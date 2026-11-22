@@ -41,6 +41,9 @@ Problems in Overtake's own protections, for example:
   not intend is a risk for every browser agent and is not something Overtake can fully prevent.
   See [Prompt injection](README.md#prompt-injection) for mitigations. A report is still in scope
   when page content can get past one of Overtake's protections listed above.
+- Data read with `browser_evaluate`. It runs JavaScript with the page's own access by design
+  and is not filtered. Credentials leaking through `browser_network`, `browser_events` or
+  `browser_cdp` results are in scope.
 - Sites detecting automation through CDP, and Chrome's "is debugging this browser" bar.
 - Attacks that require an attacker already running code as your user account, beyond what is
   listed above.

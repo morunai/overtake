@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { BrokerClient } from './broker-client.ts';
 import { Engine, DEVICES } from './engine.ts';
+import { redactCdp } from './redact.ts';
 import { OvertakeError, toWireError } from '../shared/protocol.ts';
 import { overtakeHome } from '../bridge/paths.ts';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -297,11 +298,12 @@ server.registerTool('browser_debug', {
 }, wrap(async (a: { tabId: number; action: string } & Record<string, unknown>) => engine.debug(a.tabId, a as Parameters<Engine['debug']>[1])));
 
 server.registerTool('browser_cdp', {
-  description: 'Send any Chrome DevTools Protocol command to a tab you control (validated; Input.* goes through the input gate; profile-wide cookie/cache commands are denied). Use sessionId (browser_frames) for out-of-process iframes. Events arrive in browser_events.',
+  description: 'Send any Chrome DevTools Protocol command to a tab you control (validated; Input.* goes through the input gate; profile-wide cookie/cache commands are denied; credentials in results such as headers, cookie values and token fields are masked). Use sessionId (browser_frames) for out-of-process iframes. Events arrive in browser_events.',
   inputSchema: { tabId, method: z.string().regex(/^[A-Z][A-Za-z]+\.[a-z][A-Za-z]+$/), params: z.record(z.string(), z.unknown()).default({}), sessionId: z.string().optional() },
 }, wrap(async (a: { tabId: number; method: string; params: Record<string, unknown>; sessionId?: string }) => {
   if (a.method.startsWith('Network.') || a.method.startsWith('Runtime.') || a.method.startsWith('Page.')) await engine.ensureTab(a.tabId);
-  return client.request('cdp', { tabId: a.tabId, method: a.method, params: a.params, sessionId: a.sessionId });
+  // Raw results can carry credentials (headers, cookies, bodies); mask them like browser_network does.
+  return redactCdp(await client.request('cdp', { tabId: a.tabId, method: a.method, params: a.params, sessionId: a.sessionId }));
 }));
 
 server.registerTool('browser_capabilities', { description: 'Probe which CDP domains work on this tab through the extension-owned debugger, and whether the browser-level input gate is available.', inputSchema: { tabId } },
