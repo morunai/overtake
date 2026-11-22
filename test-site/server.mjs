@@ -16,6 +16,12 @@ export function startTestServer(p = port) {
       res.end(JSON.stringify({ message: 'hello from api', query: Object.fromEntries(url.searchParams) }));
       return;
     }
+    if (url.pathname === '/api/session') {
+      // Fake login endpoint for the redaction test: a session cookie and a token in the body.
+      res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'sid=test-session-secret; Path=/; HttpOnly' });
+      res.end(JSON.stringify({ ok: true, user: 'tester', access_token: 'test-access-secret' }));
+      return;
+    }
     if (url.pathname === '/download') {
       const body = `report generated for ${url.searchParams.get('name') || 'test'}\n`;
       res.writeHead(200, { 'content-type': 'text/plain', 'content-disposition': `attachment; filename="overtake-report.txt"`, 'content-length': Buffer.byteLength(body) });

@@ -10,6 +10,7 @@ import { BrokerClient } from './broker-client.ts';
 import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
+import { redactNetworkEntry, redactUrl } from './redact.ts';
 
 type Json = Record<string, unknown>;
 
@@ -965,7 +966,7 @@ export class Engine {
     if (opts.status !== undefined) list = list.filter((e) => e.status === opts.status);
     if (opts.failedOnly) list = list.filter((e) => e.failed || (e.status ?? 0) >= 400);
     list = list.slice(-(opts.limit ?? 50));
-    return list.map((e) => ({ requestId: e.requestId, method: e.method, url: e.url.slice(0, 300), type: e.type, status: e.status ?? (e.failed ? 'failed' : 'pending'), mimeType: e.mimeType, ms: e.endedAt ? e.endedAt - e.startedAt : undefined, bytes: e.encodedDataLength, failed: e.failed, fromCache: e.fromCache || undefined }));
+    return list.map((e) => ({ requestId: e.requestId, method: e.method, url: redactUrl(e.url).slice(0, 300), type: e.type, status: e.status ?? (e.failed ? 'failed' : 'pending'), mimeType: e.mimeType, ms: e.endedAt ? e.endedAt - e.startedAt : undefined, bytes: e.encodedDataLength, failed: e.failed, fromCache: e.fromCache || undefined }));
   }
 
   async networkDetail(tabId: number, requestId: string, includeBody = true) {
@@ -983,7 +984,8 @@ export class Engine {
       let postData = e.postData;
       if (!postData && e.hasPostData) postData = (await this.cdp<{ postData: string }>(tabId, 'Network.getRequestPostData', { requestId }, e.sessionId).catch(() => null))?.postData;
       const text = body ? (body.base64Encoded ? `[base64 ${body.body.length} chars]` : body.body) : undefined;
-      return { ...e, postData: postData?.slice(0, 20_000), responseBody: text?.slice(0, 100_000), responseBodyTruncated: (text?.length ?? 0) > 100_000, bodyError };
+      // Credentials (auth headers, cookies, tokens, passwords) are masked: tool results reach the model and its logs.
+      return redactNetworkEntry({ ...e, postData: postData?.slice(0, 20_000), responseBody: text?.slice(0, 100_000), responseBodyTruncated: (text?.length ?? 0) > 100_000, bodyError, redacted: true });
     });
   }
 

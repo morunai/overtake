@@ -186,6 +186,8 @@ results and the harness are in [`bench/REPORT.md`](bench/REPORT.md).
 - **Origin restriction.** Chrome starts the broker only for the extension's fixed origin.
 - **Per-session authorization.** Each agent can act only in the Spaces it owns.
 - **CDP policy.** Profile-wide cookie access, cache clearing and browser shutdown are denied.
+- **Secrets masked in network results.** `browser_network` masks auth headers, cookies, and
+  token, password and API-key fields in URLs and bodies before they reach the agent.
 - **Your tabs stay yours.** Agents cannot touch tabs outside their Spaces, and tabs you open in
   a Space are kept when it closes.
 

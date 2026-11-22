@@ -108,6 +108,27 @@ test('9-10. genuine CDP click; network request and response inspected', async ()
   assert.match(log, /click isTrusted=true/);
 });
 
+test('network results mask credentials (headers, cookies, tokens, passwords)', async () => {
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `fetch('/api/session?token=test-query-secret&page=1', { method: 'POST', headers: { Authorization: 'Bearer test-bearer-secret', 'Content-Type': 'application/json' }, body: JSON.stringify({ user: 'tester', password: 'test-password-secret' }) }).then((r) => r.json())` });
+  const list = await A.call('browser_network', { tabId: space.tabId, urlIncludes: '/api/session' });
+  assert.equal(list.requests.length, 1);
+  assert.ok(!list.requests[0].url.includes('test-query-secret'), 'query token masked in list');
+  let detail: any;
+  for (let i = 0; i < 30 && !detail?.responseBody; i++) {
+    if (i) await sleep(100); // the body is captured once loadingFinished arrives
+    detail = await A.call('browser_network', { tabId: space.tabId, action: 'get', requestId: list.requests[0].requestId });
+  }
+  const raw = JSON.stringify(detail);
+  for (const secret of ['test-query-secret', 'test-bearer-secret', 'test-password-secret', 'test-session-secret', 'test-access-secret']) {
+    assert.ok(!raw.includes(secret), `${secret} must not reach the agent`);
+  }
+  assert.match(detail.requestHeaders.Authorization, /^Bearer \[redacted \d+ chars\]$/);
+  assert.match(detail.url, /page=1/, 'non-sensitive parameters stay readable');
+  assert.equal(JSON.parse(detail.postData).user, 'tester');
+  assert.equal(JSON.parse(detail.responseBody).user, 'tester');
+  assert.equal(detail.redacted, true);
+});
+
 test('11. blue shield and animated agent cursor are visible; human input is blocked', async () => {
   const wrap = await h.overlayClasses(human, 'wrap');
   assert.match(wrap, /\bon\b/, 'glowing shield is on');

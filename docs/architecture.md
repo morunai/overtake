@@ -194,6 +194,10 @@ wakes the renderer. Settled paused, reduced-motion and hidden fields request no 
 * CDP deny-list: profile-wide cookie reads and writes, cache clearing, browser close/crash,
   target creation and closing, download behaviour, and the gate's own
   `Input.setIgnoreInputEvents`.
+* Network results: `browser_network` masks credentials before returning them to the agent:
+  `Authorization`, `Cookie`, `Set-Cookie` and other auth headers, plus token, password,
+  session and API-key fields in query strings and JSON or form bodies (`mcp/redact.ts`).
+  Tool results land in the model's context and transcripts, so they are treated as logs.
 * Logs: the broker logs connection events with the token redacted. The MCP server logs tool
   name, duration and outcome, never arguments or page data.
 

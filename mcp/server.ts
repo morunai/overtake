@@ -192,7 +192,7 @@ server.registerTool('browser_evaluate', {
 }, wrap(async (a: { tabId: number; expression: string; frameId?: string; awaitPromise: boolean; timeoutMs?: number }) => engine.evaluate(a.tabId, a.expression, a)));
 
 server.registerTool('browser_network', {
-  description: 'Inspect network traffic captured since the tab was first used: list (filters), get (headers, post data, response body), or clear.',
+  description: 'Inspect network traffic captured since the tab was first used: list (filters), get (headers, post data, response body), or clear. Credentials (auth headers, cookies, token/password fields) are masked.',
   inputSchema: { tabId, action: z.enum(['list', 'get', 'clear']).default('list'), requestId: z.string().optional(), urlIncludes: z.string().optional(), type: z.string().optional(), status: z.number().int().optional(), failedOnly: z.boolean().optional(), includeBody: z.boolean().default(true), limit: z.number().int().max(400).default(50) },
 }, wrap(async (a: { tabId: number; action: string; requestId?: string; urlIncludes?: string; type?: string; status?: number; failedOnly?: boolean; includeBody: boolean; limit: number }) => {
   await engine.ensureTab(a.tabId);
