@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isSensitiveName, redactBody, redactHeaders, redactNetworkEntry, redactUrl } from '../../mcp/redact.ts';
+import { isSensitiveName, redactBody, redactCdp, redactHeaders, redactNetworkEntry, redactUrl } from '../../mcp/redact.ts';
 
 const SECRET = 'eyJhbGciOiJSUzI1NiJ9.payload.signature';
 
@@ -71,4 +71,39 @@ test('redact: a whole network entry leaks nothing', () => {
   assert.ok(!JSON.stringify(e).includes(SECRET), JSON.stringify(e));
   assert.equal(JSON.parse(e.postData as string).title, 'hi');
   assert.equal(JSON.parse(e.responseBody as string).ok, true);
+});
+
+test('redactCdp: Network events (headers objects, raw header text, associated cookies)', () => {
+  const ev = redactCdp({
+    requestId: '1',
+    request: { url: `https://api.test/x?token=${SECRET}&q=1`, method: 'POST', headers: { Authorization: `Bearer ${SECRET}`, Accept: '*/*' }, postData: JSON.stringify({ password: SECRET, user: 'u' }) },
+    headersText: `POST /x HTTP/1.1\r\nCookie: sid=${SECRET}\r\nAccept: */*\r\n`,
+    associatedCookies: [{ cookie: { name: 'sid', value: SECRET, domain: 'api.test' }, blockedReasons: [] }],
+  }) as any;
+  assert.ok(!JSON.stringify(ev).includes(SECRET), JSON.stringify(ev));
+  assert.equal(ev.request.headers.Accept, '*/*');
+  assert.match(ev.request.url, /q=1/);
+  assert.match(ev.headersText, /Accept: \*\/\*/);
+  assert.equal(ev.associatedCookies[0].cookie.name, 'sid');
+  assert.equal(ev.associatedCookies[0].cookie.domain, 'api.test');
+});
+
+test('redactCdp: Fetch header entries, cookies list, plain and base64 bodies', () => {
+  const fetchPaused = redactCdp({ responseHeaders: [{ name: 'Set-Cookie', value: `sid=${SECRET}; HttpOnly` }, { name: 'Content-Type', value: 'text/html' }] }) as any;
+  assert.equal(fetchPaused.responseHeaders[1].value, 'text/html');
+  const cookies = redactCdp({ cookies: [{ name: 'sid', value: SECRET, httpOnly: true }] }) as any;
+  assert.equal(cookies.cookies[0].name, 'sid');
+  assert.equal(cookies.cookies[0].httpOnly, true);
+  const plain = redactCdp({ body: JSON.stringify({ access_token: SECRET, ok: true }), base64Encoded: false }) as any;
+  assert.equal(JSON.parse(plain.body).ok, true);
+  const b64 = redactCdp({ body: Buffer.from(JSON.stringify({ refresh_token: SECRET })).toString('base64'), base64Encoded: true }) as any;
+  assert.ok(!Buffer.from(b64.body, 'base64').toString().includes(SECRET));
+  const binary = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');
+  assert.equal((redactCdp({ body: binary, base64Encoded: true }) as any).body, binary, 'binary bodies untouched');
+  for (const v of [fetchPaused, cookies, plain]) assert.ok(!JSON.stringify(v).includes(SECRET), JSON.stringify(v));
+});
+
+test('redactCdp: unrelated results pass through unchanged', () => {
+  const r = { result: { type: 'number', value: 42 }, frameTree: { frame: { id: 'f', url: 'https://a.test/page?x=1' } } };
+  assert.deepEqual(redactCdp(r), r);
 });

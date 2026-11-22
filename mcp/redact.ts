@@ -126,3 +126,81 @@ export function redactNetworkEntry<T extends Record<string, unknown>>(e: T): T {
     responseBody: redactBody(e.responseBody as string | undefined, (e.mimeType as string | undefined) ?? headerValue(e.responseHeaders, 'content-type')),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Raw CDP results and events (browser_cdp, browser_events)
+//
+// The same credentials appear in raw protocol data: Network.* events carry request and response
+// headers (plus raw header text and associated cookies), Network.getResponseBody and
+// Network.getRequestPostData return bodies, Network.getCookies returns cookie values, and
+// Fetch.requestPaused carries headers as [{name, value}] arrays. This walks any CDP payload and
+// masks those fields by key, leaving everything else unchanged.
+
+const b64decode = (s: string) => Buffer.from(s, 'base64').toString('utf8');
+const b64encode = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+
+/** Redact a header block given as raw text ("Name: value\r\n..."), as in *ExtraInfo.headersText. */
+function redactHeadersText(text: string): string {
+  return text.split(/(\r?\n)/).map((line) => {
+    const i = line.indexOf(':');
+    if (i <= 0) return line;
+    const name = line.slice(0, i).trim();
+    const lower = name.toLowerCase();
+    if (!SENSITIVE_HEADERS.has(lower) && !isSensitiveName(lower)) return line;
+    return `${line.slice(0, i)}: ${maskHeader(name, line.slice(i + 1).trim())}`;
+  }).join('');
+}
+
+/** Headers as an array of {name, value} entries (Fetch domain). */
+function redactHeaderEntries(entries: unknown[]): unknown[] {
+  return entries.map((h) => {
+    if (!h || typeof h !== 'object') return h;
+    const { name, value } = h as { name?: unknown; value?: unknown };
+    if (typeof name !== 'string' || typeof value !== 'string') return h;
+    const lower = name.toLowerCase();
+    return SENSITIVE_HEADERS.has(lower) || isSensitiveName(lower) ? { ...(h as object), value: maskHeader(name, value) } : h;
+  });
+}
+
+/** A cookie object ({name, value, ...}) or a wrapper ({cookie: {...}, blockedReasons}). */
+function redactCookie(c: unknown): unknown {
+  if (!c || typeof c !== 'object') return c;
+  const o = c as Record<string, unknown>;
+  if (o.cookie && typeof o.cookie === 'object') return { ...o, cookie: redactCookie(o.cookie) };
+  return typeof o.value === 'string' ? { ...o, value: mask(o.value) } : o;
+}
+
+function redactBase64Body(b: string): string {
+  const text = b64decode(b);
+  const out = redactBody(text);
+  return out === text ? b : b64encode(out ?? '');
+}
+
+export function redactCdp(v: unknown, depth = 0): unknown {
+  if (depth > 25 || v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) return v.map((x) => redactCdp(x, depth + 1));
+  const o = v as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(o)) {
+    if ((k === 'headers' || k === 'requestHeaders' || k === 'responseHeaders') && x && typeof x === 'object') {
+      out[k] = Array.isArray(x) ? redactHeaderEntries(x) : redactHeaders(x);
+    } else if (k === 'headersText' || k === 'requestHeadersText') {
+      out[k] = typeof x === 'string' ? redactHeadersText(x) : x;
+    } else if ((k === 'url' || k === 'documentURL' || k === 'redirectURL') && typeof x === 'string') {
+      out[k] = redactUrl(x);
+    } else if (k === 'postData' && typeof x === 'string') {
+      out[k] = redactBody(x);
+    } else if (k === 'postDataEntries' && Array.isArray(x)) {
+      out[k] = x.map((e) => (e && typeof e === 'object' && typeof (e as { bytes?: unknown }).bytes === 'string' ? { ...e, bytes: redactBase64Body((e as { bytes: string }).bytes) } : e));
+    } else if (k === 'body' && typeof x === 'string') {
+      out[k] = o.base64Encoded === true ? redactBase64Body(x) : redactBody(x);
+    } else if ((k === 'cookies' || k === 'associatedCookies' || k === 'blockedCookies' || k === 'exemptedCookies') && Array.isArray(x)) {
+      out[k] = x.map(redactCookie);
+    } else if (k === 'cookie' && x && typeof x === 'object') {
+      out[k] = redactCookie(x);
+    } else {
+      out[k] = redactCdp(x, depth + 1);
+    }
+  }
+  return out;
+}

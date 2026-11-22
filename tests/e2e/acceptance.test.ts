@@ -127,6 +127,20 @@ test('network results mask credentials (headers, cookies, tokens, passwords)', a
   assert.equal(JSON.parse(detail.postData).user, 'tester');
   assert.equal(JSON.parse(detail.responseBody).user, 'tester');
   assert.equal(detail.redacted, true);
+  // The raw paths mask the same data: CDP results and recorded Network events.
+  const secrets = ['test-query-secret', 'test-bearer-secret', 'test-password-secret', 'test-session-secret', 'test-access-secret'];
+  const body = await A.call('browser_cdp', { tabId: space.tabId, method: 'Network.getResponseBody', params: { requestId: list.requests[0].requestId } });
+  assert.equal(JSON.parse(body.body).user, 'tester');
+  const post = await A.call('browser_cdp', { tabId: space.tabId, method: 'Network.getRequestPostData', params: { requestId: list.requests[0].requestId } });
+  assert.equal(JSON.parse(post.postData).user, 'tester');
+  const jar = await A.call('browser_cdp', { tabId: space.tabId, method: 'Network.getCookies', params: { urls: [SITE] } });
+  assert.ok(jar.cookies.some((c: { name: string }) => c.name === 'sid'), 'cookie names stay visible');
+  const events = await A.call('browser_events', { tabId: space.tabId, methodPrefix: 'Network.', limit: 500 });
+  assert.ok(events.events.some((e: { method: string }) => e.method === 'Network.requestWillBeSent'));
+  for (const [what, v] of [['getResponseBody', body], ['getRequestPostData', post], ['getCookies', jar], ['events', events]] as const) {
+    const json = JSON.stringify(v);
+    for (const secret of secrets) assert.ok(!json.includes(secret), `${secret} leaked through ${what}`);
+  }
 });
 
 test('11. blue shield and animated agent cursor are visible; human input is blocked', async () => {
