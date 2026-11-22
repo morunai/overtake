@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { Harness, SITE, sleep, pngSize, type Agent } from './harness.ts';
 
-const SHOTS = join(import.meta.dirname, '..', '..', 'docs', 'screenshots');
+// Test captures go to artifacts/ (gitignored). docs/screenshots holds the curated README images
+// (made with tests/e2e/showcase.manual.ts) and must not be overwritten by a test run.
+const SHOTS = join(import.meta.dirname, '..', '..', 'artifacts', 'e2e-screenshots');
 const h = new Harness();
 let A: Agent;
 let B: Agent;
