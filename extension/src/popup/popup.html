@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Overtake</title>
+<style>
+  :root { --line: rgb(255 255 255 / .07); --muted: #8d93a3; --blue: #6f8cff; --amber: #f5b342; --orange: #ff9d57; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; width: 360px; background: #131418; color: #eceef4; font: 13px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+  header { display: flex; align-items: center; gap: 9px; height: 46px; padding: 0 10px 0 14px; border-bottom: 1px solid var(--line); }
+  .orb { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg, #ffd60a, #ff9500); }
+  .title { font-weight: 650; letter-spacing: -.01em; }
+  #head { flex: 1; color: var(--muted); font-size: 12px; text-align: right; }
+  #head.off { color: #ff6b6b; }
+  #overview { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: var(--muted); }
+  #overview:hover { background: rgb(255 255 255 / .08); color: #fff; }
+  #overview svg { width: 14px; height: 14px; }
+  #overview path { fill: currentColor; stroke: none; }
+  #list { max-height: 460px; overflow: auto; padding: 6px; }
+  .row { display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 10px; padding: 9px 8px; border-radius: 10px; cursor: pointer; }
+  .row:hover { background: rgb(255 255 255 / .05); }
+  .row.here { background: rgb(111 140 255 / .08); box-shadow: inset 0 0 0 1px rgb(111 140 255 / .22); }
+  .id { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: rgb(255 255 255 / .06); }
+  .logo { width: 15px; height: 15px; color: #dfe3ee; } .logo svg { width: 100%; height: 100%; display: block; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #5f6473; }
+  .txt { min-width: 0; }
+  .l1 { display: flex; align-items: baseline; gap: 8px; }
+  .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .state { font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+  .state.agent { color: var(--blue); } .state.paused { color: var(--amber); } .state.needs { color: var(--orange); }
+  .l2 { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .acts { display: flex; gap: 5px; }
+  .acts button { height: 28px; padding: 0 10px; border-radius: 8px; font-size: 12px; font-weight: 600; background: rgb(255 255 255 / .08); }
+  .acts button:hover { background: rgb(255 255 255 / .15); }
+  .acts button.primary { background: #f1f3f9; color: #14161c; }
+  .acts button.accent { background: #4c6ef5; color: #fff; }
+  .acts button.icon { width: 28px; padding: 0; display: grid; place-items: center; } .acts svg { width: 12px; height: 12px; }
+  .acts button.stop:hover { background: rgb(255 107 107 / .2); color: #ff6b6b; }
+  .empty { color: var(--muted); text-align: center; padding: 22px 12px; margin: 0; }
+</style>
+</head>
+<body>
+<header><span class="orb"></span><span class="title">Overtake</span><span id="head">…</span><button id="overview" title="Spaces overview" aria-label="Spaces overview"></button></header>
+<div id="list"></div>
+<script type="module" src="popup.js"></script>
+</body>
+</html>

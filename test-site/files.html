@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Files fixture</title>
+<style>body{font:15px system-ui;margin:40px} .row{margin:18px 0} button,a{font:inherit;padding:8px 14px}</style>
+</head>
+<body>
+  <h1>Files fixture</h1>
+  <div class="row"><label>Direct input <input id="direct" type="file"></label> <span id="direct-out"></span></div>
+  <div class="row"><input id="hidden" type="file" multiple hidden>
+    <button id="choose">Choose files…</button> <span id="hidden-out"></span></div>
+  <div class="row"><a id="download" href="/download?name=agent">Download report</a></div>
+  <div class="row"><a id="popup" href="/files.html?popup=1" target="_blank">Open in new tab</a></div>
+  <script>
+    const show = (input, out) => input.addEventListener('change', async () => {
+      const parts = await Promise.all([...input.files].map(async (f) => `${f.name}:${(await f.text()).trim()}`));
+      document.getElementById(out).textContent = parts.join(' | ');
+    });
+    show(document.getElementById('direct'), 'direct-out');
+    show(document.getElementById('hidden'), 'hidden-out');
+    document.getElementById('choose').onclick = () => document.getElementById('hidden').click();
+  </script>
+</body>
+</html>

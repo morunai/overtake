@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spaces · Overtake</title>
+<link rel="stylesheet" href="overview.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><span class="mark" aria-hidden="true"></span>Overtake</div>
+  <button id="title" class="title" aria-haspopup="menu" aria-expanded="false">
+    <span id="count">Spaces</span>
+    <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.6 6 7.6l3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+  <div class="right">
+    <button id="agents" class="agents" aria-label="Connected agents"><span id="agentCount">0</span><i></i></button>
+  </div>
+</header>
+<div id="menu" class="menu" role="menu" hidden>
+  <button role="menuitem" data-menu="new">New Space</button>
+  <button role="menuitem" data-menu="details">Show details</button>
+  <div class="sep"></div>
+  <p id="bridge" class="bridge"></p>
+</div>
+<div class="layout">
+  <main id="grid" class="grid" aria-label="Spaces"></main>
+  <aside id="panel" class="panel" aria-label="Space details" hidden></aside>
+</div>
+<div id="hint" class="hint">
+  <svg viewBox="0 0 28 20" aria-hidden="true"><rect x="1" y="1" width="26" height="18" rx="3.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 6h1M10 6h1M14 6h1M18 6h1M22 6h1M6 10h1M10 10h1M14 10h1M18 10h1M22 10h1M9 14h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  <p id="hintText"><b>Press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>S</kbd> to come back</b> here, <kbd>←</kbd> <kbd>→</kbd> and <kbd>↵</kbd> to open a Space.</p>
+</div>
+<div id="toast" class="toast" role="status"></div>
+<script type="module" src="overview.js"></script>
+</body>
+</html>

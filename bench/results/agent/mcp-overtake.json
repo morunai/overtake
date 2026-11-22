@@ -1,0 +1,1 @@
+{"mcpServers":{"overtake":{"command":"node","args":["<tmp>"],"env":{"OVERTAKE_HOME":"<tmp>","OVERTAKE_AGENT_NAME":"rr-agent-r2"}}}}

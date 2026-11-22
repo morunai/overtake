@@ -1,0 +1,30 @@
+{
+  "name": "overtake",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Agent Spaces for your own Google Chrome: MV3 extension + secure local broker + MCP server",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test tests/unit/*.test.ts",
+    "test:e2e": "node --test --test-concurrency=1 tests/e2e/*.test.ts",
+    "install:host": "node scripts/install.mjs",
+    "mcp": "node mcp/server.ts",
+    "test-site": "node test-site/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

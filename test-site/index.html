@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Agent Test Page</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{font:16px system-ui,sans-serif;margin:0;padding:24px;background:#f6f7fb;color:#1b1d26}
+ h1{margin:0 0 16px} .card{background:#fff;border-radius:12px;padding:20px;margin:0 0 16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ button{font:inherit;padding:10px 18px;border-radius:8px;border:1px solid #3b5bdb;background:#4263eb;color:#fff;cursor:pointer}
+ input{font:inherit;padding:8px 10px;border:1px solid #c9cdd8;border-radius:8px;width:260px}
+ #log{font:13px ui-monospace,monospace;white-space:pre-wrap;background:#11131a;color:#9fe;padding:12px;border-radius:8px;min-height:80px}
+ .tall{height:1600px;background:linear-gradient(#fff,#dde3ff);display:flex;align-items:flex-end;justify-content:center;padding-bottom:24px}
+ iframe{width:100%;height:120px;border:1px dashed #aab;border-radius:8px}
+</style></head>
+<body>
+<h1 id="title">Agent Test Page</h1>
+<div class="card">
+  <button id="btn">Click me</button>
+  <a id="navlink" href="/?via=link">Go to next page</a>
+  <span id="count" data-count="0">clicks: 0</span>
+  <div style="margin-top:12px"><label>Name <input id="name" placeholder="type here"></label></div>
+  <div style="margin-top:12px"><button id="fetch">Fetch data</button> <span id="fetchOut"></span></div>
+  <div style="margin-top:12px"><button id="boom">Throw error</button> <button id="slow">Slow work</button></div>
+</div>
+<div class="card"><div id="log"></div></div>
+<div class="card"><iframe id="frame" src="frame.html" title="child frame"></iframe>
+  <iframe id="xframe" src="http://localhost:8765/frame.html" title="cross-site frame"></iframe></div>
+<div class="tall"><div id="bottom">Bottom of page</div></div>
+<script>
+ const log=(m)=>{const l=document.getElementById('log');l.textContent+=m+'\n'};
+ let n=0;
+ document.getElementById('btn').addEventListener('click',(e)=>{n++;const c=document.getElementById('count');c.textContent='clicks: '+n;c.dataset.count=n;
+   log(`click isTrusted=${e.isTrusted} at ${e.clientX},${e.clientY}`);});
+ document.getElementById('name').addEventListener('input',(e)=>log('input: '+e.target.value));
+ document.getElementById('fetch').addEventListener('click',async()=>{const r=await fetch('/api/data?x=1');const j=await r.json();document.getElementById('fetchOut').textContent=j.message;log('fetched '+j.message)});
+ document.getElementById('boom').addEventListener('click',()=>{ setTimeout(()=>{ throw new Error('boom from test page'); }); });
+ function slowWork(n){ let total = 0; for (let i = 0; i < n; i++) { total += i; } return total; }
+ document.getElementById('slow').addEventListener('click',()=>{ const r = slowWork(1000); log('slow result '+r); });
+ window.addEventListener('pointerdown',(e)=>{window.__lastPointer={x:e.clientX,y:e.clientY,trusted:e.isTrusted,t:Date.now()}},true);
+ console.log('test page loaded');
+</script>
+</body></html>

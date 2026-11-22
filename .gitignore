@@ -1,0 +1,9 @@
+node_modules/
+dist/
+keys/extension-key.pem
+.DS_Store
+artifacts/
+
+# Benchmark raw artefacts (screenshots, full agent transcripts with local environment details)
+bench/**/shots/
+bench/results/*/stream-*.jsonl

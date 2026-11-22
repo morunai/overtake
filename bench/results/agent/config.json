@@ -1,0 +1,11 @@
+{
+  "stamp": "2026-11-22T08-30-55",
+  "runs": 2,
+  "tools": [
+    "cli"
+  ],
+  "budget": "2",
+  "model": "(default)",
+  "claude": "2.1.330 (Claude Code)",
+  "cliVersion": "cli-browser"
+}

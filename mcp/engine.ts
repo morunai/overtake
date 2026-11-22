@@ -1,0 +1,1333 @@
+// Overtake automation engine: turns MCP tool calls into CDP commands for one tab.
+// Every browser effect goes through the extension, which enforces ownership,
+// control state and the input gate. The engine never fakes DOM events: input is
+// CDP Input.* only, and unsupported operations surface as errors.
+
+import { writeFile, mkdir, stat, copyFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { BrokerClient } from './broker-client.ts';
+import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
+import { chordSteps, typeSteps } from './keys.ts';
+import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
+
+type Json = Record<string, unknown>;
+
+interface NetEntry {
+  requestId: string;
+  url: string;
+  method: string;
+  type?: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  requestHeaders?: Json;
+  responseHeaders?: Json;
+  postData?: string;
+  hasPostData?: boolean;
+  startedAt: number;
+  endedAt?: number;
+  encodedDataLength?: number;
+  failed?: string;
+  fromCache?: boolean;
+  frameId?: string;
+  sessionId?: string;
+}
+
+interface ConsoleEntry {
+  seq: number;
+  at: number;
+  level: string;
+  text: string;
+  url?: string;
+  line?: number;
+  stack?: string;
+}
+
+interface InterceptRule {
+  id: number;
+  urlPattern: string;
+  block?: boolean;
+  response?: { status: number; headers: Record<string, string>; body: string };
+  hits: number;
+}
+
+interface TabState {
+  tabId: number;
+  enabled: boolean;
+  enabling: Promise<void> | null;
+  net: Map<string, NetEntry>;
+  console: ConsoleEntry[];
+  events: { seq: number; at: number; method: string; sessionId?: string; params: unknown }[];
+  refs: Map<number, RefTarget>;
+  cursor: { x: number; y: number } | null;
+  children: Map<string, { targetId: string; type: string; url: string }>; // OOPIF sessions
+  contexts: Map<string, number>; // frameId -> default execution context id
+  dialog: { type: string; message: string; defaultPrompt?: string; url: string } | null;
+  paused: unknown | null;
+  intercepts: InterceptRule[];
+  loadWaiters: Set<() => void>;
+  lastNavAt: number;
+  navRequestedAt: number; // main-frame renderer-initiated navigation requested (link, form, location=)
+  lastLoadAt: number; // main-frame load event
+  downloadAt: number; // a navigation turned into a download
+  mainFrameId: string | null;
+  chooserWaiters: Set<(p: { backendNodeId: number; mode: string; sessionId?: string }) => void>;
+  tracing: { chunks: string[]; done: ((stream?: string) => void) | null } | null;
+}
+
+const MAX_NET = 400;
+const MAX_CONSOLE = 400;
+const MAX_EVENTS = 1500;
+
+let seq = 0;
+let refCounter = 0;
+
+/** Refusals that mean "stop now", as opposed to transient page states worth retrying. */
+const HARD_STOP = new Set<string>([ErrorCode.USER_IN_CONTROL, ErrorCode.STOPPED, ErrorCode.NOT_OWNER, ErrorCode.SPACE_CLOSED, ErrorCode.TAB_CLOSED, ErrorCode.SPACE_NOT_FOUND, ErrorCode.TAB_NOT_IN_SPACE, ErrorCode.EXTENSION_NOT_CONNECTED, ErrorCode.AGENT_PAUSED_TIMEOUT]);
+function softFail<T>(fallback: T) {
+  return (e: unknown): T => {
+    if (e instanceof OvertakeError && HARD_STOP.has(e.code)) throw e;
+    return fallback;
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function globToRegExp(glob: string): RegExp {
+  return new RegExp('^' + glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+}
+
+/** Async mutex per key: one high-level action per space at a time. */
+class KeyedMutex {
+  #tails = new Map<number, Promise<void>>();
+  async run<T>(key: number, fn: () => Promise<T>): Promise<T> {
+    const prev = this.#tails.get(key) || Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => next);
+    this.#tails.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.#tails.get(key) === tail) this.#tails.delete(key);
+    }
+  }
+}
+
+export const DEVICES: Record<string, { width: number; height: number; deviceScaleFactor: number; mobile: boolean; userAgent?: string }> = {
+  'iPhone 15': { width: 393, height: 852, deviceScaleFactor: 3, mobile: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' },
+  'Pixel 8': { width: 412, height: 915, deviceScaleFactor: 2.625, mobile: true, userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36' },
+  iPad: { width: 820, height: 1180, deviceScaleFactor: 2, mobile: true, userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' },
+  'Desktop 1440': { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
+};
+
+/** Split an element target into its kind: css (default), text= or xpath=. */
+function parseSelector(target: string): { kind: 'css' | 'text' | 'xpath'; sel: string } {
+  if (target.startsWith('text=')) return { kind: 'text', sel: target.slice(5) };
+  if (target.startsWith('xpath=')) return { kind: 'xpath', sel: target.slice(6) };
+  if (target.startsWith('css=')) return { kind: 'css', sel: target.slice(4) };
+  return { kind: 'css', sel: target };
+}
+
+/** Page-side finder shared by actions and browser_wait: returns the single (visible-preferred)
+ *  match, or { count } when there are none or several. With `all`, returns every match. */
+const FIND_ELEMENT = (function find(sel: string, kind: string, all = false) {
+      const deepAll = (root: Document | ShadowRoot, css: string): Element[] => {
+        const out = [...root.querySelectorAll(css)];
+        for (const e of root.querySelectorAll('*')) if (e.shadowRoot) out.push(...deepAll(e.shadowRoot, css));
+        return out;
+      };
+      let m: Element[] = [];
+      if (kind === 'css') m = deepAll(document, sel);
+      else if (kind === 'xpath') {
+        const r = document.evaluate(sel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        for (let i = 0; i < r.snapshotLength; i++) if (r.snapshotItem(i) instanceof Element) m.push(r.snapshotItem(i) as Element);
+      } else {
+        const exact = /^".*"$/.test(sel);
+        const want = exact ? sel.slice(1, -1) : sel.replace(/\s+/g, ' ').trim().toLowerCase();
+        const norm = (s: string) => (exact ? s.trim() : s.replace(/\s+/g, ' ').trim().toLowerCase());
+        const all = [...document.querySelectorAll('body *')].filter((e) => e.localName !== 'overtake-overlay' && e.localName !== 'script' && e.localName !== 'style');
+        const hit = all.filter((e) => {
+          const txt = norm((e as HTMLElement).innerText ?? e.textContent ?? '');
+          const aria = norm(e.getAttribute('aria-label') || (e as HTMLInputElement).value || '');
+          return exact ? txt === want || aria === want : txt.includes(want) || aria.includes(want);
+        });
+        m = hit.filter((e) => !hit.some((o) => o !== e && e.contains(o)));
+      }
+      if (all) return m;
+      const vis = m.filter((e) => (e as HTMLElement).checkVisibility?.() ?? true);
+      const pick = vis.length ? vis : m;
+      if (pick.length === 1) return pick[0];
+      return { count: pick.length };
+    }).toString();
+
+export class Engine {
+  readonly client: BrokerClient;
+  #tabs = new Map<number, TabState>();
+  #spaces = new Map<number, SpaceSummary>();
+  #mutex = new KeyedMutex();
+  #controlWaiters = new Set<() => void>();
+  #tabSpace = new Map<number, number>();
+
+  constructor(client: BrokerClient) {
+    this.client = client;
+    client.on('event', (e: AgentEvent) => this.#onEvent(e));
+  }
+
+  // -------------------------------------------------------------------------
+  // Events
+
+  #tab(tabId: number): TabState {
+    let t = this.#tabs.get(tabId);
+    if (!t) {
+      t = {
+        tabId, enabled: false, enabling: null, net: new Map(), console: [], events: [], refs: new Map(), cursor: null, children: new Map(),
+        contexts: new Map(), dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
+      };
+      this.#tabs.set(tabId, t);
+    }
+    return t;
+  }
+
+  #onEvent(e: AgentEvent) {
+    switch (e.type) {
+      case 'control':
+        this.#spaces.set(e.space.spaceId, e.space);
+        for (const tab of e.space.tabs) this.#tabSpace.set(tab.tabId, e.space.spaceId);
+        if (e.space.control === 'AGENT_CONTROL' && e.space.owner === this.client.agentKey) {
+          // Interception is lifted while the human drives; restore it on return.
+          for (const tab of e.space.tabs) {
+            const t = this.#tabs.get(tab.tabId);
+            if (t?.intercepts.length) void this.#applyFetch(t).catch(() => {});
+          }
+        }
+        for (const w of this.#controlWaiters) w();
+        return;
+      case 'space-closed':
+        this.#spaces.delete(e.spaceId);
+        for (const w of this.#controlWaiters) w();
+        return;
+      case 'tab-closed':
+      case 'debugger-attached':
+      case 'debugger-detached': {
+        const t = this.#tabs.get(e.tabId);
+        if (t) {
+          t.enabled = false;
+          t.children.clear();
+          t.contexts.clear();
+          if (e.type === 'tab-closed') this.#tabs.delete(e.tabId);
+        }
+        return;
+      }
+      case 'extension':
+        for (const t of this.#tabs.values()) t.enabled = false;
+        return;
+      case 'cdp':
+        this.#onCdp(e.tabId, e.sessionId, e.method, e.params as Json);
+        return;
+    }
+  }
+
+  #onCdp(tabId: number, sessionId: string | undefined, method: string, p: Json) {
+    const t = this.#tab(tabId);
+    t.events.push({ seq: ++seq, at: Date.now(), method, sessionId, params: p });
+    if (t.events.length > MAX_EVENTS) t.events.splice(0, t.events.length - MAX_EVENTS);
+    switch (method) {
+      case 'Network.requestWillBeSent': {
+        const req = p.request as Json;
+        const id = p.requestId as string;
+        const prev = t.net.get(id);
+        t.net.set(id, {
+          ...(prev || {}),
+          requestId: id, url: req.url as string, method: req.method as string, type: p.type as string, requestHeaders: req.headers as Json,
+          hasPostData: !!req.hasPostData, postData: req.postData as string | undefined, startedAt: Date.now(), frameId: p.frameId as string, sessionId,
+        });
+        if (t.net.size > MAX_NET) t.net.delete(t.net.keys().next().value!);
+        break;
+      }
+      case 'Network.responseReceived': {
+        const e = t.net.get(p.requestId as string);
+        const r = p.response as Json;
+        if (e) Object.assign(e, { status: r.status, statusText: r.statusText, mimeType: r.mimeType, responseHeaders: r.headers, fromCache: !!r.fromDiskCache || !!r.fromServiceWorker });
+        break;
+      }
+      case 'Network.loadingFinished': {
+        const e = t.net.get(p.requestId as string);
+        if (e) Object.assign(e, { endedAt: Date.now(), encodedDataLength: p.encodedDataLength });
+        break;
+      }
+      case 'Network.loadingFailed': {
+        const e = t.net.get(p.requestId as string);
+        if (e) Object.assign(e, { endedAt: Date.now(), failed: (p.errorText as string) + (p.blockedReason ? ` (${p.blockedReason})` : '') });
+        break;
+      }
+      case 'Runtime.consoleAPICalled': {
+        const args = (p.args as Json[]) || [];
+        const text = args.map((a) => (a.value !== undefined ? (typeof a.value === 'string' ? a.value : JSON.stringify(a.value)) : (a.description as string) || (a.type as string))).join(' ');
+        const top = ((p.stackTrace as Json)?.callFrames as Json[] | undefined)?.[0];
+        this.#pushConsole(t, { level: p.type as string, text, url: top?.url as string, line: top ? (top.lineNumber as number) + 1 : undefined });
+        break;
+      }
+      case 'Runtime.exceptionThrown': {
+        const d = p.exceptionDetails as Json;
+        const ex = d.exception as Json | undefined;
+        const frames = ((d.stackTrace as Json)?.callFrames as Json[]) || [];
+        this.#pushConsole(t, {
+          level: 'exception',
+          text: (ex?.description as string) || (d.text as string),
+          url: d.url as string,
+          line: typeof d.lineNumber === 'number' ? d.lineNumber + 1 : undefined,
+          stack: frames.slice(0, 8).map((f) => `  at ${f.functionName || '<anonymous>'} (${f.url}:${(f.lineNumber as number) + 1}:${(f.columnNumber as number) + 1})`).join('\n'),
+        });
+        break;
+      }
+      case 'Log.entryAdded': {
+        const en = p.entry as Json;
+        this.#pushConsole(t, { level: `log.${en.level}`, text: en.text as string, url: en.url as string, line: typeof en.lineNumber === 'number' ? en.lineNumber + 1 : undefined });
+        break;
+      }
+      case 'Runtime.executionContextCreated': {
+        const c = p.context as Json;
+        const aux = c.auxData as Json | undefined;
+        if (aux?.isDefault && typeof aux.frameId === 'string') t.contexts.set(aux.frameId, c.id as number);
+        break;
+      }
+      case 'Runtime.executionContextsCleared':
+        if (!sessionId) t.contexts.clear();
+        break;
+      case 'Target.attachedToTarget': {
+        const info = p.targetInfo as Json;
+        t.children.set(p.sessionId as string, { targetId: info.targetId as string, type: info.type as string, url: info.url as string });
+        // Bring OOPIF sessions to parity with the main session.
+        const sid = p.sessionId as string;
+        for (const m of ['Runtime.enable', 'Network.enable', 'Page.enable']) void this.cdp(tabId, m, {}, sid).catch(() => {});
+        break;
+      }
+      case 'Target.detachedFromTarget':
+        t.children.delete(p.sessionId as string);
+        break;
+      case 'Page.frameNavigated': {
+        const frame = p.frame as Json;
+        if (!frame.parentId && !sessionId) {
+          t.refs.clear();
+          t.lastNavAt = Date.now();
+          t.mainFrameId = frame.id as string;
+        }
+        break;
+      }
+      case 'Page.frameRequestedNavigation':
+        // Sent while the click is being dispatched, before the input reply arrives,
+        // so a click knows at once whether it started a navigation.
+        if (!sessionId && (p.disposition ?? 'currentTab') === 'currentTab' && (!t.mainFrameId || p.frameId === t.mainFrameId)) t.navRequestedAt = Date.now();
+        break;
+      case 'Page.loadEventFired':
+        if (!sessionId) {
+          t.lastLoadAt = Date.now();
+          for (const w of t.loadWaiters) w();
+        }
+        break;
+      case 'Page.downloadWillBegin':
+        if (!sessionId) t.downloadAt = Date.now();
+        break;
+      case 'Page.fileChooserOpened':
+        for (const w of [...t.chooserWaiters]) w({ backendNodeId: p.backendNodeId as number, mode: p.mode as string, sessionId });
+        break;
+      case 'Page.javascriptDialogOpening':
+        t.dialog = { type: p.type as string, message: p.message as string, defaultPrompt: p.defaultPrompt as string, url: p.url as string };
+        break;
+      case 'Page.javascriptDialogClosed':
+        t.dialog = null;
+        break;
+      case 'Debugger.paused':
+        t.paused = p;
+        break;
+      case 'Debugger.resumed':
+        t.paused = null;
+        break;
+      case 'Fetch.requestPaused':
+        void this.#onRequestPaused(t, sessionId, p);
+        break;
+      case 'Tracing.dataCollected':
+        t.tracing?.chunks.push(...((p.value as unknown[]) || []).map((v) => JSON.stringify(v)));
+        break;
+      case 'Tracing.tracingComplete':
+        t.tracing?.done?.(p.stream as string | undefined);
+        break;
+    }
+  }
+
+  #pushConsole(t: TabState, e: Omit<ConsoleEntry, 'seq' | 'at'>) {
+    t.console.push({ seq: ++seq, at: Date.now(), ...e });
+    if (t.console.length > MAX_CONSOLE) t.console.splice(0, t.console.length - MAX_CONSOLE);
+  }
+
+  // -------------------------------------------------------------------------
+  // Transport helpers
+
+  cdp<T = Json>(tabId: number, method: string, params: Json = {}, sessionId?: string, timeoutMs?: number): Promise<T> {
+    return this.client.request<T>('cdp', { tabId, method, params, ...(sessionId ? { sessionId } : {}), ...(timeoutMs ? { deadlineMs: timeoutMs } : {}) }, timeoutMs ? timeoutMs + 5000 : undefined);
+  }
+
+  async ensureTab(tabId: number): Promise<TabState> {
+    const t = this.#tab(tabId);
+    if (t.enabled) return t;
+    if (!t.enabling) {
+      t.enabling = (async () => {
+        await this.cdp(tabId, 'Page.enable');
+        await this.cdp(tabId, 'Page.setLifecycleEventsEnabled', { enabled: true }).catch(() => {});
+        await this.cdp(tabId, 'Runtime.enable');
+        await this.cdp(tabId, 'Network.enable', { maxPostDataSize: 65536 });
+        await this.cdp(tabId, 'Log.enable').catch(() => {});
+        t.enabled = true;
+      })().finally(() => {
+        t.enabling = null;
+      });
+    }
+    await t.enabling;
+    return t;
+  }
+
+  async spaceOf(tabId: number): Promise<number> {
+    const known = this.#tabSpace.get(tabId);
+    if (known !== undefined) return known;
+    const { spaces } = await this.client.request<{ spaces: SpaceSummary[] }>('spaces.list');
+    for (const s of spaces) {
+      this.#spaces.set(s.spaceId, s);
+      for (const tab of s.tabs) this.#tabSpace.set(tab.tabId, s.spaceId);
+    }
+    const id = this.#tabSpace.get(tabId);
+    if (id === undefined) throw new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in a Space.`);
+    return id;
+  }
+
+  /** Run one high-level action exclusively for the tab's space. */
+  async action<T>(tabId: number, fn: (t: TabState) => Promise<T>): Promise<T> {
+    const spaceId = await this.spaceOf(tabId);
+    return this.#mutex.run(spaceId, async () => fn(await this.ensureTab(tabId)));
+  }
+
+  // -------------------------------------------------------------------------
+  // Spaces
+
+  async listSpaces(): Promise<SpaceSummary[]> {
+    const { spaces } = await this.client.request<{ spaces: SpaceSummary[] }>('spaces.list');
+    for (const s of spaces) {
+      this.#spaces.set(s.spaceId, s);
+      for (const tab of s.tabs) this.#tabSpace.set(tab.tabId, s.spaceId);
+    }
+    return spaces;
+  }
+
+  async waitForControl(spaceId: number, timeoutMs: number): Promise<{ inControl: boolean; space: SpaceSummary | null }> {
+    const deadline = Date.now() + timeoutMs;
+    await this.listSpaces();
+    for (;;) {
+      const s = this.#spaces.get(spaceId) || null;
+      if (!s) return { inControl: false, space: null };
+      if (s.control === 'AGENT_CONTROL' && s.owner === this.client.agentKey) return { inControl: true, space: s };
+      const left = deadline - Date.now();
+      if (left <= 0) return { inControl: false, space: s };
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          this.#controlWaiters.delete(done);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(done, Math.min(left, 15_000));
+        this.#controlWaiters.add(done);
+      });
+      if (Date.now() < deadline) await this.listSpaces().catch(() => {});
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Navigation and waiting
+
+  async navigate(tabId: number, url: string, opts: { timeoutMs?: number; waitUntil?: 'load' | 'commit' | 'none' } = {}) {
+    return this.action(tabId, async (t) => {
+      const timeoutMs = opts.timeoutMs ?? 30_000;
+      const loaded = new Promise<boolean>((resolve) => {
+        const w = () => {
+          t.loadWaiters.delete(w);
+          resolve(true);
+        };
+        t.loadWaiters.add(w);
+        setTimeout(() => {
+          t.loadWaiters.delete(w);
+          resolve(false);
+        }, timeoutMs);
+      });
+      const r = await this.cdp<{ frameId: string; loaderId?: string; errorText?: string }>(tabId, 'Page.navigate', { url }, undefined, timeoutMs + 5000);
+      if (r.errorText) throw new OvertakeError(ErrorCode.CDP_ERROR, `Navigation to ${url} failed: ${r.errorText}`);
+      let didLoad = false;
+      if (opts.waitUntil !== 'none' && opts.waitUntil !== 'commit' && r.loaderId) didLoad = await Promise.race([loaded, this.#pollLoaded(tabId, url, timeoutMs)]);
+      const info = await this.pageInfo(tabId);
+      return { ...info, loaded: didLoad || !r.loaderId, sameDocument: !r.loaderId };
+    });
+  }
+
+  /** Poll readyState: survives a dropped/re-attached debugger session, where the
+   *  load event can be lost. Resolves false on timeout. */
+  async #pollLoaded(tabId: number, url: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    const target = url.split('#')[0];
+    await sleep(150);
+    while (Date.now() < deadline) {
+      const r = await this.cdp<{ result: { value?: { href: string; state: string } } }>(tabId, 'Runtime.evaluate', {
+        expression: '({ href: location.href, state: document.readyState })', returnByValue: true,
+      }, undefined, 5000).catch(softFail(null));
+      const v = r?.result.value;
+      if (v && v.state === 'complete' && (v.href.split('#')[0] === target || !target.startsWith('http'))) return true;
+      await sleep(250);
+    }
+    return false;
+  }
+
+  async pageInfo(tabId: number) {
+    const r = await this.cdp<{ result: { value: { url: string; title: string; readyState: string } } }>(tabId, 'Runtime.evaluate', {
+      expression: '({url: location.href, title: document.title, readyState: document.readyState})', returnByValue: true,
+    });
+    return r.result.value;
+  }
+
+  async wait(tabId: number, cond: { delayMs?: number; selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
+    if (cond.delayMs) {
+      // A plain pause (no page timers, so background throttling cannot stretch it).
+      // Control is re-checked afterwards, so a take-over during the pause is reported.
+      await sleep(Math.min(cond.delayMs, 120_000));
+      const spaceId = await this.spaceOf(tabId);
+      const s = (await this.listSpaces()).find((x) => x.spaceId === spaceId);
+      if (!s) throw new OvertakeError(ErrorCode.SPACE_CLOSED, `Space ${spaceId} was closed.`);
+      if (s.owner !== this.client.agentKey || s.control !== 'AGENT_CONTROL') {
+        if (s.control === 'AGENT_PAUSED' && s.owner === this.client.agentKey) return { waited: cond.delayMs, note: 'The human paused the agent; your next command will wait for Resume.' };
+        throw new OvertakeError(s.control === 'STOPPED' ? ErrorCode.STOPPED : s.owner === this.client.agentKey ? ErrorCode.USER_IN_CONTROL : ErrorCode.NOT_OWNER,
+          'Control changed while waiting: the human has this Space now. This is a hard stop; wait until they give control back.');
+      }
+      if (!cond.selector && !cond.text && !cond.urlIncludes && !cond.function && !cond.networkIdleMs && !cond.load) return { waited: cond.delayMs };
+    }
+    return this.action(tabId, async (t) => {
+      const timeoutMs = cond.timeoutMs ?? 10_000;
+      const deadline = Date.now() + timeoutMs;
+      const check = async (): Promise<boolean> => {
+        const parts: string[] = [];
+        if (cond.selector) {
+          // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
+          const { kind, sel } = parseSelector(cond.selector);
+          const all = `((${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true))`;
+          const state = cond.state || 'visible';
+          parts.push(state === 'hidden'
+            ? `${all}.every((e) => !e.checkVisibility())`
+            : state === 'attached' ? `${all}.length > 0` : `${all}.some((e) => e.checkVisibility())`);
+        }
+        if (cond.text) parts.push(`(document.body?.innerText || '').includes(${JSON.stringify(cond.text)})`);
+        if (cond.urlIncludes) parts.push(`location.href.includes(${JSON.stringify(cond.urlIncludes)})`);
+        if (cond.function) parts.push(`!!(await (async () => (${cond.function}))())`);
+        if (cond.load) parts.push(`document.readyState === 'complete'`);
+        if (parts.length) {
+          const r = await this.cdp<{ result: { value: boolean } }>(tabId, 'Runtime.evaluate', { expression: `(async () => ${parts.join(' && ')})()`, awaitPromise: true, returnByValue: true }).catch(softFail({ result: { value: false } }));
+          if (!r.result.value) return false;
+        }
+        if (cond.networkIdleMs) {
+          const now = Date.now();
+          const inflight = [...t.net.values()].filter((e) => !e.endedAt && now - e.startedAt < 30_000);
+          const lastEnd = Math.max(0, ...[...t.net.values()].map((e) => e.endedAt || 0));
+          if (inflight.length || now - lastEnd < cond.networkIdleMs) return false;
+        }
+        return true;
+      };
+      const started = Date.now();
+      while (!(await check())) {
+        if (Date.now() > deadline) throw new OvertakeError(ErrorCode.TIMEOUT, `Condition not met within ${timeoutMs} ms: ${JSON.stringify(cond)}`);
+        // Poll fast at first (most conditions are met within a few hundred ms), then back off.
+        const elapsed = Date.now() - started;
+        await sleep(elapsed < 1000 ? 20 : elapsed < 5000 ? 50 : 100);
+      }
+      return { satisfied: true, ...(await this.pageInfo(tabId)) };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Snapshot
+
+  async snapshot(tabId: number, opts: { scope?: 'viewport' | 'full_page'; maxLines?: number } = {}) {
+    return this.action(tabId, async (t) => {
+      const { nodes } = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {});
+      const children = new Map<number, FrameTree>();
+      // Same-process child frames.
+      const tree = await this.cdp<{ frameTree: { frame: { id: string }; childFrames?: unknown[] } }>(tabId, 'Page.getFrameTree');
+      const frameIds: string[] = [];
+      const collect = (ft: { frame: { id: string }; childFrames?: unknown[] }, depth: number) => {
+        if (depth > 0) frameIds.push(ft.frame.id);
+        for (const c of (ft.childFrames || []) as typeof ft[]) collect(c, depth + 1);
+      };
+      collect(tree.frameTree, 0);
+      for (const n of nodes) {
+        if ((n.role?.value === 'Iframe' || n.role?.value === 'iframe') && n.backendDOMNodeId !== undefined) {
+          const d = await this.cdp<{ node: { frameId?: string; contentDocument?: unknown } }>(tabId, 'DOM.describeNode', { backendNodeId: n.backendDOMNodeId }).catch(() => null);
+          const fid = d?.node.frameId;
+          if (!fid) continue;
+          if (frameIds.includes(fid)) {
+            const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', { frameId: fid }).catch(() => null);
+            if (sub) children.set(n.backendDOMNodeId, { nodes: sub.nodes, frameId: fid });
+          } else {
+            // Out-of-process iframe: find its session.
+            const child = [...t.children.entries()].find(([, v]) => v.targetId === fid);
+            if (child) {
+              const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {}, child[0]).catch(() => null);
+              if (sub) children.set(n.backendDOMNodeId, { nodes: sub.nodes, sessionId: child[0], frameId: fid, ownerBackendNodeId: n.backendDOMNodeId });
+            }
+          }
+        }
+      }
+      let visible: Set<number> | undefined;
+      if ((opts.scope || 'viewport') === 'viewport') visible = await this.#visibleNodes(tabId);
+      const exclude = new Set<number>();
+      const host = await this.cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', { expression: `document.querySelector('overtake-overlay')` }).catch(() => null);
+      if (host?.result.objectId) {
+        const d = await this.cdp<{ node: { backendNodeId: number } }>(tabId, 'DOM.describeNode', { objectId: host.result.objectId }).catch(() => null);
+        if (d) exclude.add(d.node.backendNodeId);
+        void this.cdp(tabId, 'Runtime.releaseObject', { objectId: host.result.objectId }).catch(() => {});
+      }
+      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, nextRef: () => ++refCounter, maxLines: opts.maxLines });
+      t.refs = out.refs;
+      const info = await this.pageInfo(tabId);
+      return { url: info.url, title: info.title, snapshot: out.text, refCount: out.refs.size };
+    });
+  }
+
+  async #visibleNodes(tabId: number): Promise<Set<number>> {
+    const snap = await this.cdp<{ documents: { nodes: { backendNodeId: number[] }; layout: { nodeIndex: number[]; bounds: number[][] }; scrollOffsetX?: number; scrollOffsetY?: number }[] }>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] });
+    const m = await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
+    const vp = m.cssVisualViewport;
+    const doc = snap.documents[0];
+    const visible = new Set<number>();
+    if (!doc) return visible;
+    for (let i = 0; i < doc.layout.nodeIndex.length; i++) {
+      const [x, y, w, h] = doc.layout.bounds[i];
+      if (w <= 0 || h <= 0) continue;
+      if (x + w < vp.pageX || x > vp.pageX + vp.clientWidth || y + h < vp.pageY || y > vp.pageY + vp.clientHeight) continue;
+      visible.add(doc.nodes.backendNodeId[doc.layout.nodeIndex[i]]);
+    }
+    return visible;
+  }
+
+  // -------------------------------------------------------------------------
+  // Target resolution
+
+  async #resolve(t: TabState, target: string): Promise<{ point?: { x: number; y: number }; node?: RefTarget & { objectId?: string }; desc: string }> {
+    const tabId = t.tabId;
+    const coord = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(target);
+    if (coord) return { point: { x: Number(coord[1]), y: Number(coord[2]) }, desc: `point ${coord[1]},${coord[2]}` };
+    const ref = /^@(\d+)$|^ref=(\d+)$/.exec(target.trim());
+    if (ref) {
+      const id = Number(ref[1] ?? ref[2]);
+      const r = t.refs.get(id);
+      if (!r) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `Ref @${id} is unknown or stale (the page navigated or a newer snapshot replaced it). Take a new browser_snapshot.`);
+      return { node: r, desc: `@${id} ${r.role}${r.name ? ` "${r.name}"` : ''}` };
+    }
+    const { kind, sel } = parseSelector(target);
+    const finder = `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)})`;
+    const r = await this.cdp<{ result: { type: string; subtype?: string; objectId?: string; value?: { count: number } }; exceptionDetails?: Json }>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false });
+    if (r.exceptionDetails) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${target}`);
+    if (r.result.subtype !== 'node' || !r.result.objectId) {
+      const cnt = await this.cdp<{ result: { value: { count: number } } }>(tabId, 'Runtime.callFunctionOn', { objectId: r.result.objectId, functionDeclaration: 'function(){return this}', returnByValue: true }).catch(() => null);
+      const count = cnt?.result.value?.count ?? 0;
+      if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
+      throw new OvertakeError(count ? ErrorCode.ELEMENT_AMBIGUOUS : ErrorCode.ELEMENT_NOT_FOUND, count ? `${target} matched ${count} elements; make it unique (or use a snapshot @ref).` : `${target} matched no element.`);
+    }
+    const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: r.result.objectId });
+    return { node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: r.result.objectId }, desc: target };
+  }
+
+  /** Scroll into view, verify the element is the top hit target, return root-viewport coordinates. */
+  async #pointFor(t: TabState, node: RefTarget & { objectId?: string }, force = false): Promise<{ x: number; y: number }> {
+    const tabId = t.tabId;
+    const sid = node.sessionId;
+    await this.cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: node.backendNodeId }, sid).catch(() => {});
+    let objectId = node.objectId;
+    if (!objectId || sid) {
+      const res = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId }, sid).catch(() => null);
+      if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
+      objectId = res.object.objectId;
+    }
+    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
+      objectId,
+      returnByValue: true,
+      functionDeclaration: `function(){
+        const r = this.getBoundingClientRect();
+        if (!r.width || !r.height) return { ok: false, reason: 'the element has no size (hidden?)' };
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const root = this.getRootNode();
+        const stack = (root.elementsFromPoint ? root : document).elementsFromPoint(cx, cy).filter((e) => e.localName !== 'overtake-overlay');
+        const top = stack[0];
+        const desc = (e) => e ? e.localName + (e.id ? '#' + e.id : '') + (typeof e.className === 'string' && e.className ? '.' + e.className.trim().split(/\\s+/).slice(0, 2).join('.') : '') : 'nothing';
+        const ok = !!top && (top === this || this.contains(top) || (top.localName === 'label' && top.control === this));
+        return { ok, top: desc(top), disabled: !!this.disabled };
+      }`,
+    }, sid);
+    const v = check.result.value;
+    if (!force) {
+      if (v.reason) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `Cannot act on the element: ${v.reason}.`);
+      if (!v.ok) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${v.top} at its center. Close the covering element or pass force:true.`);
+    }
+    const q = await this.cdp<{ quads: number[][] }>(tabId, 'DOM.getContentQuads', { backendNodeId: node.backendNodeId }, sid).catch(() => ({ quads: [] as number[][] }));
+    if (!q.quads.length) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The element has no visible box.');
+    const quad = q.quads[0];
+    let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+    let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+    if (sid && node.ownerBackendNodeId !== undefined) {
+      const box = await this.cdp<{ model: { content: number[] } }>(tabId, 'DOM.getBoxModel', { backendNodeId: node.ownerBackendNodeId });
+      x += box.model.content[0];
+      y += box.model.content[1];
+    }
+    return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+  }
+
+  #jump(t: TabState, to: { x: number; y: number }): InputStep[] {
+    t.cursor = to;
+    return [{ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: to.x, y: to.y, button: 'none' } }];
+  }
+
+  #path(t: TabState, to: { x: number; y: number }): InputStep[] {
+    const from = t.cursor || { x: Math.max(0, to.x - 160), y: Math.max(0, to.y - 90) };
+    const dist = Math.hypot(to.x - from.x, to.y - from.y);
+    // Few real mouseMoved steps: the overlay's spring animates the visible cursor smoothly
+    // between them, and each step pays the input-gate handshake (benchmark: 14 steps = 360 ms).
+    const n = Math.max(2, Math.min(6, Math.round(dist / 120)));
+    const steps: InputStep[] = [];
+    for (let i = 1; i <= n; i++) {
+      const k = i / n;
+      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2; // easeInOutQuad
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: from.x + (to.x - from.x) * e, y: from.y + (to.y - from.y) * e, button: 'none' }, delayMs: i === 1 ? 0 : 12 });
+    }
+    t.cursor = to;
+    return steps;
+  }
+
+  async #receiptAfter(t: TabState, navBefore: number) {
+    // No fixed pause: a navigation the action caused was announced (frameRequestedNavigation)
+    // before the input reply. Then wait for its commit and load, using the recorded event
+    // times, so a page that loaded before we started waiting is not missed (benchmark: that
+    // cost ~150 ms per navigating click).
+    await sleep(0);
+    if (t.lastNavAt > navBefore || t.navRequestedAt > navBefore) {
+      const commitBy = Date.now() + 3000;
+      const loadBy = Date.now() + 8000;
+      let lastPoll = 0;
+      for (;;) {
+        const now = Date.now();
+        if (t.downloadAt > navBefore && t.lastNavAt <= navBefore) break; // it became a download
+        if (t.lastNavAt > navBefore) {
+          if (t.lastLoadAt >= t.lastNavAt || now > loadBy) break;
+          // Fallback if the load event was missed (e.g. re-attach): the committed document's readyState.
+          if (now - lastPoll > 150) {
+            lastPoll = now;
+            const r = await this.cdp<{ result: { value?: string } }>(t.tabId, 'Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }, undefined, 2000).catch(() => null);
+            if (r?.result.value === 'complete' && t.lastNavAt > navBefore) break;
+          }
+        } else if (now > commitBy) break; // requested but never committed (cancelled, or very slow)
+        await sleep(10);
+      }
+    }
+    const info = t.dialog ? { url: '', title: '' } : await this.pageInfo(t.tabId).catch(() => ({ url: '', title: '' }));
+    // A requested navigation can turn into a download or be cancelled: report only commits.
+    const navigated = t.lastNavAt > navBefore;
+    return { navigated, url: info.url, title: info.title, ...(t.dialog ? { dialog: t.dialog } : {}) };
+  }
+
+  async #tabsBefore(tabId: number): Promise<Set<number>> {
+    const sid = await this.spaceOf(tabId);
+    const r = await this.client.request<{ tabs: { tabId: number }[] }>('tabs.list', { spaceId: sid });
+    return new Set(r.tabs.map((x) => x.tabId));
+  }
+
+  async #popups(tabId: number, before: Set<number>) {
+    const sid = await this.spaceOf(tabId);
+    const r = await this.client.request<{ tabs: { tabId: number; url?: string; managed: boolean }[] }>('tabs.list', { spaceId: sid });
+    return r.tabs.filter((x) => !before.has(x.tabId));
+  }
+
+  // -------------------------------------------------------------------------
+  // Actions
+
+  async click(tabId: number, target: string, opts: { button?: 'left' | 'right' | 'middle'; clickCount?: number; label?: string; force?: boolean; modifiers?: number; humanlike?: boolean } = {}) {
+    return this.action(tabId, async (t) => {
+      const tm: Record<string, number> = {};
+      let t0 = performance.now();
+      const lap = (k: string) => { const n = performance.now(); tm[k] = Math.round(n - t0); t0 = n; };
+      const r = await this.#resolve(t, target);
+      lap('resolve');
+      const pt = r.point ?? (await this.#pointFor(t, r.node!, opts.force));
+      lap('point');
+      const navBefore = Date.now();
+      const before = await this.#tabsBefore(tabId);
+      lap('tabs');
+      const button = opts.button || 'left';
+      const count = opts.clickCount || 1;
+      // Default: the visible cursor glides (overlay animation) but the page only gets a
+      // move onto the target, press and release, each still through the input gate.
+      // humanlike: real pointer moves along the path too (hover effects on the way).
+      const steps = opts.humanlike ? this.#path(t, pt) : this.#jump(t, pt);
+      for (let i = 1; i <= count; i++) {
+        steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pt.x, y: pt.y, button, clickCount: i, modifiers: opts.modifiers || 0 }, delayMs: i === 1 ? 0 : 40 });
+        steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pt.x, y: pt.y, button, clickCount: i, modifiers: opts.modifiers || 0 } });
+      }
+      await this.client.request('input.batch', { tabId, steps, label: opts.label || `click ${r.desc}`.slice(0, 60) });
+      lap('input');
+      if (r.node?.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.node.objectId }).catch(() => {});
+      const receipt = await this.#receiptAfter(t, navBefore);
+      lap('receipt');
+      const popups = await this.#popups(tabId, before).catch(() => []);
+      lap('popups');
+      return { clicked: r.desc, at: pt, ...receipt, ...(popups.length ? { popups } : {}), timingMs: tm };
+    });
+  }
+
+  async hover(tabId: number, target: string, label?: string) {
+    return this.action(tabId, async (t) => {
+      const r = await this.#resolve(t, target);
+      const pt = r.point ?? (await this.#pointFor(t, r.node!, true));
+      await this.client.request('input.batch', { tabId, steps: this.#path(t, pt), label: label || `hover ${r.desc}`.slice(0, 60) });
+      return { hovered: r.desc, at: pt };
+    });
+  }
+
+  async type(tabId: number, opts: { target?: string; text: string; clear?: boolean; submit?: boolean; slowly?: boolean; label?: string }) {
+    return this.action(tabId, async (t) => {
+      const steps: InputStep[] = [];
+      let desc = 'focused element';
+      if (opts.target) {
+        const r = await this.#resolve(t, opts.target);
+        desc = r.desc;
+        const pt = r.point ?? (await this.#pointFor(t, r.node!));
+        // Same as a default click: visual glide only, real move onto the field, press, release.
+        steps.push(...this.#jump(t, pt));
+        steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pt.x, y: pt.y, button: 'left', clickCount: 1 } });
+        steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: 1 } });
+        await this.client.request('input.batch', { tabId, steps: steps.splice(0), label: opts.label || `type into ${desc}`.slice(0, 60) });
+      }
+      if (opts.clear) {
+        await this.cdp(tabId, 'Runtime.evaluate', {
+          expression: `(() => { const e = document.activeElement; if (!e) return; if (typeof e.select === 'function') e.select(); else { const r = document.createRange(); r.selectNodeContents(e); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } })()`,
+        });
+        steps.push(...chordSteps('Backspace'));
+      }
+      if (opts.slowly) steps.push(...typeSteps(opts.text).map((s) => ({ ...s, delayMs: 25 })));
+      else if (opts.text) steps.push({ method: 'Input.insertText', params: { text: opts.text } });
+      if (opts.submit) steps.push(...chordSteps('Enter'));
+      const navBefore = Date.now();
+      if (steps.length) await this.client.request('input.batch', { tabId, steps });
+      const value = await this.cdp<{ result: { value: unknown } }>(tabId, 'Runtime.evaluate', {
+        expression: `(() => { const e = document.activeElement; return e ? (e.value ?? e.textContent ?? null) : null; })()`, returnByValue: true,
+      }).catch(() => null);
+      const receipt = opts.submit ? await this.#receiptAfter(t, navBefore) : {};
+      return { typedInto: desc, value: value?.result.value, ...receipt };
+    });
+  }
+
+  async press(tabId: number, keys: string, repeat = 1) {
+    return this.action(tabId, async (t) => {
+      const steps: InputStep[] = [];
+      for (let i = 0; i < Math.min(repeat, 50); i++) steps.push(...chordSteps(keys));
+      const navBefore = Date.now();
+      await this.client.request('input.batch', { tabId, steps });
+      return { pressed: keys, repeat, ...(await this.#receiptAfter(t, navBefore)) };
+    });
+  }
+
+  async scroll(tabId: number, opts: { target?: string; dx?: number; dy?: number; label?: string }) {
+    return this.action(tabId, async (t) => {
+      let pt: { x: number; y: number };
+      if (opts.target) {
+        const r = await this.#resolve(t, opts.target);
+        pt = r.point ?? (await this.#pointFor(t, r.node!, true));
+      } else {
+        const m = await this.cdp<{ cssVisualViewport: { clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
+        pt = { x: Math.round(m.cssVisualViewport.clientWidth / 2), y: Math.round(m.cssVisualViewport.clientHeight / 2) };
+      }
+      const steps = this.#path(t, pt);
+      const dx = opts.dx || 0;
+      const dy = opts.dy ?? 600;
+      const n = Math.max(1, Math.min(20, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 200)));
+      for (let i = 0; i < n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: pt.x, y: pt.y, deltaX: dx / n, deltaY: dy / n }, delayMs: 24 });
+      await this.client.request('input.batch', { tabId, steps, label: opts.label || 'scroll' });
+      await sleep(250);
+      const pos = await this.cdp<{ result: { value: { x: number; y: number; maxY: number } } }>(tabId, 'Runtime.evaluate', {
+        expression: '({x: scrollX, y: scrollY, maxY: document.documentElement.scrollHeight - innerHeight})', returnByValue: true,
+      });
+      return { scrolledAt: pt, delta: { dx, dy }, scroll: pos.result.value };
+    });
+  }
+
+  async drag(tabId: number, from: string, to: string, label?: string) {
+    return this.action(tabId, async (t) => {
+      const a = await this.#resolve(t, from);
+      const pa = a.point ?? (await this.#pointFor(t, a.node!, true));
+      const b = await this.#resolve(t, to);
+      const pb = b.point ?? (await this.#pointFor(t, b.node!, true));
+      const steps = this.#path(t, pa);
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pa.x, y: pa.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      const n = 12;
+      for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: pa.x + ((pb.x - pa.x) * i) / n, y: pa.y + ((pb.y - pa.y) * i) / n, button: 'left', buttons: 1 }, delayMs: 18 });
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      t.cursor = pb;
+      await this.client.request('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
+      return { dragged: { from: pa, to: pb } };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Screenshots
+
+  async screenshot(tabId: number, opts: { fullPage?: boolean; target?: string; format?: 'png' | 'jpeg' | 'webp'; quality?: number; path?: string; includeOverlay?: boolean }) {
+    return this.action(tabId, async (t) => {
+      const format = opts.format || 'png';
+      const params: Json = { format, ...(format !== 'png' && opts.quality ? { quality: opts.quality } : {}) };
+      let clip: { x: number; y: number; width: number; height: number } | null = null;
+      const m = await this.cdp<{ cssContentSize: { width: number; height: number }; cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
+      if (opts.target) {
+        const r = await this.#resolve(t, opts.target);
+        if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'Screenshot target must be an element, not coordinates.');
+        await this.cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: r.node.backendNodeId }, r.node.sessionId).catch(() => {});
+        const q = await this.cdp<{ quads: number[][] }>(tabId, 'DOM.getContentQuads', { backendNodeId: r.node.backendNodeId }, r.node.sessionId);
+        const quad = q.quads[0];
+        const xs = [quad[0], quad[2], quad[4], quad[6]];
+        const ys = [quad[1], quad[3], quad[5], quad[7]];
+        const vp = (await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number } }>(tabId, 'Page.getLayoutMetrics')).cssVisualViewport;
+        clip = { x: Math.min(...xs) + vp.pageX, y: Math.min(...ys) + vp.pageY, width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+        params.captureBeyondViewport = true;
+      } else if (opts.fullPage) {
+        clip = { x: 0, y: 0, width: Math.ceil(m.cssContentSize.width), height: Math.min(Math.ceil(m.cssContentSize.height), 16384) };
+        params.captureBeyondViewport = true;
+      }
+      if (clip) params.clip = { ...clip, scale: 1 };
+      const r = await this.client.request<{ data: string }>('screenshot', { tabId, params, includeOverlay: !!opts.includeOverlay }, 60_000);
+      const bytes = Buffer.from(r.data, 'base64');
+      let savedTo: string | undefined;
+      if (opts.path || bytes.length > 4_500_000) {
+        const p = opts.path && isAbsolute(opts.path) ? opts.path : join(tmpdir(), `overtake-${tabId}-${Date.now()}.${format}`);
+        await mkdir(dirname(p), { recursive: true });
+        await writeFile(p, bytes);
+        savedTo = p;
+      }
+      return {
+        data: bytes.length <= 4_500_000 ? r.data : undefined,
+        mimeType: `image/${format}`,
+        bytes: bytes.length,
+        savedTo,
+        viewport: { width: m.cssVisualViewport.clientWidth, height: m.cssVisualViewport.clientHeight },
+        contentSize: m.cssContentSize,
+        clip,
+        fullPage: !!opts.fullPage,
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // JavaScript
+
+  async evaluate(tabId: number, expression: string, opts: { frameId?: string; awaitPromise?: boolean; timeoutMs?: number } = {}) {
+    return this.action(tabId, async (t) => {
+      const params: Json = { expression, returnByValue: true, awaitPromise: opts.awaitPromise !== false, replMode: true, userGesture: true, generatePreview: false };
+      let sessionId: string | undefined;
+      if (opts.frameId) {
+        const child = [...t.children.entries()].find(([, v]) => v.targetId === opts.frameId);
+        if (child) sessionId = child[0];
+        else {
+          const ctx = t.contexts.get(opts.frameId);
+          if (!ctx) throw new OvertakeError(ErrorCode.BAD_REQUEST, `No execution context for frame ${opts.frameId}. List frames with browser_frames.`);
+          params.contextId = ctx;
+        }
+      }
+      if (opts.timeoutMs) params.timeout = opts.timeoutMs;
+      const r = await this.cdp<{ result: { type: string; value?: unknown; description?: string; unserializableValue?: string }; exceptionDetails?: { text: string; exception?: { description?: string } } }>(tabId, 'Runtime.evaluate', params, sessionId, (opts.timeoutMs ?? 30_000) + 5000);
+      if (r.exceptionDetails) {
+        return { ok: false, exception: r.exceptionDetails.exception?.description || r.exceptionDetails.text };
+      }
+      const v = r.result;
+      return { ok: true, type: v.type, value: v.value !== undefined ? v.value : v.unserializableValue ?? v.description };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Network / console / events
+
+  network(tabId: number, opts: { urlIncludes?: string; type?: string; status?: number; failedOnly?: boolean; limit?: number }) {
+    const t = this.#tab(tabId);
+    let list = [...t.net.values()];
+    if (opts.urlIncludes) list = list.filter((e) => e.url.includes(opts.urlIncludes!));
+    if (opts.type) list = list.filter((e) => (e.type || '').toLowerCase() === opts.type!.toLowerCase());
+    if (opts.status !== undefined) list = list.filter((e) => e.status === opts.status);
+    if (opts.failedOnly) list = list.filter((e) => e.failed || (e.status ?? 0) >= 400);
+    list = list.slice(-(opts.limit ?? 50));
+    return list.map((e) => ({ requestId: e.requestId, method: e.method, url: e.url.slice(0, 300), type: e.type, status: e.status ?? (e.failed ? 'failed' : 'pending'), mimeType: e.mimeType, ms: e.endedAt ? e.endedAt - e.startedAt : undefined, bytes: e.encodedDataLength, failed: e.failed, fromCache: e.fromCache || undefined }));
+  }
+
+  async networkDetail(tabId: number, requestId: string, includeBody = true) {
+    return this.action(tabId, async (t) => {
+      const e = t.net.get(requestId);
+      if (!e) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Unknown requestId ${requestId}; list requests first.`);
+      let body: { body: string; base64Encoded: boolean } | null = null;
+      let bodyError: string | undefined;
+      if (includeBody && e.endedAt && !e.failed) {
+        body = await this.cdp<{ body: string; base64Encoded: boolean }>(tabId, 'Network.getResponseBody', { requestId }, e.sessionId).catch((err) => {
+          bodyError = (err as Error).message;
+          return null;
+        });
+      }
+      let postData = e.postData;
+      if (!postData && e.hasPostData) postData = (await this.cdp<{ postData: string }>(tabId, 'Network.getRequestPostData', { requestId }, e.sessionId).catch(() => null))?.postData;
+      const text = body ? (body.base64Encoded ? `[base64 ${body.body.length} chars]` : body.body) : undefined;
+      return { ...e, postData: postData?.slice(0, 20_000), responseBody: text?.slice(0, 100_000), responseBodyTruncated: (text?.length ?? 0) > 100_000, bodyError };
+    });
+  }
+
+  clearNetwork(tabId: number) {
+    this.#tab(tabId).net.clear();
+  }
+
+  consoleEntries(tabId: number, opts: { level?: string; sinceSeq?: number; limit?: number }) {
+    let list = this.#tab(tabId).console;
+    if (opts.sinceSeq) list = list.filter((e) => e.seq > opts.sinceSeq!);
+    if (opts.level) list = list.filter((e) => e.level.includes(opts.level!));
+    return list.slice(-(opts.limit ?? 100));
+  }
+
+  events(tabId: number, opts: { methodPrefix?: string; sinceSeq?: number; limit?: number }) {
+    let list = this.#tab(tabId).events;
+    if (opts.sinceSeq) list = list.filter((e) => e.seq > opts.sinceSeq!);
+    if (opts.methodPrefix) list = list.filter((e) => e.method.startsWith(opts.methodPrefix!));
+    return list.slice(-(opts.limit ?? 50)).map((e) => {
+      const s = JSON.stringify(e.params);
+      return { seq: e.seq, at: e.at, method: e.method, sessionId: e.sessionId, params: s.length > 4000 ? s.slice(0, 4000) + '…' : e.params };
+    });
+  }
+
+  latestSeq(): number {
+    return seq;
+  }
+
+  // -------------------------------------------------------------------------
+  // Interception (Fetch domain)
+
+  async #applyFetch(t: TabState) {
+    if (!t.intercepts.length) {
+      await this.cdp(t.tabId, 'Fetch.disable').catch(() => {});
+      return;
+    }
+    await this.cdp(t.tabId, 'Fetch.enable', { patterns: t.intercepts.map((r) => ({ urlPattern: r.urlPattern, requestStage: 'Request' })) });
+  }
+
+  async #onRequestPaused(t: TabState, sessionId: string | undefined, p: Json) {
+    const req = p.request as Json;
+    const url = req.url as string;
+    const rule = t.intercepts.find((r) => globToRegExp(r.urlPattern).test(url));
+    const requestId = p.requestId as string;
+    try {
+      if (!rule) await this.cdp(t.tabId, 'Fetch.continueRequest', { requestId }, sessionId);
+      else if (rule.block) {
+        rule.hits++;
+        await this.cdp(t.tabId, 'Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }, sessionId);
+      } else if (rule.response) {
+        rule.hits++;
+        const headers = Object.entries(rule.response.headers).map(([name, value]) => ({ name, value }));
+        await this.cdp(t.tabId, 'Fetch.fulfillRequest', { requestId, responseCode: rule.response.status, responseHeaders: headers, body: Buffer.from(rule.response.body).toString('base64') }, sessionId);
+      }
+    } catch {
+      // Lost control mid-flight: the extension disables Fetch on take-over, which releases the request.
+    }
+  }
+
+  async intercept(tabId: number, opts: { action: 'add' | 'remove' | 'list' | 'clear'; urlPattern?: string; block?: boolean; status?: number; body?: string; contentType?: string; headers?: Record<string, string>; ruleId?: number }) {
+    return this.action(tabId, async (t) => {
+      if (opts.action === 'add') {
+        if (!opts.urlPattern) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'urlPattern is required.');
+        const rule: InterceptRule = {
+          id: t.intercepts.reduce((m, r) => Math.max(m, r.id), 0) + 1,
+          urlPattern: opts.urlPattern,
+          block: !!opts.block,
+          response: opts.block ? undefined : { status: opts.status ?? 200, headers: { 'content-type': opts.contentType || 'application/json', ...(opts.headers || {}) }, body: opts.body ?? '' },
+          hits: 0,
+        };
+        t.intercepts.push(rule);
+      } else if (opts.action === 'remove') t.intercepts = t.intercepts.filter((r) => r.id !== opts.ruleId);
+      else if (opts.action === 'clear') t.intercepts = [];
+      if (opts.action !== 'list') await this.#applyFetch(t);
+      return { rules: t.intercepts.map((r) => ({ id: r.id, urlPattern: r.urlPattern, mode: r.block ? 'block' : `fulfill ${r.response?.status}`, hits: r.hits })) };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Emulation
+
+  async emulate(tabId: number, opts: { device?: string; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean; userAgent?: string; touch?: boolean; colorScheme?: 'light' | 'dark'; offline?: boolean; reset?: boolean }) {
+    return this.action(tabId, async () => {
+      if (opts.reset) {
+        await this.cdp(tabId, 'Emulation.clearDeviceMetricsOverride');
+        await this.cdp(tabId, 'Emulation.setTouchEmulationEnabled', { enabled: false }).catch(() => {});
+        await this.cdp(tabId, 'Emulation.setUserAgentOverride', { userAgent: '' }).catch(() => {});
+        await this.cdp(tabId, 'Emulation.setEmulatedMedia', { features: [] }).catch(() => {});
+        await this.cdp(tabId, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }).catch(() => {});
+        return { reset: true };
+      }
+      const dev = opts.device ? DEVICES[opts.device] : undefined;
+      if (opts.device && !dev) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Unknown device "${opts.device}". Known: ${Object.keys(DEVICES).join(', ')}`);
+      const width = opts.width ?? dev?.width;
+      const height = opts.height ?? dev?.height;
+      const applied: Json = {};
+      if (width && height) {
+        const metrics = { width, height, deviceScaleFactor: opts.deviceScaleFactor ?? dev?.deviceScaleFactor ?? 1, mobile: opts.mobile ?? dev?.mobile ?? false };
+        await this.cdp(tabId, 'Emulation.setDeviceMetricsOverride', metrics);
+        applied.metrics = metrics;
+      }
+      const ua = opts.userAgent ?? dev?.userAgent;
+      if (ua) {
+        await this.cdp(tabId, 'Emulation.setUserAgentOverride', { userAgent: ua });
+        applied.userAgent = ua;
+      }
+      const touch = opts.touch ?? dev?.mobile;
+      if (touch !== undefined) {
+        await this.cdp(tabId, 'Emulation.setTouchEmulationEnabled', { enabled: touch, maxTouchPoints: touch ? 5 : 1 });
+        applied.touch = touch;
+      }
+      if (opts.colorScheme) {
+        await this.cdp(tabId, 'Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: opts.colorScheme }] });
+        applied.colorScheme = opts.colorScheme;
+      }
+      if (opts.offline !== undefined) {
+        await this.cdp(tabId, 'Network.emulateNetworkConditions', { offline: opts.offline, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+        applied.offline = opts.offline;
+      }
+      return { applied };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Performance tracing
+
+  async traceStart(tabId: number, categories?: string[]) {
+    return this.action(tabId, async (t) => {
+      if (t.tracing) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'A trace is already running for this tab.');
+      t.tracing = { chunks: [], done: null };
+      try {
+        await this.cdp(tabId, 'Tracing.start', {
+          transferMode: 'ReportEvents',
+          traceConfig: { includedCategories: categories?.length ? categories : ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'v8.execute', 'blink.user_timing', 'loading', 'latencyInfo'] },
+        });
+      } catch (e) {
+        t.tracing = null;
+        throw e;
+      }
+      await this.cdp(tabId, 'Performance.enable').catch(() => {});
+      return { tracing: true };
+    });
+  }
+
+  async traceStop(tabId: number, path?: string) {
+    return this.action(tabId, async (t) => {
+      if (!t.tracing) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'No trace is running for this tab.');
+      const tr = t.tracing;
+      const done = new Promise<void>((resolve) => {
+        tr.done = () => resolve();
+        setTimeout(resolve, 20_000);
+      });
+      await this.cdp(tabId, 'Tracing.end');
+      await done;
+      t.tracing = null;
+      const events = tr.chunks.map((c) => JSON.parse(c) as { name?: string; dur?: number; cat?: string });
+      const metrics = await this.cdp<{ metrics: { name: string; value: number }[] }>(tabId, 'Performance.getMetrics').catch(() => ({ metrics: [] }));
+      const out = path && isAbsolute(path) ? path : join(tmpdir(), `overtake-trace-${tabId}-${Date.now()}.json`);
+      await mkdir(dirname(out), { recursive: true });
+      await writeFile(out, JSON.stringify({ traceEvents: events }));
+      const longTasks = events.filter((e) => e.name === 'RunTask' && (e.dur ?? 0) > 50_000).length;
+      const pick = ['JSHeapUsedSize', 'Nodes', 'LayoutCount', 'RecalcStyleCount', 'ScriptDuration', 'TaskDuration'];
+      return { savedTo: out, eventCount: events.length, longTasksOver50ms: longTasks, metrics: Object.fromEntries(metrics.metrics.filter((m) => pick.includes(m.name)).map((m) => [m.name, m.value])), note: 'Open the file in Chrome DevTools > Performance > Load profile.' };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // JavaScript debugging
+
+  async debug(tabId: number, opts: { action: string; url?: string; urlRegex?: string; line?: number; column?: number; condition?: string; breakpointId?: string; expression?: string }) {
+    // While paused, the action that triggered the pause still holds the space lock;
+    // inspection and resume must not wait behind it (they use the extension's immediate lane).
+    const unlocked = ['state', 'evaluate', 'resume', 'step_over', 'step_into', 'step_out'].includes(opts.action);
+    const run = unlocked ? async <T>(fn: (t: TabState) => Promise<T>) => fn(this.#tab(tabId)) : <T>(fn: (t: TabState) => Promise<T>) => this.action(tabId, fn);
+    return run(async (t) => {
+      switch (opts.action) {
+        case 'enable':
+          await this.cdp(tabId, 'Debugger.enable', { maxScriptsCacheSize: 10_000_000 });
+          return { enabled: true };
+        case 'disable':
+          await this.cdp(tabId, 'Debugger.disable');
+          t.paused = null;
+          return { enabled: false };
+        case 'set_breakpoint': {
+          if (opts.line === undefined || (!opts.url && !opts.urlRegex)) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'url (or urlRegex) and line (1-based) are required.');
+          await this.cdp(tabId, 'Debugger.enable', {});
+          const r = await this.cdp<{ breakpointId: string; locations: unknown[] }>(tabId, 'Debugger.setBreakpointByUrl', { lineNumber: opts.line - 1, columnNumber: opts.column, ...(opts.urlRegex ? { urlRegex: opts.urlRegex } : { url: opts.url }), condition: opts.condition });
+          return r;
+        }
+        case 'remove_breakpoint':
+          await this.cdp(tabId, 'Debugger.removeBreakpoint', { breakpointId: opts.breakpointId });
+          return { removed: opts.breakpointId };
+        case 'pause':
+          await this.cdp(tabId, 'Debugger.pause');
+          await sleep(100);
+          return this.#pausedState(t);
+        case 'resume':
+        case 'step_over':
+        case 'step_into':
+        case 'step_out': {
+          const m = { resume: 'Debugger.resume', step_over: 'Debugger.stepOver', step_into: 'Debugger.stepInto', step_out: 'Debugger.stepOut' }[opts.action]!;
+          await this.cdp(tabId, m);
+          await sleep(opts.action === 'resume' ? 50 : 150);
+          return opts.action === 'resume' ? { resumed: true } : this.#pausedState(t);
+        }
+        case 'state':
+          return this.#pausedState(t);
+        case 'evaluate': {
+          const p = t.paused as { callFrames?: { callFrameId: string }[] } | null;
+          if (!p?.callFrames?.length) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'Not paused.');
+          const r = await this.cdp<{ result: { value?: unknown; description?: string }; exceptionDetails?: { text: string } }>(tabId, 'Debugger.evaluateOnCallFrame', { callFrameId: p.callFrames[0].callFrameId, expression: opts.expression || 'undefined', returnByValue: true });
+          return r.exceptionDetails ? { ok: false, exception: r.exceptionDetails.text } : { ok: true, value: r.result.value ?? r.result.description };
+        }
+      }
+      throw new OvertakeError(ErrorCode.BAD_REQUEST, `Unknown debug action ${opts.action}`);
+    });
+  }
+
+  async #pausedState(t: TabState) {
+    const p = t.paused as { reason: string; hitBreakpoints?: string[]; callFrames: { callFrameId: string; functionName: string; url: string; location: { lineNumber: number; columnNumber: number }; scopeChain: { type: string; object: { objectId?: string } }[] }[] } | null;
+    if (!p) return { paused: false };
+    const frames = p.callFrames.slice(0, 6).map((f) => ({ function: f.functionName || '<anonymous>', url: f.url, line: f.location.lineNumber + 1, column: f.location.columnNumber + 1 }));
+    let locals: Record<string, unknown> = {};
+    const local = p.callFrames[0]?.scopeChain.find((s) => s.type === 'local');
+    if (local?.object.objectId) {
+      const props = await this.cdp<{ result: { name: string; value?: { value?: unknown; description?: string; type: string } }[] }>(t.tabId, 'Runtime.getProperties', { objectId: local.object.objectId, ownProperties: true }).catch(() => ({ result: [] }));
+      locals = Object.fromEntries(props.result.slice(0, 30).map((pr) => [pr.name, pr.value ? pr.value.value ?? pr.value.description ?? pr.value.type : undefined]));
+    }
+    return { paused: true, reason: p.reason, hitBreakpoints: p.hitBreakpoints, callFrames: frames, locals };
+  }
+
+  // -------------------------------------------------------------------------
+  // Frames, dialogs
+
+  async frames(tabId: number) {
+    return this.action(tabId, async (t) => {
+      const tree = await this.cdp<{ frameTree: { frame: { id: string; url: string; name?: string }; childFrames?: unknown[] } }>(tabId, 'Page.getFrameTree');
+      const out: { frameId: string; url: string; name?: string; depth: number; outOfProcess: boolean; sessionId?: string }[] = [];
+      const walk = (ft: { frame: { id: string; url: string; name?: string }; childFrames?: unknown[] }, depth: number) => {
+        const child = [...t.children.entries()].find(([, v]) => v.targetId === ft.frame.id);
+        out.push({ frameId: ft.frame.id, url: ft.frame.url, name: ft.frame.name, depth, outOfProcess: !!child, sessionId: child?.[0] });
+        for (const c of (ft.childFrames || []) as typeof ft[]) walk(c, depth + 1);
+      };
+      walk(tree.frameTree, 0);
+      // OOPIFs appear in the main frame tree only as placeholders on some versions; list sessions too.
+      for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: v.url, depth: 1, outOfProcess: true, sessionId: sid });
+      return { frames: out };
+    });
+  }
+
+  /**
+   * Put local files into a file input. A target that is (or resolves to) an <input type=file>
+   * is set directly; anything else is clicked with the native file chooser intercepted, and
+   * the files go to the input that opened it. The page receives normal input/change events.
+   */
+  async upload(tabId: number, target: string, files: string[], label?: string) {
+    if (!files.length) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'Give at least one file.');
+    for (const f of files) {
+      if (!isAbsolute(f)) throw new OvertakeError(ErrorCode.BAD_REQUEST, `File paths must be absolute: ${f}`);
+      const st = await stat(f).catch(() => null);
+      if (!st?.isFile()) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Not a readable file: ${f}`);
+    }
+    const direct = await this.action(tabId, async (t) => {
+      const r = await this.#resolve(t, target);
+      if (!r.node) return null;
+      const sid = r.node.sessionId;
+      let objectId = r.node.objectId;
+      if (!objectId) objectId = (await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: r.node.backendNodeId }, sid)).object.objectId;
+      const info = await this.cdp<{ result: { value: { multiple: boolean } | null } }>(tabId, 'Runtime.callFunctionOn', {
+        objectId, returnByValue: true,
+        functionDeclaration: `function(){ return this.localName === 'input' && this.type === 'file' ? { multiple: this.multiple } : null; }`,
+      }, sid);
+      void this.cdp(tabId, 'Runtime.releaseObject', { objectId }, sid).catch(() => {});
+      const v = info.result.value;
+      if (!v) return null;
+      if (files.length > 1 && !v.multiple) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'This file input accepts a single file.');
+      await this.cdp(tabId, 'DOM.setFileInputFiles', { files, backendNodeId: r.node.backendNodeId }, sid);
+      return { uploaded: files.length, via: 'input', target: r.desc };
+    });
+    if (direct) return direct;
+    const t = this.#tab(tabId);
+    let waiter: ((p: { backendNodeId: number; mode: string; sessionId?: string }) => void) | null = null;
+    const opened = new Promise<{ backendNodeId: number; mode: string; sessionId?: string }>((resolve, reject) => {
+      waiter = resolve;
+      t.chooserWaiters.add(resolve);
+      setTimeout(() => reject(new OvertakeError(ErrorCode.TIMEOUT, `Clicking ${target} did not open a file chooser within 5 s.`)), 5000);
+    });
+    opened.catch(() => {});
+    await this.cdp(tabId, 'Page.setInterceptFileChooserDialog', { enabled: true });
+    try {
+      await this.click(tabId, target, { label: label || 'Choose a file' });
+      const ev = await opened;
+      if (files.length > 1 && ev.mode !== 'selectMultiple') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'This file chooser accepts a single file.');
+      await this.cdp(tabId, 'DOM.setFileInputFiles', { files, backendNodeId: ev.backendNodeId }, ev.sessionId);
+      return { uploaded: files.length, via: 'chooser', mode: ev.mode };
+    } finally {
+      if (waiter) t.chooserWaiters.delete(waiter);
+      await this.cdp(tabId, 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+    }
+  }
+
+  /**
+   * Downloads started from a Space (Chrome saves them to the user's download folder; changing
+   * that is profile-wide and denied). wait: until the given (or newest recent) download finishes.
+   * save: copy a finished download to an absolute path.
+   */
+  async downloads(spaceId: number, opts: { action: 'list' | 'wait' | 'save'; downloadId?: number; sinceMs?: number; timeoutMs?: number; path?: string }) {
+    type D = { downloadId: number; url: string; filename: string; state: string; startTime: string; error?: string; bytesReceived: number; totalBytes: number };
+    const list = async () => (await this.client.request<{ downloads: D[] }>('downloads.list', { spaceId })).downloads;
+    if (opts.action === 'list') return { downloads: await list() };
+    if (opts.action === 'save') {
+      if (opts.downloadId === undefined || !opts.path) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'save needs downloadId and path.');
+      if (!isAbsolute(opts.path)) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'path must be absolute.');
+      const d = (await list()).find((x) => x.downloadId === opts.downloadId);
+      if (!d) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Download ${opts.downloadId} is not one of this Space's downloads.`);
+      if (d.state !== 'complete') throw new OvertakeError(ErrorCode.BAD_REQUEST, `Download ${d.downloadId} is ${d.state}; wait for it first.`);
+      await mkdir(dirname(opts.path), { recursive: true });
+      await copyFile(d.filename, opts.path);
+      return { saved: opts.path, from: d.filename, bytes: d.totalBytes || d.bytesReceived };
+    }
+    const since = opts.sinceMs ?? Date.now() - 15_000;
+    const deadline = Date.now() + (opts.timeoutMs ?? 30_000);
+    for (;;) {
+      const all = await list();
+      const d = opts.downloadId !== undefined
+        ? all.find((x) => x.downloadId === opts.downloadId)
+        : all.filter((x) => Date.parse(x.startTime) >= since).sort((a, b) => Date.parse(b.startTime) - Date.parse(a.startTime))[0];
+      if (d?.state === 'complete') return { download: d };
+      if (d?.state === 'interrupted') throw new OvertakeError(ErrorCode.BAD_REQUEST, `Download ${d.downloadId} failed: ${d.error ?? 'interrupted'}.`);
+      if (Date.now() > deadline) throw new OvertakeError(ErrorCode.TIMEOUT, d ? `Download ${d.downloadId} still ${d.state} (${d.bytesReceived}/${d.totalBytes} bytes).` : 'No download from this Space started in the time window.');
+      await sleep(250);
+    }
+  }
+
+  async dialog(tabId: number, accept: boolean, promptText?: string) {
+    const t = this.#tab(tabId);
+    if (!t.dialog) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'No JavaScript dialog is open on this tab.');
+    await this.cdp(tabId, 'Page.handleJavaScriptDialog', { accept, ...(promptText !== undefined ? { promptText } : {}) });
+    const was = t.dialog;
+    t.dialog = null;
+    return { handled: was, accepted: accept };
+  }
+
+  pendingDialog(tabId: number) {
+    return this.#tabs.get(tabId)?.dialog ?? null;
+  }
+}
