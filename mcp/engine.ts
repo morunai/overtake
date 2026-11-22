@@ -10,7 +10,7 @@ import { BrokerClient } from './broker-client.ts';
 import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
-import { redactNetworkEntry, redactUrl } from './redact.ts';
+import { redactCdp, redactNetworkEntry, redactUrl } from './redact.ts';
 
 type Json = Record<string, unknown>;
 
@@ -1005,8 +1005,9 @@ export class Engine {
     if (opts.sinceSeq) list = list.filter((e) => e.seq > opts.sinceSeq!);
     if (opts.methodPrefix) list = list.filter((e) => e.method.startsWith(opts.methodPrefix!));
     return list.slice(-(opts.limit ?? 50)).map((e) => {
-      const s = JSON.stringify(e.params);
-      return { seq: e.seq, at: e.at, method: e.method, sessionId: e.sessionId, params: s.length > 4000 ? s.slice(0, 4000) + '…' : e.params };
+      const params = redactCdp(e.params); // Network/Fetch events carry headers and cookies
+      const s = JSON.stringify(params);
+      return { seq: e.seq, at: e.at, method: e.method, sessionId: e.sessionId, params: s.length > 4000 ? s.slice(0, 4000) + '…' : params };
     });
   }
 
