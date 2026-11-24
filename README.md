@@ -139,6 +139,7 @@ needed.
 | Control | Where |
 |---|---|
 | Take over, pause, resume, stop, give back | The dock on every Space tab |
+| Move the dock | Drag the grip on its left edge; it stays where you put it |
 | Open the Spaces overview | Toolbar icon, or `Alt+Shift+S` |
 | Take over or give back | `Alt+Shift+E` |
 | New Space | `N` on the Spaces overview, or the **New Space** card |

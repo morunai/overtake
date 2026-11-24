@@ -205,6 +205,36 @@ test('14-15. human gives control back from the dock; the agent resumes', async (
   assert.equal(await count(), before + 1);
 });
 
+test('the dock drags by its grip, stays in the viewport, and the drag never reaches the page', async () => {
+  const gripBox = async () => {
+    const n = await h.overlayElement(human, (x) => (x.attributes || []).some((a: string, i: number, arr: string[]) => a === 'class' && arr[i + 1] === 'grip'));
+    assert.ok(n, 'dock has a grip');
+    const { model } = await h.browser.send<{ model: { content: number[] } }>('DOM.getBoxModel', { backendNodeId: n!.backendNodeId }, human);
+    const c = model.content;
+    return { x: (c[0] + c[4]) / 2, y: (c[1] + c[5]) / 2 };
+  };
+  const drag = async (from: { x: number; y: number }, dx: number, dy: number) => {
+    await h.browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none' }, human);
+    await h.browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 }, human);
+    for (let i = 1; i <= 8; i++) await h.browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x + (dx * i) / 8, y: from.y + (dy * i) / 8, button: 'left', buttons: 1 }, human);
+    await h.browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: from.x + dx, y: from.y + dy, button: 'left', clickCount: 1 }, human);
+    await sleep(100);
+  };
+  const before = await count();
+  const g0 = await gripBox();
+  await drag(g0, 260, 180);
+  const g1 = await gripBox();
+  assert.ok(Math.abs(g1.x - g0.x - 260) < 3 && Math.abs(g1.y - g0.y - 180) < 3, `dock moved with the grip: ${JSON.stringify({ g0, g1 })}`);
+  // Dragged far past the bottom right corner, it stops at the viewport edge.
+  await drag(g1, 5000, 5000);
+  const vp = await h.eval<{ w: number; h: number }>(human, '({ w: innerWidth, h: innerHeight })');
+  const g2 = await gripBox();
+  assert.ok(g2.x < vp.w && g2.y < vp.h, `dock stays inside the viewport: ${JSON.stringify({ g2, vp })}`);
+  assert.equal(await count(), before, 'the drag did not click the page');
+  assert.match(await h.overlayClasses(human, 'wrap'), /\bagent\b/, 'the agent is still in control after a drag');
+  await drag(g2, -5000, -5000); // back to the top left for the tests that follow
+});
+
 test('a take-over during a wait is reported at once, not masked as a timeout', async () => {
   const pending = A.call('browser_wait', { tabId: space.tabId, function: 'false', timeoutMs: 20_000 }).then(() => 'resolved', (e) => code(e));
   await sleep(500);
