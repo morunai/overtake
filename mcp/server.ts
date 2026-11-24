@@ -20,6 +20,7 @@ const INSTRUCTIONS = `Overtake drives the user's real Google Chrome through agen
 Rules:
 - Work inside a Space you own. Create one per user goal (spaces_create) and keep using its spaceId; it starts with one tab.
 - Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages.
+- Pass snapshot: true to browser_click, browser_type, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
 - A CERT_ERROR (untrusted certificate, Chrome's "Privacy error" page) cannot be bypassed from the extension: hand off so the user clicks "Proceed" once, then navigate again.
@@ -78,6 +79,41 @@ const register = server.registerTool.bind(server);
 
 const tabId = z.number().int().describe('Tab id (from spaces_create, spaces_list or browser_tabs).');
 const spaceId = z.number().int().describe('Space id.');
+const snapshotOpts = {
+  snapshot: z.boolean().default(false).describe('Also return an accessibility snapshot (with fresh @refs) of the page after the action, saving a browser_snapshot call.'),
+  snapshotScope: z.enum(['viewport', 'full_page']).default('viewport').describe('Scope of that snapshot.'),
+};
+type SnapshotOpts = { snapshot: boolean; snapshotScope: 'viewport' | 'full_page' };
+
+function snapshotText(r: { url: string; title: string; snapshot: string }) {
+  return `url: ${r.url}\ntitle: ${r.title}\n\n${r.snapshot}`;
+}
+
+/** The action's JSON receipt, plus a snapshot of the page afterwards when asked for. The
+ *  snapshot is skipped (with the reason) when it cannot be taken safely: a dialog is open, the
+ *  page is still loading, the agent was paused, or control changed after the action.
+ *  `since` is when the action started (Date.now()), for input and navigation actions. */
+async function afterAction(tabId: number, r: unknown, o: SnapshotOpts, since?: number): Promise<ToolResult> {
+  const receipt = text(r);
+  if (!o.snapshot) return receipt;
+  const skipped = (why: string): ToolResult => ({ content: [...receipt.content, { type: 'text', text: `snapshot skipped: ${why}` }] });
+  const v = (r ?? {}) as { dialog?: unknown; loaded?: boolean; note?: string };
+  if (v.dialog || engine.pendingDialog(tabId)) return skipped('a JavaScript dialog is open; handle it with browser_dialog first.');
+  if (v.note) return skipped(v.note);
+  if (v.loaded === false) return skipped('the page is still loading; use browser_wait, then browser_snapshot.');
+  try {
+    // After an input action, let the page's own fetch-and-render finish first. browser_wait
+    // passes no `since`: its condition already says the page is ready.
+    if (since !== undefined) await engine.settle(tabId, since);
+    if ((await engine.pageInfo(tabId)).readyState === 'loading') return skipped('the page is still loading; use browser_wait, then browser_snapshot.');
+    const s = await engine.snapshot(tabId, { scope: o.snapshotScope });
+    return { content: [...receipt.content, { type: 'text', text: snapshotText(s) }] };
+  } catch (e) {
+    const w = toWireError(e);
+    return skipped(`${w.code}: ${w.message}`);
+  }
+}
+
 const target = z.string().describe('Element: snapshot ref "@12", "text=Sign in", "xpath=//button", a CSS selector, or viewport coordinates "x,y".');
 
 // ---------------------------------------------------------------------------
@@ -150,17 +186,20 @@ server.registerTool('browser_tabs', {
 
 server.registerTool('browser_navigate', {
   description: 'Navigate a tab and wait for load.',
-  inputSchema: { tabId, url: z.string(), waitUntil: z.enum(['load', 'commit', 'none']).default('load'), timeoutMs: z.number().int().max(120_000).default(30_000) },
-}, wrap(async (a: { tabId: number; url: string; waitUntil: 'load' | 'commit' | 'none'; timeoutMs: number }) => engine.navigate(a.tabId, a.url, a)));
+  inputSchema: { tabId, url: z.string(), waitUntil: z.enum(['load', 'commit', 'none']).default('load'), timeoutMs: z.number().int().max(120_000).default(30_000), ...snapshotOpts },
+}, wrap(async (a: { tabId: number; url: string; waitUntil: 'load' | 'commit' | 'none'; timeoutMs: number } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.navigate(a.tabId, a.url, a), a, t0); }));
 
 server.registerTool('browser_wait', {
   description: 'Wait until all given conditions hold: selector state, page text, URL substring, JS predicate, network idle, or load complete. Use delayMs for a plain pause (do not use page timers for delays). Fails immediately with USER_IN_CONTROL if the human takes over.',
   inputSchema: {
     tabId, delayMs: z.number().int().min(0).max(120_000).optional().describe('Plain pause in ms, measured outside the page.'), selector: z.string().optional(), state: z.enum(['visible', 'attached', 'hidden']).optional(), text: z.string().optional(), urlIncludes: z.string().optional(),
     function: z.string().optional().describe('JS expression evaluated in the page, truthy = done (may be async).'), networkIdleMs: z.number().int().optional(), load: z.boolean().optional(),
-    timeoutMs: z.number().int().max(120_000).default(10_000),
+    timeoutMs: z.number().int().max(120_000).default(10_000), ...snapshotOpts,
   },
-}, wrap(async (a: { tabId: number } & Record<string, unknown>) => engine.wait(a.tabId, a as Parameters<Engine['wait']>[1])));
+}, wrap(async (a: { tabId: number } & SnapshotOpts & Record<string, unknown>) => {
+  const { snapshot, snapshotScope, ...cond } = a;
+  return afterAction(a.tabId, await engine.wait(a.tabId, cond as Parameters<Engine['wait']>[1]), { snapshot, snapshotScope });
+}));
 
 // ---------------------------------------------------------------------------
 // Observation
@@ -169,8 +208,7 @@ server.registerTool('browser_snapshot', {
   description: 'Accessibility snapshot of the page (includes iframe content) with @refs for interactive elements. Default scope is the viewport; use full_page for everything. Refs become stale after navigation.',
   inputSchema: { tabId, scope: z.enum(['viewport', 'full_page']).default('viewport'), maxLines: z.number().int().min(50).max(5000).optional() },
 }, wrap(async (a: { tabId: number; scope: 'viewport' | 'full_page'; maxLines?: number }) => {
-  const r = await engine.snapshot(a.tabId, a);
-  return text(`url: ${r.url}\ntitle: ${r.title}\n\n${r.snapshot}`);
+  return text(snapshotText(await engine.snapshot(a.tabId, a)));
 }));
 
 server.registerTool('browser_screenshot', {
@@ -233,22 +271,22 @@ server.registerTool('browser_click', {
   inputSchema: {
     tabId, target, button: z.enum(['left', 'right', 'middle']).default('left'), clickCount: z.number().int().min(1).max(3).default(1), force: z.boolean().default(false),
     humanlike: z.boolean().default(false).describe('Also send real pointer moves along the path (slower; for pages that react to hover on the way).'),
-    label: z.string().max(60).optional().describe('3-6 word description shown next to the agent cursor.'),
+    label: z.string().max(60).optional().describe('3-6 word description shown next to the agent cursor.'), ...snapshotOpts,
   },
-}, wrap(async (a: { tabId: number; target: string; button: 'left' | 'right' | 'middle'; clickCount: number; force: boolean; humanlike: boolean; label?: string }) => engine.click(a.tabId, a.target, a)));
+}, wrap(async (a: { tabId: number; target: string; button: 'left' | 'right' | 'middle'; clickCount: number; force: boolean; humanlike: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.click(a.tabId, a.target, a), a, t0); }));
 
 server.registerTool('browser_hover', { description: 'Move the mouse over an element.', inputSchema: { tabId, target, label: z.string().max(60).optional() } },
   wrap(async (a: { tabId: number; target: string; label?: string }) => engine.hover(a.tabId, a.target, a.label)));
 
 server.registerTool('browser_type', {
   description: 'Type text. With target, clicks it first. clear replaces existing text; submit presses Enter; slowly sends per-key events instead of a single insertText.',
-  inputSchema: { tabId, text: z.string(), target: target.optional(), clear: z.boolean().default(false), submit: z.boolean().default(false), slowly: z.boolean().default(false), label: z.string().max(60).optional() },
-}, wrap(async (a: { tabId: number; text: string; target?: string; clear: boolean; submit: boolean; slowly: boolean; label?: string }) => engine.type(a.tabId, a)));
+  inputSchema: { tabId, text: z.string(), target: target.optional(), clear: z.boolean().default(false), submit: z.boolean().default(false), slowly: z.boolean().default(false), label: z.string().max(60).optional(), ...snapshotOpts },
+}, wrap(async (a: { tabId: number; text: string; target?: string; clear: boolean; submit: boolean; slowly: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.type(a.tabId, a), a, t0); }));
 
 server.registerTool('browser_press', {
   description: 'Press a key or chord, Playwright syntax: "Enter", "Tab", "Shift+Tab", "ControlOrMeta+a", "ArrowDown".',
-  inputSchema: { tabId, keys: z.string(), repeat: z.number().int().min(1).max(50).default(1) },
-}, wrap(async (a: { tabId: number; keys: string; repeat: number }) => engine.press(a.tabId, a.keys, a.repeat)));
+  inputSchema: { tabId, keys: z.string(), repeat: z.number().int().min(1).max(50).default(1), ...snapshotOpts },
+}, wrap(async (a: { tabId: number; keys: string; repeat: number } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.press(a.tabId, a.keys, a.repeat), a, t0); }));
 
 server.registerTool('browser_scroll', {
   description: 'Scroll with real mouse-wheel input at an element or the viewport center. Positive dy scrolls down.',

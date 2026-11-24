@@ -102,7 +102,7 @@ function analyse(lines: Line[]) {
 const quiz = (await startQuizServer(PORT)) as unknown as { close: () => void };
 const tools = (ONLY ? [ONLY] : ['overtake', 'cli']) as ('overtake' | 'cli')[];
 let env: OvertakeEnv | null = null;
-writeFileSync(join(OUT, 'config.json'), JSON.stringify({ stamp, runs: RUNS, tools, budget: BUDGET, model: MODEL || '(default)', claude: execSync('claude --version').toString().trim(), cliVersion: execSync(`${CLI_BIN} --version 2>&1`).toString().trim().split('\n')[0] }, null, 2));
+writeFileSync(join(OUT, 'config.json'), JSON.stringify({ stamp, runs: RUNS, tools, budget: BUDGET, model: MODEL || '(default)', claude: execSync('claude --version').toString().trim(), cliVersion: tools.includes('cli') ? execSync(`${CLI_BIN} --version 2>&1`).toString().trim().split('\n')[0] : null }, null, 2));
 try {
   if (tools.includes('overtake')) { env = new OvertakeEnv(); await env.start(); }
   for (let run = FIRST; run <= RUNS; run++) {

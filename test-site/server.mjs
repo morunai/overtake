@@ -12,6 +12,9 @@ export function startTestServer(p = port) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname === '/api/data') {
+      // ?delay=ms answers late, like a real API, for the snapshot-after-action test.
+      const delay = Math.min(Number(url.searchParams.get('delay')) || 0, 5000);
+      if (delay) await new Promise((r) => setTimeout(r, delay));
       res.writeHead(200, { 'content-type': 'application/json', 'x-test-header': 'overtake' });
       res.end(JSON.stringify({ message: 'hello from api', query: Object.fromEntries(url.searchParams) }));
       return;
