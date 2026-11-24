@@ -23,6 +23,7 @@ for (const [src, dst] of [
   ['extension/manifest.json', 'manifest.json'],
   ['extension/src/overview/overview.html', 'overview.html'],
   ['extension/src/overview/overview.css', 'overview.css'],
+  ['extension/src/overview/bg.jpg', 'bg.jpg'],
 ]) copyFileSync(join(root, src), join(out, dst));
 
 // --- icons: a glowing blue orb, rendered procedurally (no image dependencies)

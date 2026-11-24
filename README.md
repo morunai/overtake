@@ -1,13 +1,9 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
-    <img src="docs/brand/logo-light.svg" alt="overtake." width="360">
-  </picture>
+  <img src="docs/brand/banner.jpg" alt="overtake. Your browser. Your sessions. Any agent." width="100%">
 </p>
 
 <p align="center">
-  <b>Open-source agent workspaces for your existing Chrome.</b><br>
-  Your browser. Your sessions. Any agent.
+  <b>Open-source agent workspaces for your existing Chrome.</b>
 </p>
 
 <p align="center">
@@ -69,7 +65,7 @@ remote debugging port.
 
 <p align="center">
   <img src="docs/screenshots/overview.png" alt="Spaces overview with five Spaces in different states" width="860">
-  <br><sub>The Spaces overview: every task in its own window, with live previews and who is in control.</sub>
+  <br><sub>The Spaces overview: every task in its own window, with a live preview, its state and who is driving it.</sub>
 </p>
 
 | Agent at work | Needs you | You have control | Paused |
@@ -145,6 +141,7 @@ needed.
 | Take over, pause, resume, stop, give back | The dock on every Space tab |
 | Open the Spaces overview | Toolbar icon, or `Alt+Shift+S` |
 | Take over or give back | `Alt+Shift+E` |
+| New Space | `N` on the Spaces overview, or the **New Space** card |
 
 ## How it works
 
