@@ -26,6 +26,7 @@ export const ErrorCode = {
   DEBUGGER_DETACHED: 'DEBUGGER_DETACHED',
   PROTECTED_PAGE: 'PROTECTED_PAGE',
   CDP_ERROR: 'CDP_ERROR',
+  CERT_ERROR: 'CERT_ERROR',
   CDP_METHOD_DENIED: 'CDP_METHOD_DENIED',
   UNSUPPORTED: 'UNSUPPORTED',
   TIMEOUT: 'TIMEOUT',
@@ -168,6 +169,7 @@ export type Operation =
   | 'tabs.create'
   | 'tabs.close'
   | 'tabs.activate'
+  | 'tabs.navigate'
   | 'tabs.adopt'
   | 'cdp'
   | 'input.batch'
@@ -176,7 +178,7 @@ export type Operation =
 export const OPERATIONS: readonly Operation[] = [
   'hello', 'capabilities', 'spaces.list', 'spaces.create', 'spaces.close', 'spaces.switch', 'spaces.rename',
   'space.claim', 'space.release', 'space.handoff', 'space.resume', 'space.setStatus', 'space.markError',
-  'tabs.list', 'downloads.list', 'tabs.create', 'tabs.close', 'tabs.activate', 'tabs.adopt', 'cdp', 'input.batch', 'screenshot',
+  'tabs.list', 'downloads.list', 'tabs.create', 'tabs.close', 'tabs.activate', 'tabs.navigate', 'tabs.adopt', 'cdp', 'input.batch', 'screenshot',
 ];
 
 // ---------------------------------------------------------------------------

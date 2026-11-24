@@ -825,6 +825,18 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
       }, { tabId });
     }
 
+    case 'tabs.navigate': {
+      // Fallback for tabs the debugger cannot drive: Chrome's own error and warning pages (for
+      // example the certificate interstitial) refuse CDP, including Page.navigate.
+      const { space, tabId } = managedTab(agentKey, args.tabId);
+      const url = args.url;
+      if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'tabs.navigate only accepts http(s) URLs.');
+      return runGated(space, agentKey, 'navigating', async () => {
+        await chrome.tabs.update(tabId, { url });
+        return { navigating: true };
+      }, { tabId });
+    }
+
     case 'tabs.adopt': {
       if (typeof args.tabId !== 'number') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'tabId must be a number.');
       const tabId = args.tabId;

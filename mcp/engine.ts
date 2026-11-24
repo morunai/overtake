@@ -11,6 +11,7 @@ import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './sn
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
 import { redactCdp, redactNetworkEntry, redactUrl } from './redact.ts';
+import { navigationError } from './navigation-error.ts';
 
 type Json = Record<string, unknown>;
 
@@ -463,10 +464,24 @@ export class Engine {
           resolve(false);
         }, timeoutMs);
       });
-      const r = await this.cdp<{ frameId: string; loaderId?: string; errorText?: string }>(tabId, 'Page.navigate', { url }, undefined, timeoutMs + 5000);
-      if (r.errorText) throw new OvertakeError(ErrorCode.CDP_ERROR, `Navigation to ${url} failed: ${r.errorText}`);
+      let r: { frameId: string; loaderId?: string; errorText?: string };
+      try {
+        r = await this.cdp<{ frameId: string; loaderId?: string; errorText?: string }>(tabId, 'Page.navigate', { url }, undefined, timeoutMs + 5000);
+      } catch (e) {
+        // Chrome's error and warning pages (such as the certificate interstitial) cannot be
+        // driven over CDP, so leave them through the tabs API instead.
+        if (!/cannot attach to this target/i.test((e as Error).message) || !/^https?:\/\//i.test(url)) throw e;
+        await this.client.request('tabs.navigate', { tabId, url });
+        r = { frameId: '', loaderId: 'tabs-api' };
+      }
+      if (r.errorText) throw navigationError(url, r.errorText);
       let didLoad = false;
-      if (opts.waitUntil !== 'none' && opts.waitUntil !== 'commit' && r.loaderId) didLoad = await Promise.race([loaded, this.#pollLoaded(tabId, url, timeoutMs)]);
+      if (r.loaderId === 'tabs-api') {
+        // Load events from the warning page are unreliable here; poll until the new page is up.
+        didLoad = await this.#pollLoaded(tabId, url, timeoutMs);
+      } else if (opts.waitUntil !== 'none' && opts.waitUntil !== 'commit' && r.loaderId) {
+        didLoad = await Promise.race([loaded, this.#pollLoaded(tabId, url, timeoutMs)]);
+      }
       const info = await this.pageInfo(tabId);
       return { ...info, loaded: didLoad || !r.loaderId, sameDocument: !r.loaderId };
     });
