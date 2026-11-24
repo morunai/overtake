@@ -186,7 +186,7 @@ function updateBadge() {
   const running = [...spaces.values()].filter((s) => s.ctl.control === 'AGENT_CONTROL').length;
   const needs = [...spaces.values()].some((s) => s.ctl.userReason === 'handoff');
   void chrome.action.setBadgeText({ text: needs ? '!' : running ? String(running) : '' });
-  void chrome.action.setBadgeBackgroundColor({ color: needs ? '#f59f00' : '#3b5bdb' });
+  void chrome.action.setBadgeBackgroundColor({ color: needs ? '#f59f00' : '#1c1c1e' });
 }
 
 // ---------------------------------------------------------------------------

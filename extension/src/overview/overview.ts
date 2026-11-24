@@ -1,6 +1,7 @@
 // Spaces overview: stable card order, a selection ring, hover controls, one caption line,
 // a "+" tile and a keyboard hint.
 import { human, ownerState, activity, controls, identityOf, el, activeTab, host, type Snapshot, type SpaceV } from './ui.ts';
+import { AGENT_LOGO } from '../ui/identity.ts';
 
 let snap: Snapshot = { spaces: [], agents: [], brokerConnected: false, strictInputGate: null };
 const previews: Record<number, { dataUrl: string; at: number }> = {};
@@ -8,6 +9,7 @@ const busy = new Set<number>();
 let selected: number | null = null;
 let confirming: number | null = null;
 let renaming: number | null = null;
+let menuFor: number | null = null;
 let detailsOpen = false;
 let newTileNode: HTMLElement | null = null;
 let firstSnapshot = true;
@@ -29,7 +31,10 @@ const ICONS: Record<string, string> = {
   giveback: svg('<path d="M6 4 2.5 7.5 6 11M3 7.5h6.5a4 4 0 0 1 4 4V13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'),
   dismissError: svg('<path d="m3.5 8.5 3 3 6-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'),
   close: svg('<path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>'),
-  plus: svg('<path d="M20 5v30M5 20h30" stroke="currentColor" stroke-width="4.2" stroke-linecap="round"/>', '0 0 40 40'),
+  plus: svg('<path d="M20 6v28M6 20h28" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/>', '0 0 40 40'),
+  more: svg('<circle cx="3.5" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="12.5" cy="8" r="1.4" fill="currentColor"/>'),
+  tabs: svg('<rect x="2.5" y="4.5" width="9" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 2.5h6.5a2 2 0 0 1 2 2V11" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>'),
+  user: svg('<circle cx="8" cy="5.6" r="2.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3 13.5c.8-2.4 2.7-3.6 5-3.6s4.2 1.2 5 3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>'),
 };
 
 function flash(msg: string) {
@@ -75,11 +80,11 @@ function layoutCards() {
   const avail = grid.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
   if (avail <= 0) return;
   const gap = parseFloat(style.columnGap) || 0;
-  const target = 428;
+  const target = 480;
   let cols = Math.max(1, Math.round((avail + gap) / (target + gap)));
   const width = () => (avail - (cols - 1) * gap) / cols;
-  while (width() > 560) cols++;
-  while (cols > 1 && width() < 260) cols--;
+  while (width() > 640) cols++;
+  while (cols > 1 && width() < 300) cols--;
   grid.style.setProperty('--columns', String(cols));
   grid.style.setProperty('--card-width', `${Math.floor(width())}px`);
   placeHint();
@@ -104,7 +109,7 @@ function card(s: SpaceV): HTMLElement {
   const shot = el('div', { class: 'shot' });
   if (prev) shot.append(el('img', { src: prev.dataUrl, alt: '' }));
   else shot.append(el('div', { class: 'empty' }, host(activeTab(s)?.url) || 'No preview yet'));
-  shot.append(el('div', { class: 'glow' }), el('div', { class: 'flow' }), el('div', { class: 'status' }));
+  shot.append(el('div', { class: 'glow' }), el('div', { class: 'status' }));
 
   const hov = el('div', { class: 'hov' });
   for (const c of controls(s)) {
@@ -153,9 +158,23 @@ function card(s: SpaceV): HTMLElement {
     n.addEventListener('click', (e) => e.detail > 1 && e.stopPropagation());
     return n;
   })();
-  const cap = el('div', { class: 'cap' }, p ? el('span', { class: `pill ${p.cls}` }, p.text) : null, name, el('span', { class: 'who' }, who(s)));
+  const id = identityOf(s);
+  const badge = el('span', { class: `who${id ? '' : ' user'}`, title: who(s) || 'Agent', 'aria-label': who(s) || 'Agent' });
+  badge.innerHTML = id ? AGENT_LOGO[id.kind] : s.createdBy === 'user' ? ICONS.user : AGENT_LOGO.generic;
+  const tabs = el('span', { class: 'tabs', title: `${s.tabs.length} tab${s.tabs.length === 1 ? '' : 's'}` });
+  tabs.innerHTML = ICONS.tabs;
+  tabs.append(el('span', {}, tabCount(s)));
+  const more = el('button', { class: 'more', title: 'More', 'aria-label': 'More actions', 'aria-haspopup': 'menu', 'aria-expanded': String(menuFor === s.spaceId) });
+  more.innerHTML = ICONS.more;
+  more.addEventListener('click', (e) => {
+    e.stopPropagation();
+    menuFor = menuFor === s.spaceId ? null : s.spaceId;
+    render();
+  });
+  const cap = el('div', { class: 'cap' }, badge, name, p ? el('span', { class: `pill ${p.cls}` }, p.text) : null, tabs, more);
+  if (menuFor === s.spaceId) cap.append(cardMenu(s));
 
-  const c = el('article', { class: 'card', tabindex: '0', 'data-space': String(s.spaceId) }, frame, cap);
+  const c = el('article', { class: 'card', tabindex: '0', 'data-space': String(s.spaceId) }, frame, cap, el('div', { class: 'flow' }));
   // One click opens the Space. Never rebuild the grid from pointer or focus handlers:
   // replacing the card between mousedown and mouseup makes the browser drop the click.
   c.addEventListener('click', (e) => {
@@ -165,6 +184,28 @@ function card(s: SpaceV): HTMLElement {
   });
   c.addEventListener('focus', () => select(s.spaceId));
   return c;
+}
+
+const tabCount = (s: SpaceV) => String(s.tabs.length);
+
+/** The "..." menu on a card: rename, details, close. */
+function cardMenu(s: SpaceV): HTMLElement {
+  const item = (label: string, run: () => void, cls = '') => {
+    const b = el('button', { role: 'menuitem', class: cls }, label);
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      menuFor = null;
+      run();
+    });
+    return b;
+  };
+  const pop = el('div', { class: 'pop', role: 'menu' },
+    item('Rename', () => { renaming = s.spaceId; render(); }),
+    item(detailsOpen && selected === s.spaceId ? 'Hide details' : 'Show details', () => { select(s.spaceId); toggleDetails(!(detailsOpen && selected === s.spaceId)); render(); }),
+    item('Close Space', () => { confirming = s.spaceId; render(); }, 'danger'),
+  );
+  pop.addEventListener('click', (e) => e.stopPropagation());
+  return pop;
 }
 
 function renameInput(s: SpaceV): HTMLElement {
@@ -192,7 +233,7 @@ function renameInput(s: SpaceV): HTMLElement {
 /** Card structure: anything that changes which elements a card has. Text and state
  *  classes are patched in place (patchCard), so frequent agent updates never rebuild it. */
 function cardKey(s: SpaceV): string {
-  return [pill(s)?.text ?? '', controls(s).map((c) => c.action).join(','), confirming === s.spaceId, renaming === s.spaceId, who(s), !!previews[s.spaceId]].join('|');
+  return [pill(s)?.text ?? '', controls(s).map((c) => c.action).join(','), confirming === s.spaceId, renaming === s.spaceId, menuFor === s.spaceId, who(s), s.createdBy, !!previews[s.spaceId]].join('|');
 }
 
 function patchCard(c: HTMLElement, s: SpaceV) {
@@ -202,6 +243,8 @@ function patchCard(c: HTMLElement, s: SpaceV) {
   c.setAttribute('aria-label', `${s.name}${pill(s) ? `, ${pill(s)!.text}` : ''}`);
   const name = c.querySelector('.cap .name');
   if (name && renaming !== s.spaceId && name.textContent !== s.name) name.textContent = s.name;
+  const tabs = c.querySelector('.cap .tabs span');
+  if (tabs && tabs.textContent !== tabCount(s)) tabs.textContent = tabCount(s);
   const status = c.querySelector('.status');
   const a = activity(s);
   if (status && status.textContent !== a) status.textContent = a;
@@ -241,9 +284,8 @@ function openSpace(id: number) {
 }
 
 function newTile(): HTMLElement {
-  const shot = el('div', { class: 'shot' });
-  shot.innerHTML = ICONS.plus;
-  const t = el('button', { class: 'new', 'aria-label': 'New Space', title: 'New Space' }, el('div', { class: 'frame' }, shot));
+  const t = el('button', { class: 'new', title: 'New Space (N)' }, el('b', {}, 'New Space'), el('span', {}, 'Open a browser window for an agent'));
+  t.insertAdjacentHTML('afterbegin', ICONS.plus);
   t.addEventListener('click', () => void newSpace());
   return t;
 }
@@ -314,6 +356,10 @@ menu.addEventListener('click', (e) => {
 });
 document.addEventListener('click', (e) => {
   if (!menu.hidden && !menu.contains(e.target as Node)) setMenu(false);
+  if (menuFor !== null && !(e.target as HTMLElement).closest?.('.pop')) {
+    menuFor = null;
+    render();
+  }
 });
 agentsBtn.addEventListener('click', () => toggleDetails());
 
@@ -381,8 +427,8 @@ function render() {
   if (hintText.dataset.mode !== mode) {
     hintText.dataset.mode = mode;
     hintText.innerHTML = list.length
-      ? '<b>Press <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>S</kbd> to come back</b> here, <kbd>←</kbd> <kbd>→</kbd> and <kbd>↵</kbd> to open a Space.'
-      : '<b>Agents open a Space</b> when they start working. Click + to open one yourself.';
+      ? 'Press <kbd>N</kbd> for a new Space, <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>S</kbd> to come back here'
+      : '<b>Agents open a Space</b> when they start working. Press <kbd>N</kbd> to open one yourself';
   }
 }
 
@@ -400,8 +446,15 @@ document.addEventListener('keydown', (e) => {
     openSpace(selected);
   } else if (e.key === 'i') {
     toggleDetails();
+  } else if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    void newSpace();
   } else if (e.key === 'Escape') {
     setMenu(false);
+    if (menuFor !== null) {
+      menuFor = null;
+      render();
+    }
     if (confirming !== null) {
       confirming = null;
       render();

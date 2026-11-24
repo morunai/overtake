@@ -1,7 +1,7 @@
 // Overtake in-page overlay. Runs in every frame at document_start.
 //
 // Top frame: closed Shadow DOM in the top layer (popover) with
-//   - blue glowing frame around the controlled page
+//   - red glowing frame around the controlled page
 //   - agent cursor + click ripples, positioned from real CDP input coordinates
 //   - floating dock: status + Take over / Pause / Resume / Stop / Give back
 //   - an input blocker (hit-test layer) while the agent is in control
@@ -98,7 +98,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
   /* The host already covers 100vw × 100vh. A second fixed layer would use the
      page's scrollbar-gutter-adjusted viewport and leave an unpainted edge. */
-  .wrap { position: absolute; inset: 0; pointer-events: none; --blue: 112 140 255; --amber: 245 179 66; --tone: var(--blue);
+  .wrap { position: absolute; inset: 0; pointer-events: none; --red: 255 61 79; --red-text: 255 128 140; --amber: 245 179 66; --tone: var(--red);
     --ease-out: cubic-bezier(0.22, 1, 0.36, 1); --ease-io: cubic-bezier(0.65, 0, 0.35, 1); --fast: 120ms; --base: 180ms; --slow: 280ms; }
   .wrap.paused { --tone: var(--amber); }
 
@@ -156,11 +156,11 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding-right: 4px; }
   .t1 { font-size: 13px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
   .t2 { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; color: #9aa1b5; }
-  .agent .t2 { color: rgb(var(--blue)); }
+  .agent .t2 { color: rgb(var(--red-text)); }
   .paused .t2 { color: rgb(var(--amber)); }
   .need .t2 { color: #ffb36b; }
   /* Live activity shimmer: a light band sweeping across the status text. */
-  .busy .t2 { background: linear-gradient(105deg, rgb(var(--blue)) 40%, #fff 50%, rgb(var(--blue)) 60%) 100% 0 / 250% 100% no-repeat;
+  .busy .t2 { background: linear-gradient(105deg, rgb(var(--red-text)) 40%, #fff 50%, rgb(var(--red-text)) 60%) 100% 0 / 250% 100% no-repeat;
     -webkit-background-clip: text; background-clip: text; color: transparent; animation: sweep 1.9s linear infinite; }
   @keyframes sweep { 0% { background-position: 100% 0 } 70%, 100% { background-position: 0% 0 } }
   .swap .txt, .swap .btns { animation: swap var(--base) var(--ease-out); }
@@ -171,11 +171,11 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
     transition: background var(--fast) var(--ease-out), color var(--fast), scale var(--fast) var(--ease-out); }
   button:hover { background: rgb(255 255 255 / .14); }
   button:active { scale: .97; }
-  button:focus-visible { outline: 2px solid rgb(var(--blue)); outline-offset: 2px; }
+  button:focus-visible { outline: 2px solid rgb(var(--red)); outline-offset: 2px; }
   button.primary { background: #f2f4fa; color: #14161c; }
   button.primary:hover { background: #fff; }
-  button.accent { background: rgb(76 110 245); color: #fff; }
-  button.accent:hover { background: rgb(92 124 250); }
+  button.accent { background: rgb(230 38 58); color: #fff; }
+  button.accent:hover { background: rgb(245 56 75); }
   button.icon { width: 34px; padding: 0; justify-content: center; }
   button.icon svg { width: 14px; height: 14px; }
   button.stop:hover { background: rgb(250 82 82 / .18); color: #ff8f8f; }

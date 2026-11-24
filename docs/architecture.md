@@ -133,7 +133,7 @@ Layers inside the overlay's closed shadow root (top layer):
 
 | Layer | Role | Pointer events |
 |---|---|---|
-| `.edge` | atmospheric edge light (blue; amber when paused) | none |
+| `.edge` | atmospheric edge light (red; amber when paused) | none |
 | `.blocker` | **the input shield**, the only layer that blocks input | auto while the agent drives |
 | `canvas.field` | agent field: trail-revealed dot grid, click ripples, cursor glow (`agent-field.ts`) | none |
 | `.cursor` | arrow + action label, positioned by the field's spring each frame | none |
