@@ -146,7 +146,7 @@ export class AgentField {
     this.#wake();
   }
 
-  /** Light page background: dots switch from near-white to blue to stay legible. */
+  /** Light page background: dots switch from near-white to grey to stay legible. */
   setSurface(light: boolean) {
     if (this.#light === light) return;
     this.#light = light;
