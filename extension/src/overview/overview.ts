@@ -295,10 +295,16 @@ async function newSpace() {
 }
 
 function renderPanel() {
-  panel.hidden = !detailsOpen;
+  panel.classList.toggle('open', detailsOpen);
+  panel.setAttribute('aria-hidden', String(!detailsOpen));
+  panel.inert = !detailsOpen;
   if (!detailsOpen) return;
   const s = snap.spaces.find((x) => x.spaceId === selected) || ordered()[0];
   panel.replaceChildren();
+  const close = el('button', { class: 'close', title: 'Close (Esc)', 'aria-label': 'Close details' });
+  close.innerHTML = ICONS.close;
+  close.addEventListener('click', () => toggleDetails(false));
+  panel.append(el('div', { class: 'head' }, el('b', {}, 'Details'), close));
   if (s) {
     panel.append(el('h2', {}, s.name));
     const dl = el('dl');
@@ -451,6 +457,7 @@ document.addEventListener('keydown', (e) => {
     void newSpace();
   } else if (e.key === 'Escape') {
     setMenu(false);
+    if (detailsOpen) toggleDetails(false);
     if (menuFor !== null) {
       menuFor = null;
       render();
