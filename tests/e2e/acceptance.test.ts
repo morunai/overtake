@@ -114,6 +114,35 @@ test('9-10. genuine CDP click; network request and response inspected', async ()
   assert.match(log, /click isTrusted=true/);
 });
 
+test('an action with snapshot: true returns the page after it, with working refs', async () => {
+  // Default result is unchanged: one JSON receipt, no snapshot.
+  const plain = await A.callRaw('browser_click', { tabId: space.tabId, target: '#btn' });
+  assert.equal(plain.content.length, 1);
+  assert.ok(JSON.parse(plain.content[0].text).clicked);
+  const n = await count();
+  const r = await A.callRaw('browser_click', { tabId: space.tabId, target: '#btn', snapshot: true });
+  assert.ok(!r.isError);
+  assert.equal(r.content.length, 2);
+  assert.ok(JSON.parse(r.content[0].text).clicked, 'the receipt comes first');
+  const snap: string = r.content[1].text;
+  assert.match(snap, /^url: /);
+  assert.match(snap, new RegExp(`clicks: ${n + 1}`), 'the snapshot shows the state after the click');
+  // Its refs replace the old ones and work.
+  const ref = /button "Click me" (@\d+)/.exec(snap)![1];
+  await A.call('browser_click', { tabId: space.tabId, target: ref });
+  assert.equal(await count(), n + 2);
+  // A page that fetches and renders after the click: the snapshot waits for that.
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `(() => { const b = document.createElement('button'); b.id = 'later'; b.textContent = 'Load later'; const out = document.createElement('span'); b.onclick = async () => { const j = await (await fetch('/api/data?delay=200')).json(); out.textContent = 'later: ' + j.message; }; document.getElementById('count').after(b, out); })()` });
+  const later = await A.callRaw('browser_click', { tabId: space.tabId, target: '#later', snapshot: true });
+  assert.match(later.content[1].text, /later: hello from api/, 'the snapshot shows what the page rendered after its fetch');
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('later').nextSibling.remove(), document.getElementById('later').remove()` });
+  // The other action tools take it too.
+  const w = await A.callRaw('browser_wait', { tabId: space.tabId, text: `clicks: ${n + 2}`, snapshot: true });
+  assert.match(w.content[1].text, new RegExp(`clicks: ${n + 2}`));
+  const p = await A.callRaw('browser_press', { tabId: space.tabId, keys: 'Shift', snapshot: true, snapshotScope: 'full_page' });
+  assert.match(p.content[1].text, /button "Click me" @\d+/);
+});
+
 test('network results mask credentials (headers, cookies, tokens, passwords)', async () => {
   await A.call('browser_evaluate', { tabId: space.tabId, expression: `fetch('/api/session?token=test-query-secret&page=1', { method: 'POST', headers: { Authorization: 'Bearer test-bearer-secret', 'Content-Type': 'application/json' }, body: JSON.stringify({ user: 'tester', password: 'test-password-secret' }) }).then((r) => r.json())` });
   const list = await A.call('browser_network', { tabId: space.tabId, urlIncludes: '/api/session' });
@@ -179,6 +208,11 @@ test('12-13. human takes over from the dock; agent actions cannot continue', asy
   assert.equal(s.userReason, 'takeover');
   const before = await count();
   await assert.rejects(A.call('browser_click', { tabId: space.tabId, target: '#btn' }), (e) => code(e) === 'USER_IN_CONTROL');
+  // No snapshot leaks out after a take-over: the action fails before it.
+  const blocked = await A.callRaw('browser_click', { tabId: space.tabId, target: '#btn', snapshot: true });
+  assert.ok(blocked.isError);
+  assert.equal(blocked.content.length, 1);
+  assert.match(blocked.content[0].text, /^USER_IN_CONTROL/);
   await assert.rejects(A.call('browser_evaluate', { tabId: space.tabId, expression: '1' }), (e) => code(e) === 'USER_IN_CONTROL');
   await assert.rejects(A.call('space_resume', { spaceId: space.spaceId }), (e) => code(e) === 'USER_IN_CONTROL');
   await assert.rejects(A.call('space_claim', { spaceId: space.spaceId }), (e) => code(e) === 'USER_IN_CONTROL');

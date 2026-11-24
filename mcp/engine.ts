@@ -28,6 +28,7 @@ interface NetEntry {
   postData?: string;
   hasPostData?: boolean;
   startedAt: number;
+  respondedAt?: number;
   endedAt?: number;
   encodedDataLength?: number;
   failed?: string;
@@ -168,6 +169,15 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all = false) {
       return { count: pick.length };
     }).toString();
 
+/** Whether a request still counts as in flight for idle checks. Chrome never reports
+ *  loadingFinished for some requests that did get a response (fetch with keepalive, as
+ *  analytics and event beacons use), so a response more than a moment old counts as done. */
+function inFlight(e: NetEntry, now: number) {
+  if (e.endedAt) return false;
+  if (e.respondedAt) return now - e.respondedAt < 150;
+  return now - e.startedAt < 30_000;
+}
+
 export class Engine {
   readonly client: BrokerClient;
   #tabs = new Map<number, TabState>();
@@ -255,7 +265,7 @@ export class Engine {
       case 'Network.responseReceived': {
         const e = t.net.get(p.requestId as string);
         const r = p.response as Json;
-        if (e) Object.assign(e, { status: r.status, statusText: r.statusText, mimeType: r.mimeType, responseHeaders: r.headers, fromCache: !!r.fromDiskCache || !!r.fromServiceWorker });
+        if (e) Object.assign(e, { respondedAt: Date.now(), status: r.status, statusText: r.statusText, mimeType: r.mimeType, responseHeaders: r.headers, fromCache: !!r.fromDiskCache || !!r.fromServiceWorker });
         break;
       }
       case 'Network.loadingFinished': {
@@ -504,6 +514,38 @@ export class Engine {
     return false;
   }
 
+  /** Let the page finish reacting to an action before it is observed: wait until requests
+   *  started since `since` have finished and the DOM has been quiet for `quietMs`, at most
+   *  `maxMs`. Pages commonly fetch and render a moment after a click, and a snapshot taken
+   *  at once shows the old state. Best-effort: never throws. Polled from here, not with page
+   *  timers, which background throttling can stretch. */
+  async settle(tabId: number, since: number, { quietMs = 120, maxMs = 1500 } = {}) {
+    const t = this.#tabs.get(tabId);
+    const deadline = since + maxMs;
+    const watch = `(() => { let last = performance.now(); const mo = new MutationObserver(() => { last = performance.now(); });
+      mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+      return { idle: () => performance.now() - last, stop: () => mo.disconnect() }; })()`;
+    const obs = await this.cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', { expression: watch }, undefined, 2000).catch(() => null);
+    const objectId = obs?.result.objectId;
+    try {
+      while (Date.now() < deadline) {
+        const now = Date.now();
+        const busy = t && [...t.net.values()].some((e) => e.startedAt >= since && e.type !== 'EventSource' && e.type !== 'WebSocket' && inFlight(e, now));
+        if (!busy) {
+          if (!objectId) break;
+          const r = await this.cdp<{ result: { value?: number } }>(tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function () { return this.idle(); }', returnByValue: true }, undefined, 1000).catch(() => null);
+          if (r?.result.value === undefined || r.result.value >= quietMs) break; // quiet, or the document went away
+        }
+        await sleep(Math.max(10, Math.min(30, deadline - now)));
+      }
+    } finally {
+      if (objectId) {
+        void this.cdp(tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration: 'function () { this.stop(); }' }).catch(() => {});
+        void this.cdp(tabId, 'Runtime.releaseObject', { objectId }).catch(() => {});
+      }
+    }
+  }
+
   async pageInfo(tabId: number) {
     const r = await this.cdp<{ result: { value: { url: string; title: string; readyState: string } } }>(tabId, 'Runtime.evaluate', {
       expression: '({url: location.href, title: document.title, readyState: document.readyState})', returnByValue: true,
@@ -550,8 +592,8 @@ export class Engine {
         }
         if (cond.networkIdleMs) {
           const now = Date.now();
-          const inflight = [...t.net.values()].filter((e) => !e.endedAt && now - e.startedAt < 30_000);
-          const lastEnd = Math.max(0, ...[...t.net.values()].map((e) => e.endedAt || 0));
+          const inflight = [...t.net.values()].filter((e) => inFlight(e, now));
+          const lastEnd = Math.max(0, ...[...t.net.values()].map((e) => e.endedAt || (e.respondedAt ? e.respondedAt + 150 : 0)));
           if (inflight.length || now - lastEnd < cond.networkIdleMs) return false;
         }
         return true;

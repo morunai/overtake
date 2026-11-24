@@ -581,6 +581,21 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
         pass = !!msg.pass;
         if (!pass) permit = null;
         if (host) host.inert = pass;
+        // Chrome routes input to out-of-process iframes by the hit-test data of the last
+        // painted frame, so until a frame without the blocker is painted, agent clicks into a
+        // cross-site iframe still land on the blocker. Wait for that frame when there are frames.
+        if (pass && host && document.querySelector('iframe')) {
+          let done = false;
+          const finish = () => {
+            if (!done) {
+              done = true;
+              sendResponse('ack');
+            }
+          };
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+          setTimeout(finish, 50);
+          return true;
+        }
         sendResponse('ack');
         return false;
       case 'overtake:permit':
