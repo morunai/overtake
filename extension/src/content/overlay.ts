@@ -102,15 +102,15 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
     --ease-out: cubic-bezier(0.22, 1, 0.36, 1); --ease-io: cubic-bezier(0.65, 0, 0.35, 1); --fast: 120ms; --base: 180ms; --slow: 280ms; }
   .wrap.paused { --tone: var(--amber); }
 
-  /* Edge light: soft, atmospheric, heavier at the bottom; breathes slowly. */
+  /* Edge light: a faint static base and hairline. The moving halo is drawn by the field shader. */
   .edge { position: absolute; inset: 0; opacity: 0; transition: opacity 420ms var(--ease-out); pointer-events: none;
     background:
-      linear-gradient(to top, rgb(var(--tone) / .24), rgb(var(--tone) / 0) 100px),
-      linear-gradient(to right, rgb(var(--tone) / .20), rgb(var(--tone) / 0) 70px),
-      linear-gradient(to left, rgb(var(--tone) / .20), rgb(var(--tone) / 0) 70px),
-      linear-gradient(to bottom, rgb(var(--tone) / .14), rgb(var(--tone) / 0) 46px);
-    box-shadow: inset 0 0 0 1px rgb(var(--tone) / .45), inset 0 0 40px rgb(var(--tone) / .18); }
-  .edge::after { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 60% at 50% 105%, rgb(var(--tone) / .18), transparent 60%);
+      linear-gradient(to top, rgb(var(--tone) / .1), rgb(var(--tone) / 0) 90px),
+      linear-gradient(to right, rgb(var(--tone) / .08), rgb(var(--tone) / 0) 60px),
+      linear-gradient(to left, rgb(var(--tone) / .08), rgb(var(--tone) / 0) 60px),
+      linear-gradient(to bottom, rgb(var(--tone) / .06), rgb(var(--tone) / 0) 40px);
+    box-shadow: inset 0 0 0 1px rgb(var(--tone) / .4), inset 0 0 32px rgb(var(--tone) / .08); }
+  .edge::after { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 60% at 50% 105%, rgb(var(--tone) / .08), transparent 60%);
     animation: breathe 5.5s var(--ease-io) infinite; }
   .on .edge { opacity: 1; }
   .busy .edge::after { animation-duration: 2.4s; }

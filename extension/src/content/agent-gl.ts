@@ -1,5 +1,6 @@
 // WebGL renderer for the agent field: one full-viewport fragment shader draws
-//   * soft travelling waves through a fixed dot grid while the agent owns the page
+//   * a drifting light field while the agent owns the page: soft glows that wander along the
+//     viewport edges (the halo) and light the dot grid as they pass
 //   * the cursor TRAIL (15 recent positions) lighting dots
 //   * click RIPPLES that light and displace dots
 //   * the soft cursor glow
@@ -16,6 +17,7 @@ export interface GLFrame {
   presence: number; // 0..1 overall (cursor glow, trail)
   tone: [number, number, number]; // dot colour (linear 0..1)
   glowTone: [number, number, number];
+  haloTone: [number, number, number]; // edge halo colour (brand red, amber when paused)
   lightSurface: boolean;
   cursor: [number, number];
   trail: [number, number, number][]; // x, y, weight (<= 15)
@@ -31,12 +33,19 @@ const FRAG = `
 precision highp float;
 uniform vec2 uRes;      // CSS px
 uniform float uDpr, uTime, uGap, uRadius, uAmbient, uPresence, uLight;
-uniform vec3 uTone, uGlowTone;
+uniform vec3 uTone, uGlowTone, uHalo;
 uniform vec2 uCursor;
 uniform vec3 uTrail[${MAX_TRAIL}];
 uniform vec3 uRipple[${MAX_RIPPLES}];
 
 float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+// Smooth value noise and a two-octave sum: the slow light field the halo and dots share.
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm(vec2 p) { return 0.65 * vnoise(p) + 0.35 * vnoise(p * 2.03 + 17.0); }
 
 void main() {
   vec2 p = vec2(gl_FragCoord.x, uRes.y * uDpr - gl_FragCoord.y) / uDpr;
@@ -67,13 +76,21 @@ void main() {
     if (d2 < 1.0) m = max(m, t.z * (1.0 - d2) * (1.0 - d2));
   }
 
-  // A readable sweep (~130 CSS px/s), rather than twinkling every dot at once.
-  // The grid stays anchored; a broad, gently curved crest brightens it in passing.
-  // Keep this wave in sync with the Canvas fallback in agent-field.ts.
-  float phase = (c.x * 0.82 + c.y * 0.57) * 0.014 - uTime * 1.9
-    + 0.55 * sin(c.y * 0.006 + uTime * 0.45);
-  float wave = pow(0.5 + 0.5 * sin(phase), 3.0);
-  float amb = (0.075 + 0.42 * wave) * (0.72 + 0.28 * h) * uAmbient;
+  // Drifting light: broad soft blobs that wander slowly (a few seconds to cross a blob).
+  // Keep this field in sync with the Canvas fallback in agent-field.ts.
+  vec2 drift = vec2(uTime * 0.21, -uTime * 0.15);
+  float blob = smoothstep(0.4, 0.8, fbm(c * 0.0032 + drift + 0.45 * vec2(sin(uTime * 0.5), cos(uTime * 0.41))));
+  // A faint travelling crest on top, so the grid always reads as moving.
+  float crest = pow(0.5 + 0.5 * sin((c.x * 0.82 + c.y * 0.57) * 0.014 - uTime * 1.9), 3.0);
+
+  // Edge halo: light hugging the viewport edges, concentrated in a few glows that wander along
+  // them, with a slow overall breath.
+  float edge = min(min(p.x, p.y), min(uRes.x - p.x, uRes.y - p.y));
+  float roam = smoothstep(0.38, 0.78, fbm(p * 0.0026 + vec2(-uTime * 0.16, uTime * 0.12)));
+  float pulse = 0.82 + 0.18 * sin(uTime * 0.9);
+  float halo = exp(-edge / (20.0 + 58.0 * roam)) * (0.07 + 0.93 * roam) * pulse * uAmbient;
+
+  float amb = (0.06 + 0.5 * blob + 0.16 * crest + 0.7 * halo) * (0.72 + 0.28 * h) * uAmbient;
 
   float lit = max(amb, max(m * (0.7 + 0.9 * h), ring * (0.75 + 0.7 * h)) * uPresence);
 
@@ -87,8 +104,9 @@ void main() {
   float gd = length(p - uCursor);
   float g = exp(-gd * gd / (2.0 * 58.0 * 58.0)) * 0.17 * uPresence;
 
-  vec3 col = uTone * a + uGlowTone * g;
-  gl_FragColor = vec4(col, clamp(a + g, 0.0, 1.0)); // premultiplied
+  float ha = halo * (uLight > 0.5 ? 0.4 : 0.66);
+  vec3 col = uTone * a + uGlowTone * g + uHalo * ha;
+  gl_FragColor = vec4(col, clamp(a + g + ha, 0.0, 1.0)); // premultiplied
 }`;
 
 export class GLRenderer {
@@ -126,7 +144,7 @@ export class GLRenderer {
     const loc = gl.getAttribLocation(prog, 'a');
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    for (const n of ['uRes', 'uDpr', 'uTime', 'uGap', 'uRadius', 'uAmbient', 'uPresence', 'uLight', 'uTone', 'uGlowTone', 'uCursor', 'uTrail', 'uRipple']) {
+    for (const n of ['uRes', 'uDpr', 'uTime', 'uGap', 'uRadius', 'uAmbient', 'uPresence', 'uLight', 'uTone', 'uGlowTone', 'uHalo', 'uCursor', 'uTrail', 'uRipple']) {
       this.#u[n] = gl.getUniformLocation(prog, n);
     }
     gl.disable(gl.BLEND);
@@ -149,6 +167,7 @@ export class GLRenderer {
     gl.uniform1f(u.uLight, f.lightSurface ? 1 : 0);
     gl.uniform3fv(u.uTone, f.tone);
     gl.uniform3fv(u.uGlowTone, f.glowTone);
+    gl.uniform3fv(u.uHalo, f.haloTone);
     gl.uniform2f(u.uCursor, f.cursor[0], f.cursor[1]);
     const trail = new Float32Array(MAX_TRAIL * 3);
     f.trail.slice(-MAX_TRAIL).forEach((t, i) => trail.set(t, i * 3));
