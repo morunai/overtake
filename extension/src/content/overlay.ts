@@ -136,26 +136,33 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   .label i { width: 6px; height: 6px; border-radius: 50%; background: rgb(var(--tone)); box-shadow: 0 0 8px rgb(var(--tone) / .8); flex: none; }
   .label span { overflow: hidden; text-overflow: ellipsis; }
 
-  /* Dock: compact, translucent, contextual. */
-  .dock { position: absolute; left: 16px; top: 16px; display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 10px; min-height: 52px;
-    border-radius: 14px; color: #eef0f6; pointer-events: none; opacity: 0; translate: 0 -8px; scale: .98; transform-origin: top left;
-    background: rgb(20 21 26 / .80); backdrop-filter: blur(22px) saturate(1.5); -webkit-backdrop-filter: blur(22px) saturate(1.5);
-    box-shadow: 0 0 0 1px rgb(255 255 255 / .09), 0 1px 0 rgb(255 255 255 / .06) inset, 0 18px 44px rgb(0 0 0 / .38);
+  /* Dock: a native-feeling floating control panel. Graphite, hairline border, soft shadow. */
+  .dock { position: absolute; left: 16px; top: 16px; display: flex; align-items: center; gap: 12px; padding: 12px 12px 12px 8px; min-height: 64px;
+    border-radius: 20px; color: #f2f2f4; pointer-events: none; opacity: 0; translate: 0 -8px; scale: .98; transform-origin: top left;
+    background: rgb(32 32 35 / .88); backdrop-filter: blur(24px) saturate(1.4); -webkit-backdrop-filter: blur(24px) saturate(1.4);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / .1), inset 0 1px 0 rgb(255 255 255 / .06), 0 2px 6px rgb(0 0 0 / .18), 0 14px 36px rgb(0 0 0 / .34);
     transition: opacity var(--slow) var(--ease-out), translate var(--slow) var(--ease-out), scale var(--slow) var(--ease-out), width var(--slow) var(--ease-io);
-    interpolate-size: allow-keywords; max-width: calc(100vw - 32px); }
+    interpolate-size: allow-keywords; max-width: calc(100vw - 16px); }
   .dock.show { opacity: 1; translate: 0 0; scale: 1; pointer-events: auto; }
-  .mark { position: relative; width: 32px; height: 32px; flex: none; display: grid; place-items: center; border-radius: 50%; background: rgb(255 255 255 / .07); }
-  .mark svg { width: 17px; height: 17px; color: #e8ebf5; }
-  .mark::after { content: ""; position: absolute; inset: -3px; border-radius: 50%; padding: 1.5px; opacity: 0; transition: opacity var(--base);
-    background: conic-gradient(rgb(var(--tone)) 0 24%, rgb(var(--tone) / 0) 46% 100%);
+  .dock.dragging { transition: none; cursor: grabbing; }
+  .grip { flex: none; width: 16px; height: 40px; display: grid; place-items: center; border-radius: 6px; color: rgb(255 255 255 / .32); cursor: grab; touch-action: none;
+    transition: color var(--fast), background var(--fast); }
+  .grip:hover { color: rgb(255 255 255 / .62); }
+  .dragging .grip { cursor: grabbing; color: rgb(255 255 255 / .75); }
+  .grip svg { width: 6px; height: 12px; }
+  .divider { flex: none; width: 1px; height: 28px; margin-right: 2px; background: rgb(255 255 255 / .1); }
+  .mark { position: relative; width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: 50%; background: rgb(255 255 255 / .08); }
+  .mark svg { width: 18px; height: 18px; color: #ececf0; }
+  .mark::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; padding: 3px; opacity: 0; transition: opacity var(--base);
+    background: conic-gradient(rgb(var(--tone)) 0 28%, rgb(var(--tone) / 0) 52% 100%);
     -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; }
-  .agent .mark::after { opacity: .95; animation: orbit 2.6s linear infinite; }
-  .busy .mark::after { animation-duration: 1.05s; }
+  .agent .mark::after { opacity: .95; animation: orbit 2.8s linear infinite; }
+  .busy .mark::after { animation-duration: 1.4s; }
   .paused .mark::after { opacity: .9; animation: none; background: rgb(var(--amber) / .9); }
   @keyframes orbit { to { rotate: 360deg } }
-  .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding-right: 4px; }
-  .t1 { font-size: 13px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
-  .t2 { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; color: #9aa1b5; }
+  .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin-left: 2px; margin-right: 6px; }
+  .t1 { font-size: 14px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
+  .t2 { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; color: #9a9aa2; }
   .agent .t2 { color: rgb(var(--red-text)); }
   .paused .t2 { color: rgb(var(--amber)); }
   .need .t2 { color: #ffb36b; }
@@ -165,26 +172,27 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   @keyframes sweep { 0% { background-position: 100% 0 } 70%, 100% { background-position: 0% 0 } }
   .swap .txt, .swap .btns { animation: swap var(--base) var(--ease-out); }
   @keyframes swap { from { opacity: 0; translate: 0 3px } }
-  .btns { display: flex; align-items: center; gap: 6px; }
-  button { all: unset; box-sizing: border-box; cursor: pointer; height: 34px; padding: 0 13px; border-radius: 9px; display: inline-flex; align-items: center; gap: 6px;
-    font-size: 12.5px; font-weight: 600; color: #e9ecf4; background: rgb(255 255 255 / .08);
+  .btns { display: flex; align-items: center; gap: 8px; }
+  button { all: unset; box-sizing: border-box; cursor: pointer; height: 40px; padding: 0 20px; border-radius: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    font-size: 13px; font-weight: 600; color: #ececf0; background: rgb(255 255 255 / .07); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .06);
     transition: background var(--fast) var(--ease-out), color var(--fast), scale var(--fast) var(--ease-out); }
-  button:hover { background: rgb(255 255 255 / .14); }
+  button:hover { background: rgb(255 255 255 / .12); }
   button:active { scale: .97; }
   button:focus-visible { outline: 2px solid rgb(var(--red)); outline-offset: 2px; }
-  button.primary { background: #f2f4fa; color: #14161c; }
+  button.primary { background: #f2f2f4; color: #141416; box-shadow: none; }
   button.primary:hover { background: #fff; }
-  button.accent { background: rgb(230 38 58); color: #fff; }
+  button.accent { background: rgb(230 38 58); color: #fff; box-shadow: none; }
   button.accent:hover { background: rgb(245 56 75); }
-  button.icon { width: 34px; padding: 0; justify-content: center; }
+  button.icon { width: 40px; padding: 0; }
   button.icon svg { width: 14px; height: 14px; }
-  button.stop:hover { background: rgb(250 82 82 / .18); color: #ff8f8f; }
+  button.stop:hover { background: rgb(250 82 82 / .16); color: #ff8f8f; }
   button[hidden] { display: none; }
   @media (prefers-reduced-motion: reduce) { .edge::after, .mark::after, .busy .t2, .cursor.idle .arrow, .cursor.idle .label { animation: none !important; } }
   `;
 
   const ARROW = `<svg class="arrow" viewBox="0 0 22 24" aria-hidden="true"><path d="M3.2 2.3c-.4-.3-1 0-.9.6l2.3 17.6c.1.6.9.8 1.2.2l3.6-6.2 7.1.2c.6 0 .9-.7.5-1.1Z" fill="#0d0f14" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>`;
   const ICON_PAUSE = `<svg viewBox="0 0 14 14"><rect x="3" y="2.5" width="2.6" height="9" rx="1" fill="currentColor"/><rect x="8.4" y="2.5" width="2.6" height="9" rx="1" fill="currentColor"/></svg>`;
+  const ICON_GRIP = `<svg viewBox="0 0 6 12"><g fill="currentColor"><circle cx="1" cy="1.5" r="1"/><circle cx="5" cy="1.5" r="1"/><circle cx="1" cy="6" r="1"/><circle cx="5" cy="6" r="1"/><circle cx="1" cy="10.5" r="1"/><circle cx="5" cy="10.5" r="1"/></g></svg>`;
   const ICON_STOP = `<svg viewBox="0 0 14 14"><rect x="3" y="3" width="8" height="8" rx="1.8" fill="currentColor"/></svg>`;
 
   function buildUi() {
@@ -199,6 +207,8 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
         <div class="blocker"></div>
         <div class="cursor">${ARROW}<div class="label"><i></i><span></span></div></div>
         <div class="dock" role="toolbar" aria-label="Agent control">
+          <div class="grip" title="Drag to move" aria-hidden="true">${ICON_GRIP}</div>
+          <div class="divider" aria-hidden="true"></div>
           <div class="mark"></div>
           <div class="txt"><span class="t1"></span><span class="t2" aria-live="polite"></span></div>
           <div class="btns">
@@ -223,6 +233,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
       if (!b) return;
       void chrome.runtime.sendMessage({ type: 'overtake:human', action: b.dataset.a! }).catch(() => teardown());
     });
+    bindDrag(root.querySelector('.grip') as HTMLElement);
     // Swallow everything that reaches the blocker.
     for (const t of ['pointerdown', 'mousedown', 'click', 'wheel', 'contextmenu', 'dblclick']) {
       el.blocker.addEventListener(t, (e) => {
@@ -231,6 +242,66 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
       }, { passive: false });
     }
     attachHost();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dock dragging: by the grip only, trusted pointer input only, always kept inside the viewport.
+  // The position is kept in extension storage (pages cannot read it) so it survives navigation.
+
+  const DOCK_MARGIN = 8;
+  const DOCK_KEY = 'overtake.dockPos';
+  let dockPos: { x: number; y: number } | null = null;
+
+  function placeDock(x: number, y: number) {
+    const d = el.dock;
+    if (!d) return;
+    const maxX = Math.max(DOCK_MARGIN, innerWidth - d.offsetWidth - DOCK_MARGIN);
+    const maxY = Math.max(DOCK_MARGIN, innerHeight - d.offsetHeight - DOCK_MARGIN);
+    dockPos = { x: Math.round(Math.min(Math.max(DOCK_MARGIN, x), maxX)), y: Math.round(Math.min(Math.max(DOCK_MARGIN, y), maxY)) };
+    d.style.left = `${dockPos.x}px`;
+    d.style.top = `${dockPos.y}px`;
+  }
+
+  function bindDrag(grip: HTMLElement) {
+    try {
+      chrome.storage.local.get(DOCK_KEY).then((r) => {
+        const p = r?.[DOCK_KEY] as { x?: unknown; y?: unknown } | undefined;
+        if (p && typeof p.x === 'number' && typeof p.y === 'number') placeDock(p.x, p.y);
+      }).catch(() => {});
+    } catch {
+      /* extension context gone (reloaded): keep the default position */
+    }
+    grip.addEventListener('pointerdown', (e) => {
+      if (!e.isTrusted || e.button !== 0) return;
+      e.preventDefault();
+      const r = el.dock.getBoundingClientRect();
+      const ox = e.clientX - r.left;
+      const oy = e.clientY - r.top;
+      grip.setPointerCapture(e.pointerId);
+      el.dock.classList.add('dragging');
+      const move = (ev: PointerEvent) => {
+        if (ev.isTrusted) placeDock(ev.clientX - ox, ev.clientY - oy);
+      };
+      const end = () => {
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', end);
+        grip.removeEventListener('pointercancel', end);
+        el.dock.classList.remove('dragging');
+        try {
+          if (dockPos) void chrome.storage.local.set({ [DOCK_KEY]: dockPos }).catch(() => {});
+        } catch {
+          /* extension context gone */
+        }
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', end);
+      grip.addEventListener('pointercancel', end);
+    });
+    // Keep the dock reachable when the window shrinks or the dock grows with longer text.
+    addEventListener('resize', () => dockPos && placeDock(dockPos.x, dockPos.y));
+    el.dock.addEventListener('transitionend', (e) => {
+      if (e.propertyName === 'width' && dockPos) placeDock(dockPos.x, dockPos.y);
+    });
   }
 
   function attachHost() {
@@ -356,6 +427,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
     // A stop is acknowledged briefly, then the dock gets out of the way.
     if (stoppedTimer) clearTimeout(stoppedTimer);
     el.dock.classList.toggle('show', !!t1);
+    if (dockPos) placeDock(dockPos.x, dockPos.y);
     if (s.control === 'STOPPED') stoppedTimer = setTimeout(() => el.dock.classList.remove('show'), 3000);
 
     field!.setSurface(pageIsLight());
