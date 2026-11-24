@@ -57,6 +57,20 @@ function noise(ix: number, iy: number): number {
   return 0.6 * coarse + 0.4 * hash(ix, iy);
 }
 
+/** Smooth value noise over the continuous plane (same shape as the shader's vnoise). */
+function vnoise(x: number, y: number): number {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+const fbm = (x: number, y: number) => 0.65 * vnoise(x, y) + 0.35 * vnoise(x * 2.03 + 17, y * 2.03 + 17);
+const smooth = (e0: number, e1: number, x: number) => {
+  const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+};
+
 export class AgentField {
   readonly canvas: HTMLCanvasElement;
   #ctx: CanvasRenderingContext2D | null = null;
@@ -314,6 +328,7 @@ export class AgentField {
         presence: this.#placed ? this.#glow : 0,
         tone,
         glowTone,
+        haloTone: paused ? [0.96, 0.66, 0.2] : [1.0, 0.22, 0.29],
         lightSurface: this.#light,
         cursor: [this.#pos.x, this.#pos.y],
         trail: this.#reduced ? [] : this.#trail.map((p) => [p.x, p.y, this.#weight(p, now)] as [number, number, number]),
@@ -393,11 +408,11 @@ export class AgentField {
           }
         }
         const n = noise(ix, iy);
-        // Same travelling crest as the shader: both paths work while idle.
-        const phase = (bx * 0.82 + by * 0.57) * 0.014 - this.#clock * 1.9
-          + 0.55 * Math.sin(by * 0.006 + this.#clock * 0.45);
-        const wave = (0.5 + 0.5 * Math.sin(phase)) ** 3;
-        const amb = (0.075 + 0.42 * wave) * (0.72 + 0.28 * hash(ix, iy)) * ambient;
+        // Same drifting light as the shader (the halo itself is CSS-only in this fallback).
+        const t = this.#clock;
+        const blob = smooth(0.4, 0.8, fbm(bx * 0.0032 + t * 0.21 + 0.45 * Math.sin(t * 0.5), by * 0.0032 - t * 0.15 + 0.45 * Math.cos(t * 0.41)));
+        const crest = (0.5 + 0.5 * Math.sin((bx * 0.82 + by * 0.57) * 0.014 - t * 1.9)) ** 3;
+        const amb = (0.06 + 0.5 * blob + 0.16 * crest) * (0.72 + 0.28 * hash(ix, iy)) * ambient;
         const lit = Math.max(amb, Math.max(m * (0.7 + 0.9 * n), ring * (0.75 + 0.7 * n)) * this.#glow);
         const key = iy * 100003 + ix;
         let dot = this.#dots.get(key);

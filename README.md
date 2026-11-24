@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/demo.gif" alt="An agent reading Wikipedia in a Space, the human takes over and gives control back" width="860">
+  <img src="docs/screenshots/demo.gif" alt="Two agents open Spaces from the overview; Claude Code works in its own Chrome window, the human takes over and gives control back" width="860">
 </p>
 
 > [!NOTE]
