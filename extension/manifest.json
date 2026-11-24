@@ -19,8 +19,8 @@
       "match_origin_as_fallback": true
     }
   ],
-  "action": { "default_title": "Open Spaces", "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" } },
-  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "action": { "default_title": "Open Spaces", "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" } },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
   "commands": {
     "toggle-control": { "suggested_key": { "default": "Alt+Shift+E" }, "description": "Take over / give back the current agent Space" },
     "open-overview": { "suggested_key": { "default": "Alt+Shift+S" }, "description": "Open the Spaces overview" }
