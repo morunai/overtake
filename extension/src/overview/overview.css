@@ -156,8 +156,19 @@ body.entering .grid, body.entering .bar, body.entering .hint { opacity: .25; tra
 .hint.covered { opacity: 0; pointer-events: none; }
 @media (max-height: 560px) { .hint { display: none; } }
 
-/* Details (debug) panel, opened from the title menu or with "i". */
-.panel { position: sticky; top: 64px; max-height: calc(100vh - 64px); width: 340px; flex: none; border-left: 1px solid var(--line); background: rgb(16 16 18 / .86); backdrop-filter: blur(18px); padding: 18px; overflow: auto; font-size: 12.5px; }
+/* Details drawer: slides in over the cards from the right (never pushes them). Opened from the
+   agent count, the title menu or "i"; closed with its X, Esc or "i". */
+.panel { position: fixed; top: 64px; right: 0; bottom: 0; z-index: 4; width: min(380px, 100vw); padding: 0 20px 24px; overflow: auto; font-size: 12.5px;
+  background: rgb(14 14 16 / .97); backdrop-filter: blur(22px) saturate(1.2); border-left: 1px solid var(--line);
+  box-shadow: -24px 0 60px rgb(0 0 0 / .5); translate: 100% 0; visibility: hidden;
+  transition: translate 260ms var(--ease), visibility 0s linear 260ms; }
+.panel.open { translate: 0 0; visibility: visible; transition: translate 260ms var(--ease), visibility 0s; }
+.panel .head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; height: 56px; margin: 0 -20px 4px; padding: 0 12px 0 20px;
+  background: rgb(16 16 18 / .92); border-bottom: 1px solid var(--line); }
+.panel .head b { font-size: 13px; font-weight: 600; color: var(--text); }
+.panel .close { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; color: #c9c9ce; }
+.panel .close:hover { background: rgb(255 255 255 / .08); color: #fff; }
+.panel .close svg { width: 14px; height: 14px; }
 .panel h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
 .panel h3 { margin: 18px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
 .panel dl { display: grid; grid-template-columns: 104px 1fr; gap: 6px 10px; margin: 0; }
@@ -174,7 +185,6 @@ body.entering .grid, body.entering .bar, body.entering .hint { opacity: .25; tra
   .brand .word { display: none; }
   .cap { padding: 0 8px 0 12px; gap: 8px; }
   .tabs span { display: none; }
-  .panel { position: fixed; inset: 64px 0 0 auto; width: min(100%, 340px); z-index: 4; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
