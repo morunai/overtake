@@ -22,6 +22,7 @@ Rules:
 - Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
+- A CERT_ERROR (untrusted certificate, Chrome's "Privacy error" page) cannot be bypassed from the extension: hand off so the user clicks "Proceed" once, then navigate again.
 - Use browser_cdp for anything the higher-level tools do not cover. Profile-wide cookie/cache operations are denied by design.
 - When finished, close the Space with spaces_close (user-opened tabs are protected and kept).`;
 

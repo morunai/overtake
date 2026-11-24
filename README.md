@@ -245,6 +245,10 @@ used. Human actions are simulated as trusted mouse and keyboard events.
 - `Profiler` and `HeapProfiler` are not available to extensions. Use `browser_trace` instead.
 - Native HTML5 drag and drop is not driven yet. Pointer-based drags work.
 - Spaces end when Chrome closes and are not restored.
+- Certificate errors cannot be bypassed from an extension. On an untrusted certificate (such as a
+  local dev server) the agent gets `CERT_ERROR` and hands off; click **Advanced**, then **Proceed**
+  once and Chrome remembers it for that site until it restarts. A trusted local certificate
+  ([mkcert](https://github.com/FiloSottile/mkcert)) avoids the warning entirely.
 - Other extensions' in-page frames (for example password manager menus) are removed from agent
   Spaces, because Chrome refuses to debug tabs that contain them. Your other tabs are unaffected.
 - macOS only for now.

@@ -3,7 +3,11 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createServer as createHttpsServer } from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
 import { Harness, SITE, sleep, pngSize, type Agent } from './harness.ts';
 
 // Test captures go to artifacts/ (gitignored). docs/screenshots holds the curated README images
@@ -437,6 +441,32 @@ test('click receipts: navigation is detected from events, humanlike clicks still
   assert.match(link.url, /via=link/, 'and returns after the new page loaded');
   assert.ok(Date.now() - t0 < 5000);
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/` });
+});
+
+test('an untrusted certificate fails with CERT_ERROR and hand-off guidance, and the tab stays usable', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'overtake-tls-'));
+  try {
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(dir, 'k.pem'), '-out', join(dir, 'c.pem'), '-days', '1', '-subj', '/CN=localhost'], { stdio: 'ignore' });
+  } catch {
+    rmSync(dir, { recursive: true, force: true });
+    t.skip('openssl not available');
+    return;
+  }
+  const tls = createHttpsServer({ key: readFileSync(join(dir, 'k.pem')), cert: readFileSync(join(dir, 'c.pem')) }, (_q, r) => r.end('<h1>tls</h1>'));
+  await new Promise<void>((r) => tls.listen(0, '127.0.0.1', r));
+  try {
+    const port = (tls.address() as AddressInfo).port;
+    await assert.rejects(A.call('browser_navigate', { tabId: space.tabId, url: `https://localhost:${port}/`, timeoutMs: 10_000 }), (e: unknown) => {
+      assert.equal(code(e), 'CERT_ERROR');
+      assert.match((e as Error).message, /space_handoff/);
+      return true;
+    });
+    const back = await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/` });
+    assert.equal(back.loaded, true);
+  } finally {
+    tls.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('closing the space ends it and releases the debugger', async () => {
