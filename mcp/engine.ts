@@ -101,6 +101,14 @@ function contextGone(e: unknown) {
   return e instanceof OvertakeError && !HARD_STOP.has(e.code) && CONTEXT_GONE.test(e.message);
 }
 
+/** p, or fallback once ms pass. A local bound: the transport's own timeouts are longer and
+ *  only start when the extension dequeues the call. A late result is dropped. */
+function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<T>((resolve) => { timer = setTimeout(() => resolve(fallback), Math.max(0, ms)); });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -245,7 +253,8 @@ export class Engine {
         return;
       case 'tab-closed':
         this.#tabSpace.delete(e.tabId);
-        if (!this.#gone.has(e.tabId)) this.#gone.set(e.tabId, { code: e.code || ErrorCode.TAB_CLOSED, message: e.reason || `Tab ${e.tabId} was closed.` });
+        // The latest close is the truth for this tab (it may have rejoined a Space since an older reason).
+        this.#gone.set(e.tabId, { code: e.code || ErrorCode.TAB_CLOSED, message: e.reason || `Tab ${e.tabId} was closed.` });
       // falls through
       case 'debugger-attached':
       case 'debugger-detached': {
@@ -611,12 +620,16 @@ export class Engine {
       if (!s) throw new OvertakeError(ErrorCode.SPACE_CLOSED, `Space ${spaceId} was closed.`);
       if (s.owner !== this.client.agentKey || s.control !== 'AGENT_CONTROL') {
         if (s.control === 'AGENT_PAUSED' && s.owner === this.client.agentKey) return { waited: cond.delayMs, note: 'The human paused the agent; your next command will wait for Resume.' };
-        throw new OvertakeError(s.control === 'STOPPED' ? ErrorCode.STOPPED : s.owner === this.client.agentKey ? ErrorCode.USER_IN_CONTROL : ErrorCode.NOT_OWNER,
-          'Control changed while waiting: the human has this Space now. This is a hard stop; wait until they give control back.');
+        throw this.#lostControl(s);
       }
       if (!cond.selector && !cond.text && !cond.urlIncludes && !cond.function && !cond.networkIdleMs && !cond.load) return { waited: cond.delayMs };
     }
     return this.action(tabId, (t) => this.#waitIn(t, cond));
+  }
+
+  #lostControl(s: SpaceSummary) {
+    return new OvertakeError(s.control === 'STOPPED' ? ErrorCode.STOPPED : s.owner === this.client.agentKey ? ErrorCode.USER_IN_CONTROL : ErrorCode.NOT_OWNER,
+      'Control changed while waiting: the human has this Space now. This is a hard stop; wait until they give control back.');
   }
 
   /** The polling part of wait, for callers already inside the tab's action. */
@@ -641,7 +654,11 @@ export class Engine {
         if (cond.function) parts.push(`!!(await (async () => (${cond.function}))())`);
         if (cond.load) parts.push(`document.readyState === 'complete'`);
         if (parts.length) {
-          const r = await this.cdp<{ result: { value: boolean } }>(tabId, 'Runtime.evaluate', { expression: `(async () => ${parts.join(' && ')})()`, awaitPromise: true, returnByValue: true }).catch(softFail({ result: { value: false } }));
+          // Bounded by what is left, so a stuck page cannot hold the Space past timeoutMs.
+          const left = deadline - Date.now();
+          const r = await within(
+            this.cdp<{ result: { value: boolean } }>(tabId, 'Runtime.evaluate', { expression: `(async () => ${parts.join(' && ')})()`, awaitPromise: true, returnByValue: true }, undefined, Math.max(left, 100)).catch(softFail({ result: { value: false } })),
+            left, { result: { value: false } });
           if (!r.result.value) return false;
         }
         if (cond.networkIdleMs) {
@@ -654,12 +671,18 @@ export class Engine {
       };
       const started = Date.now();
       while (!(await check())) {
-        if (Date.now() > deadline) throw new OvertakeError(ErrorCode.TIMEOUT, `Condition not met within ${timeoutMs} ms: ${JSON.stringify(cond)}`);
+        if (Date.now() > deadline) {
+          // A bounded check can hide a take-over error, so ask the latest control state first.
+          const s = this.#spaces.get(this.#tabSpace.get(tabId) ?? -1);
+          if (s && s.control !== 'AGENT_PAUSED' && (s.owner !== this.client.agentKey || s.control !== 'AGENT_CONTROL')) throw this.#lostControl(s);
+          throw new OvertakeError(ErrorCode.TIMEOUT, `Condition not met within ${timeoutMs} ms: ${JSON.stringify(cond)}`);
+        }
         // Poll fast at first (most conditions are met within a few hundred ms), then back off.
         const elapsed = Date.now() - started;
         await sleep(elapsed < 1000 ? 20 : elapsed < 5000 ? 50 : 100);
       }
-      return { satisfied: true, ...(await this.pageInfo(tabId)) };
+      const info = await within(this.pageInfo(tabId, 1000).catch(softFail(null)), 1000, null);
+      return { satisfied: true, ...(info ?? { url: undefined, title: undefined, readyState: undefined }) };
     }
   }
 
@@ -1085,7 +1108,8 @@ export class Engine {
     let info: { url: string; title: string; readyState: string } | null = null;
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      info = await this.pageInfo(tabId, Math.min(1000, deadline - Date.now())).catch(softFail(null));
+      const left = Math.min(1000, deadline - Date.now());
+      info = await within(this.pageInfo(tabId, left).catch(softFail(null)), left, null);
       if (info && info.readyState !== 'loading') break;
       await sleep(200);
     }
