@@ -128,16 +128,35 @@ const actionOpts = {
 };
 type ActionOpts = { waitForText?: string; waitTimeoutMs?: number };
 
+/** Input actions with waitForText run one at a time per tab, so one action's text or requests
+ *  are never credited to another queued behind it. */
+const actChains = new Map<number, Promise<unknown>>();
+
 /** Run an input action: watch for waitForText from before it starts, then add what it caused
  *  to the receipt (the text appearing, and the requests the page made) and the snapshot. */
 async function act(a: { tabId: number } & ActionOpts & SnapshotOpts, run: () => Promise<unknown>): Promise<ToolResult> {
-  const t0 = Date.now();
-  const watch = a.waitForText ? await engine.watchText(a.tabId, a.waitForText) : undefined;
-  let r = (await run()) as Record<string, unknown>;
-  if (watch) r = { ...r, ...(await engine.awaitText(a.tabId, watch, a.waitForText!, a.waitTimeoutMs ?? 10_000)) };
-  const requests = await engine.requestsSince(a.tabId, t0).catch(() => []);
-  if (requests.length) r = { ...r, requests };
-  return afterAction(a.tabId, r, a, t0);
+  const prev = actChains.get(a.tabId) ?? Promise.resolve();
+  const mine = prev.catch(() => {}).then(async () => {
+    const t0 = Date.now();
+    const watch = a.waitForText ? await engine.watchText(a.tabId, a.waitForText) : undefined;
+    let r: Record<string, unknown>;
+    try {
+      r = (await run()) as Record<string, unknown>;
+      if (watch) r = { ...r, ...(await engine.awaitText(a.tabId, watch, a.waitForText!, a.waitTimeoutMs ?? 10_000)) };
+    } finally {
+      if (watch) await engine.unwatchText(a.tabId, watch);
+    }
+    const requests = await engine.requestsSince(a.tabId, t0).catch(() => []);
+    if (requests.length) r = { ...r, requests };
+    return { r, t0 };
+  });
+  actChains.set(a.tabId, mine);
+  try {
+    const { r, t0 } = await mine;
+    return await afterAction(a.tabId, r, a, t0);
+  } finally {
+    if (actChains.get(a.tabId) === mine) actChains.delete(a.tabId);
+  }
 }
 
 // ---------------------------------------------------------------------------

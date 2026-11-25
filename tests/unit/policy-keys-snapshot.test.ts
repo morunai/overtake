@@ -114,3 +114,16 @@ test('snapshot: draggable elements get refs and a name from their text', () => {
   assert.equal(s.refs.get(1)?.backendNodeId, 2);
   assert.equal(s.refs.size, 1);
 });
+
+test('snapshot: a draggable inside a draggable keeps its own ref', () => {
+  const nodes: AXNode[] = [
+    { nodeId: '1', ignored: false, role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 },
+    { nodeId: '2', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['3'], parentId: '1', backendDOMNodeId: 2 },
+    { nodeId: '3', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['4'], parentId: '2', backendDOMNodeId: 3 },
+    { nodeId: '4', ignored: false, role: { type: 'role', value: 'StaticText' }, name: { type: 's', value: 'Card' }, parentId: '3' },
+  ];
+  let n = 0;
+  const s = buildSnapshot({ main: { nodes }, children: new Map(), draggable: new Set([2, 3]), nextRef: () => ++n });
+  assert.equal(s.refs.size, 2);
+  assert.match(s.text, /- generic "Card" @2 \[draggable\]/);
+});

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Wait Test Page</title>
+<style>body { font: 15px system-ui; margin: 24px; } button { margin: 4px; }</style>
+</head>
+<body>
+<h1>Wait Test Page</h1>
+<p id="status" role="status">Saved</p>
+<p id="order">Order <span id="state">pending</span></p>
+<p id="other">Other text</p>
+<div id="host"></div>
+<iframe id="frame" src="/drop-frame.html" title="Same-site frame" style="width:200px;height:60px;border:0"></iframe>
+<div>
+  <button id="save" onclick="const s = document.getElementById('status'); s.textContent = 'Saving...'; setTimeout(() => (s.textContent = 'Saved'), 150)">Save</button>
+  <button id="split" onclick="document.getElementById('state').textContent = 'saved'">Finish order</button>
+  <button id="touch" onclick="document.getElementById('other').textContent = 'Other text ' + Date.now()">Touch other</button>
+  <button id="shadow" onclick="document.getElementById('host').shadowRoot.querySelector('span').textContent = 'Shadow done'">Shadow</button>
+  <button id="inframe" onclick="document.getElementById('frame').contentDocument.getElementById('fbin').textContent = 'Frame done'">In frame</button>
+  <button id="alpha" onclick="setTimeout(() => (document.getElementById('other').textContent = 'Alpha'), 100)">Alpha</button>
+  <button id="noop">Nothing</button>
+  <button id="secret" onclick="fetch('/api/data?code=oauth-secret-123&state=xyz')">Fetch</button>
+</div>
+<script>
+  document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<span>Shadow idle</span>';
+</script>
+</body>
+</html>

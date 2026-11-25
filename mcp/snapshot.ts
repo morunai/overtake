@@ -74,11 +74,14 @@ function textOf(n: AXNode, byId: Map<string, AXNode>, depth = 0): string {
   return (n.childIds || []).map((id) => byId.get(id)).filter(Boolean).map((k) => textOf(k as AXNode, byId, depth + 1)).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
 
-function hasInteractive(n: AXNode, byId: Map<string, AXNode>, depth = 0): boolean {
+/** Whether a node has descendants that get their own line with a ref (interactive or draggable). */
+function hasInteractive(n: AXNode, byId: Map<string, AXNode>, draggable: Set<number> | undefined, depth = 0): boolean {
   if (depth > 20) return false;
   return (n.childIds || []).some((id) => {
     const k = byId.get(id);
-    return !!k && ((!k.ignored && INTERACTIVE.has(str(k.role))) || hasInteractive(k, byId, depth + 1));
+    if (!k) return false;
+    if (k.backendDOMNodeId !== undefined && draggable?.has(k.backendDOMNodeId)) return true;
+    return (!k.ignored && INTERACTIVE.has(str(k.role))) || hasInteractive(k, byId, draggable, depth + 1);
   });
 }
 
@@ -170,7 +173,7 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
         walkTree(input.children.get(n.backendDOMNodeId)!, d + 1, undefined);
       }
       // A draggable named from its own text: its text-only subtree would repeat that name.
-      if ((onlyText || (drag && !str(n.name) && !hasInteractive(n, byId))) && name) return;
+      if ((onlyText || (drag && !str(n.name) && !hasInteractive(n, byId, input.draggable))) && name) return;
       for (const k of kids) visit(k, d + 1);
     };
     visit(root, depth);

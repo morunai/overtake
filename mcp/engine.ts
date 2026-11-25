@@ -207,6 +207,24 @@ function draggableNodes(snap: DomSnap): Set<number> {
   return out;
 }
 
+/** A URL for an action receipt, shown without being asked for: no credentials, no query
+ *  values (they can carry OAuth codes or tokens under any name), no fragment. Query names stay,
+ *  for context; browser_network has the full (redacted) details. */
+export function receiptUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    u.username = '';
+    u.password = '';
+    u.hash = '';
+    const names = [...new Set([...u.searchParams.keys()])];
+    u.search = '';
+    const q = names.length ? '?' + names.map((n) => `${encodeURIComponent(n)}=…`).join('&') : '';
+    return (u.toString() + q).slice(0, 200);
+  } catch {
+    return raw.split(/[?#]/)[0].replace(/\/\/[^/@]*@/, '//').slice(0, 200);
+  }
+}
+
 function inFlight(e: NetEntry, now: number) {
   if (e.endedAt) return false;
   if (e.respondedAt) return now - e.respondedAt < 150;
@@ -647,22 +665,64 @@ export class Engine {
     }
   }
 
-  /** Start watching for text that appears through a DOM change from now on (an added node or
-   *  changed text containing it). Text already on the page does not count, so waiting for
-   *  "Saved" after an action is not satisfied by an earlier "Saved". */
+  /** Start watching for text that appears through a DOM change from now on: an added or
+   *  changed node containing it, or more copies of it on the page than at their lowest since
+   *  the watch began (so "Order <span>saved</span>" matches "Order saved"). Covers open shadow roots and same-origin
+   *  iframes. Text already on the page does not count, so waiting for "Saved" after an action
+   *  is not satisfied by an earlier "Saved". Stop it with unwatchText. */
   async watchText(tabId: number, text: string): Promise<string> {
     return this.action(tabId, async () => {
       const id = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       const expr = `(() => { const text = ${JSON.stringify(text)}; const id = ${JSON.stringify(id)};
         const w = (window.__overtakeWatch ||= {});
-        const has = (n) => (n.nodeType === 3 ? n.data : n.textContent || '').includes(text);
-        const mo = new MutationObserver((list) => {
-          for (const m of list) {
-            if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { w[id] = true; mo.disconnect(); return; }
+        const entry = { seen: false, observers: [] };
+        const has = (node) => (node.nodeType === 3 ? node.data : node.textContent || '').includes(text);
+        const roots = [document];
+        const observed = new WeakSet();
+        const count = () => {
+          let n = 0;
+          for (const r of roots) {
+            const t = (r.nodeType === 9 ? r.documentElement?.textContent : r.textContent) || '';
+            for (let i = t.indexOf(text); i >= 0; i = t.indexOf(text, i + text.length)) n++;
           }
-        });
-        mo.observe(document, { subtree: true, childList: true, characterData: true });
-        w[id] = false; })()`;
+          return n;
+        };
+        const stop = () => { for (const o of entry.observers) o.disconnect(); entry.observers.length = 0; };
+        // Seen when an added or changed node contains the text, or when the page holds more
+        // copies of it than at its lowest since the watch began ("Saved", "Saving...", "Saved"
+        // counts; so does text split across elements, like "Order <span>saved</span>").
+        let low;
+        const onMutations = (list) => {
+          for (const m of list) {
+            for (const n of m.addedNodes) watchTree(n);
+            if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { entry.seen = true; stop(); return; }
+          }
+          const c = count();
+          if (c > low) { entry.seen = true; stop(); return; }
+          low = Math.min(low, c);
+        };
+        const observe = (root) => {
+          if (entry.seen || entry.observers.length > 200 || observed.has(root)) return;
+          observed.add(root);
+          if (root !== document) roots.push(root);
+          const o = new MutationObserver(onMutations);
+          o.observe(root, { subtree: true, childList: true, characterData: true });
+          entry.observers.push(o);
+        };
+        // Open shadow roots and same-origin iframes have their own trees to observe.
+        const watchTree = (root) => {
+          if (!root || root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
+          const walk = root.nodeType === 1 ? [root, ...root.querySelectorAll('*')] : [...root.querySelectorAll('*')];
+          for (const el of walk.slice(0, 5000)) {
+            if (el.shadowRoot) { observe(el.shadowRoot); watchTree(el.shadowRoot); }
+            if (el.localName === 'iframe') { try { const d = el.contentDocument; if (d) { observe(d); watchTree(d); } } catch {} }
+          }
+        };
+        entry.stop = stop;
+        w[id] = entry;
+        observe(document);
+        watchTree(document);
+        low = count(); })()`;
       await this.cdp(tabId, 'Runtime.evaluate', { expression: expr });
       return id;
     });
@@ -671,16 +731,20 @@ export class Engine {
   /** Wait for a watchText watch. If the page navigated (the watch is gone), the text on the new
    *  page counts. */
   async awaitText(tabId: number, id: string, text: string, timeoutMs: number) {
-    const fn = `(() => { const w = window.__overtakeWatch; if (w && ${JSON.stringify(id)} in w) return w[${JSON.stringify(id)}]; return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
+    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.seen; return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
     try {
       await this.wait(tabId, { function: fn, timeoutMs });
     } catch (e) {
       if (e instanceof OvertakeError && e.code === ErrorCode.TIMEOUT) throw new OvertakeError(ErrorCode.TIMEOUT, `The action ran, but "${text.slice(0, 80)}" did not appear on the page within ${timeoutMs} ms (text that was already there does not count).`);
       throw e;
-    } finally {
-      void this.cdp(tabId, 'Runtime.evaluate', { expression: `delete window.__overtakeWatch?.[${JSON.stringify(id)}]` }).catch(() => {});
     }
     return { appeared: text };
+  }
+
+  /** Disconnect a watchText watch and forget it (always call it, whatever happened). */
+  async unwatchText(tabId: number, id: string) {
+    const expr = `(() => { const w = window.__overtakeWatch; const e = w?.[${JSON.stringify(id)}]; if (e) { e.stop(); delete w[${JSON.stringify(id)}]; } })()`;
+    await this.cdp(tabId, 'Runtime.evaluate', { expression: expr }).catch(() => {});
   }
 
   /** Requests the page made since `since` (an action's start), skipping static assets. Waits
@@ -694,7 +758,7 @@ export class Engine {
     await sleep(30); // a request started by the action's last event may not be reported yet
     const deadline = Date.now() + maxMs;
     while (Date.now() < deadline && pick().some((e) => inFlight(e, Date.now()))) await sleep(25);
-    return pick().slice(0, 10).map((e) => ({ method: e.method, url: redactUrl(e.url).slice(0, 200), status: e.status ?? (e.failed ? `failed: ${e.failed}` : 'pending'), ms: e.endedAt ? e.endedAt - e.startedAt : undefined }));
+    return pick().slice(0, 10).map((e) => ({ method: e.method, url: receiptUrl(e.url), status: e.status ?? (e.failed ? `failed: ${e.failed}` : 'pending'), ms: e.endedAt ? e.endedAt - e.startedAt : undefined }));
   }
 
   /** Page URL, title and readyState. timeoutMs bounds the whole call, retries included. */
@@ -903,10 +967,11 @@ export class Engine {
       if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
       objectId = res.object.objectId;
     }
-    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
+    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
       objectId,
       returnByValue: true,
       functionDeclaration: `function(){
+        if (!this.isConnected) return { ok: false, detached: true };
         const r = this.getBoundingClientRect();
         if (!r.width || !r.height) return { ok: false, reason: 'the element has no size (hidden?)' };
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -919,6 +984,8 @@ export class Engine {
       }`,
     }, sid);
     const v = check.result.value;
+    // Pages that re-render replace their elements: an old ref then points at a removed one.
+    if (v.detached) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the page (it was removed or re-rendered, so this ref is stale). Take a new browser_snapshot.');
     if (!force) {
       if (v.reason) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `Cannot act on the element: ${v.reason}.`);
       if (!v.ok) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${v.top} at its center. Close the covering element or pass force:true.`);

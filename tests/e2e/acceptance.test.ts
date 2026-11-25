@@ -590,7 +590,7 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const d1 = await A.call('browser_drag', { tabId: space.tabId, from: n1!, to: '#bin', waitForText: 'Dropped n1' });
   assert.equal(d1.kind, 'html5');
   assert.equal(d1.appeared, 'Dropped n1');
-  assert.ok(d1.requests?.some((r: { method: string; url: string; status: unknown }) => r.method === 'GET' && r.url.includes('/api/data?drop=n1') && r.status === 200), JSON.stringify(d1.requests));
+  assert.ok(d1.requests?.some((r: { method: string; url: string; status: unknown }) => r.method === 'GET' && r.url.endsWith('/api/data?drop=…') && r.status === 200), JSON.stringify(d1.requests));
   assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n1');
   assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'bin:n1', 'dragend']);
   assert.equal(await ev('clicks'), 0, 'a drag is not a click');
@@ -715,6 +715,38 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   assert.equal(await h.eval(page, `document.getElementById('bin').dataset.dropped ?? null`), null);
   await h.humanAction(ext, 'giveback', space.spaceId);
   await A.call('space_wait_for_control', { spaceId: space.spaceId, timeoutMs: 5000 });
+});
+
+test('waitForText waits for text the action makes appear; receipts list requests without secrets', async () => {
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/wait.html` });
+  const ev = (e: string) => A.call('browser_evaluate', { tabId: space.tabId, expression: e }).then((r: { value: unknown }) => r.value);
+  const click = (target: string, extra: Record<string, unknown> = {}) => A.call('browser_click', { tabId: space.tabId, target, ...extra });
+  const timesOut = (p: Promise<unknown>) => assert.rejects(p, (e: Error) => code(e) === 'TIMEOUT');
+  // "Saved" is already on the page: a re-save (Saving..., then Saved) counts, a change elsewhere does not.
+  assert.equal((await click('#save', { waitForText: 'Saved' })).appeared, 'Saved');
+  await timesOut(click('#touch', { waitForText: 'Saved', waitTimeoutMs: 600 }));
+  // Text split across elements, in an open shadow root, and in a same-origin iframe.
+  assert.equal((await click('#split', { waitForText: 'Order saved' })).appeared, 'Order saved');
+  assert.equal((await click('#shadow', { waitForText: 'Shadow done' })).appeared, 'Shadow done');
+  assert.equal((await click('#inframe', { waitForText: 'Frame done' })).appeared, 'Frame done');
+  // Watches are cleaned up, after success and after a timeout.
+  assert.equal(await ev('Object.keys(window.__overtakeWatch || {}).length'), 0);
+  // Two actions sent at once run one after the other: the second cannot take the first's text.
+  const [first, second] = await Promise.allSettled([click('#alpha', { waitForText: 'Alpha' }), click('#noop', { waitForText: 'Alpha', waitTimeoutMs: 600 })]);
+  assert.equal(first.status, 'fulfilled');
+  assert.equal(second.status, 'rejected');
+  // Requests in receipts carry no query values or credentials.
+  const f = await click('#secret');
+  const req = f.requests?.find((r: { url: string }) => r.url.includes('/api/data'));
+  assert.ok(req, JSON.stringify(f.requests));
+  assert.match(req.url, /\?code=…&state=…$/);
+  assert.doesNotMatch(JSON.stringify(f.requests), /oauth-secret|xyz/);
+  // A ref to an element the page replaced is reported as stale.
+  const snap: string = await A.call('browser_snapshot', { tabId: space.tabId });
+  const ref = /button "Nothing" (@\d+)/.exec(snap)![1];
+  await ev(`(() => { const b = document.getElementById('noop'); b.replaceWith(b.cloneNode(true)); })()`);
+  await assert.rejects(click(ref), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /stale/.test(e.message));
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: ref, to: '#status' }), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /stale/.test(e.message));
 });
 
 test('console, exceptions, interception, emulation, tracing, debugging', async () => {
