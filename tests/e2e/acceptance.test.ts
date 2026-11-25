@@ -174,7 +174,8 @@ test('browser_run runs a whole flow from one script with real input', async () =
 test('browser_select chooses native <select> options by value or label, with checks and events', async () => {
   await A.call('browser_evaluate', { tabId: space.tabId, expression: `(() => {
     const box = document.createElement('div'); box.id = 'sel-box';
-    box.innerHTML = '<select id="team"><option value="">Choose...</option><option value="s">Sales</option><option value="e">Engineering</option><option value="x" disabled>Closed</option></select>'
+    box.innerHTML = '<select id="team"><option value="">Choose...</option><option value="s">Sales</option><option value="e">Engineering</option><option value="x" disabled>Closed</option><option value="x2">Closed</option></select>'
+      + '<fieldset disabled><select id="off"><option>a</option><option>b</option></select></fieldset>'
       + '<select id="tags" multiple><option>red</option><option>green</option><option>blue</option></select><div id="fake">Pick one</div>';
     document.body.prepend(box);
     window.__changes = [];
@@ -186,6 +187,13 @@ test('browser_select chooses native <select> options by value or label, with che
   const multi = await A.call('browser_select', { tabId: space.tabId, target: '#tags', values: ['red', 'blue'] });
   assert.deepEqual(multi.selected.map((o: { value: string }) => o.value), ['red', 'blue']);
   assert.deepEqual(await A.call('browser_evaluate', { tabId: space.tabId, expression: 'window.__changes' }).then((x: { value: string[] }) => x.value), ['team=e', 'team=s', 'tags=red,blue'], 'the page saw change events');
+  // Re-choosing the current option fires no events, like a user.
+  const same = await A.call('browser_select', { tabId: space.tabId, target: '#tags', values: ['red', 'blue'] });
+  assert.equal(same.changed, false);
+  assert.equal(await A.call('browser_evaluate', { tabId: space.tabId, expression: 'window.__changes.length' }).then((x: { value: number }) => x.value), 3);
+  // A disabled option does not hide an enabled one with the same label.
+  assert.equal((await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Closed' })).selected[0].value, 'x2');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#off', values: 'b', force: true }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /disabled/.test(e.message), 'disabled by its fieldset');
   // A snapshot ref works too.
   const snap: string = (await A.callRaw('browser_snapshot', { tabId: space.tabId })).content[0].text;
   const ref = /combobox[^\n]*?(@\d+)/.exec(snap)![1];

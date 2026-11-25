@@ -985,29 +985,35 @@ export class Engine {
         objectId = res.object.objectId;
       }
       const want = (Array.isArray(values) ? values : [values]).map(String);
-      type Out = { error?: string; tag?: string; missing?: string[]; available?: string[]; selected?: { value: string; label: string }[] };
+      type Out = { error?: string; tag?: string; missing?: string[]; available?: string[]; changed?: boolean; selected?: { value: string; label: string }[] };
       const res = await this.cdp<{ result: { value: Out } }>(tabId, 'Runtime.callFunctionOn', {
         objectId,
         returnByValue: true,
         arguments: [{ value: want }],
         functionDeclaration: `function(want){
           if (this.localName !== 'select') return { error: 'not-select', tag: this.localName };
-          if (this.disabled) return { error: 'disabled' };
+          if (this.matches(':disabled')) return { error: 'disabled' }; // also a disabled fieldset
           if (want.length > 1 && !this.multiple) return { error: 'single' };
           const opts = [...this.options];
+          const usable = opts.filter((o) => !o.matches(':disabled')); // includes disabled optgroups
           const label = (o) => (o.label || o.textContent || '').trim();
           const picked = [], missing = [];
           for (const w of want) {
-            const o = opts.find((x) => x.value === w) || opts.find((x) => label(x) === w.trim()) || opts.find((x) => label(x).toLowerCase() === w.trim().toLowerCase());
-            if (!o || o.disabled || (o.parentElement && o.parentElement.localName === 'optgroup' && o.parentElement.disabled)) missing.push(w);
+            const o = usable.find((x) => x.value === w) || usable.find((x) => label(x) === w.trim()) || usable.find((x) => label(x).toLowerCase() === w.trim().toLowerCase());
+            if (!o) missing.push(w);
             else picked.push(o);
           }
-          if (missing.length) return { error: 'missing', missing, available: opts.filter((o) => !o.disabled).slice(0, 40).map((o) => o.value === label(o) ? o.value : label(o) + ' (' + o.value + ')') };
+          if (missing.length) return { error: 'missing', missing, available: usable.slice(0, 40).map((o) => o.value === label(o) ? o.value : label(o) + ' (' + o.value + ')') };
           this.focus();
+          const before = opts.map((o) => o.selected);
           for (const o of opts) o.selected = picked.includes(o);
-          this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-          this.dispatchEvent(new Event('change', { bubbles: true }));
-          return { selected: [...this.selectedOptions].map((o) => ({ value: o.value, label: label(o) })) };
+          // Like a user re-picking the current choice: no events when nothing changed.
+          const changed = opts.some((o, i) => o.selected !== before[i]);
+          if (changed) {
+            this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            this.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return { changed, selected: [...this.selectedOptions].map((o) => ({ value: o.value, label: label(o) })) };
         }`,
       }, sid);
       void this.cdp(tabId, 'Runtime.releaseObject', { objectId }, sid).catch(() => {});
@@ -1017,7 +1023,7 @@ export class Engine {
       if (v.error === 'disabled') throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `${r.desc} is disabled.`);
       if (v.error === 'single') throw new OvertakeError(ErrorCode.BAD_REQUEST, `${r.desc} takes one value (it is not a multiple select).`);
       if (v.error === 'missing') throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `No enabled option matches ${v.missing!.map((m) => JSON.stringify(m)).join(', ')} in ${r.desc}. Options: ${v.available!.join(', ')}.`);
-      return { selectedIn: r.desc, selected: v.selected, at: pt };
+      return { selectedIn: r.desc, selected: v.selected, changed: v.changed, at: pt };
     });
   }
 
