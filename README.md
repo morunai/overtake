@@ -131,9 +131,15 @@ It prints the `claude mcp add` command for that instance.
 | Scripts | `browser_run` (a whole flow from one script file; each call uses the same real input and checks) |
 | Advanced | `browser_intercept` `browser_emulate` `browser_trace` `browser_debug` `browser_cdp` `browser_capabilities` |
 
-`browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_navigate`,
-`browser_wait` and `browser_run` take `snapshot: true` to also return a snapshot of the page after
-the action, with fresh `@refs`, so the agent does not need a separate `browser_snapshot` call.
+`browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_drag`,
+`browser_navigate`, `browser_wait` and `browser_run` take `snapshot: true` to also return a
+snapshot of the page after the action, with fresh `@refs`, so the agent does not need a separate
+`browser_snapshot` call.
+
+To check that an action worked, the input tools take `waitForText` (for example `"Saved"`): it
+waits for that text to appear because of the action, so a "Saved" left over from an earlier save
+does not count. Their results also list the requests the page made (method, URL, status).
+Snapshots mark native drag sources `[draggable]` and give them `@refs`.
 
 The server ships instructions that tell the agent how to behave: one Space per goal, snapshot
 before acting, treat `USER_IN_CONTROL` as a hard stop, and use `space_handoff` when a human is

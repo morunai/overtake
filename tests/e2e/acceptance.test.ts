@@ -580,9 +580,17 @@ test('typing, keys, scroll and drag use real input', async () => {
 test('browser_drag completes native HTML5 drags and still does pointer drags', async () => {
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html` });
   const ev = (e: string) => A.call('browser_evaluate', { tabId: space.tabId, expression: e }).then((r: { value: unknown }) => r.value);
-  // A draggable item dropped on a drop zone: the zone reads the page's own drag data.
-  const d1 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#bin' });
+  // Snapshots mark native drag sources and give them refs.
+  const snap: string = await A.call('browser_snapshot', { tabId: space.tabId });
+  const n1 = /"Native one" (@\d+) \[[^\]]*draggable\]/.exec(snap)?.[1];
+  assert.ok(n1, `draggable item has a ref: ${snap}`);
+  assert.doesNotMatch(snap, /"Pointer one"[^\n]*\[draggable\]/);
+  // A draggable item dropped on a drop zone: the zone reads the page's own drag data. The
+  // result waits for the text the drop shows and lists the request it made.
+  const d1 = await A.call('browser_drag', { tabId: space.tabId, from: n1!, to: '#bin', waitForText: 'Dropped n1' });
   assert.equal(d1.kind, 'html5');
+  assert.equal(d1.appeared, 'Dropped n1');
+  assert.ok(d1.requests?.some((r: { method: string; url: string; status: unknown }) => r.method === 'GET' && r.url.includes('/api/data?drop=n1') && r.status === 200), JSON.stringify(d1.requests));
   assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n1');
   assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'bin:n1', 'dragend']);
   assert.equal(await ev('clicks'), 0, 'a drag is not a click');
@@ -598,6 +606,10 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const t0 = Date.now();
   await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer two' });
   assert.ok(Date.now() - t0 < 1500, `pointer drag took ${Date.now() - t0} ms`);
+  // waitForText needs the text to appear because of the action: text already there does not count.
+  await assert.rejects(A.call('browser_click', { tabId: space.tabId, target: '#after', waitForText: 'Drag Test Page', waitTimeoutMs: 500 }),
+    (e: Error) => code(e) === 'TIMEOUT' && /already there does not count/.test(e.message));
+  await ev(`document.getElementById('after').dataset.n = '0'`);
   // Nothing is left held down or intercepted: a click works, and the agent cannot turn
   // drag interception on itself (it would swallow the human's drags).
   await A.call('browser_click', { tabId: space.tabId, target: '#after' });

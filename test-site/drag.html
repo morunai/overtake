@@ -89,6 +89,7 @@
     bin.dataset.dropped = id;
     bin.textContent = 'Dropped ' + id;
     dragLog.push('bin:' + id + (e.dataTransfer.getData('text/html') ? '+html' : ''));
+    fetch('/api/data?drop=' + encodeURIComponent(id));
   });
   native.dataset.order = order(native);
 

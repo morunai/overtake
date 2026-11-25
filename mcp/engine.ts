@@ -189,6 +189,24 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all = false) {
 /** Whether a request still counts as in flight for idle checks. Chrome never reports
  *  loadingFinished for some requests that did get a response (fetch with keepalive, as
  *  analytics and event beacons use), so a response more than a moment old counts as done. */
+type DomSnap = { strings: string[]; documents: { nodes: { backendNodeId: number[]; attributes?: number[][] }; layout: { nodeIndex: number[]; bounds: number[][] } }[] };
+
+/** Elements with draggable="true" in the snapshot's documents (the main page and same-process
+ *  frames): native drag sources, which the accessibility tree does not mark. */
+function draggableNodes(snap: DomSnap): Set<number> {
+  const out = new Set<number>();
+  for (const doc of snap.documents) {
+    const attrs = doc.nodes.attributes || [];
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      for (let j = 0; j + 1 < a.length; j += 2) {
+        if (snap.strings[a[j]] === 'draggable' && snap.strings[a[j + 1]] === 'true') out.add(doc.nodes.backendNodeId[i]);
+      }
+    }
+  }
+  return out;
+}
+
 function inFlight(e: NetEntry, now: number) {
   if (e.endedAt) return false;
   if (e.respondedAt) return now - e.respondedAt < 150;
@@ -629,6 +647,56 @@ export class Engine {
     }
   }
 
+  /** Start watching for text that appears through a DOM change from now on (an added node or
+   *  changed text containing it). Text already on the page does not count, so waiting for
+   *  "Saved" after an action is not satisfied by an earlier "Saved". */
+  async watchText(tabId: number, text: string): Promise<string> {
+    return this.action(tabId, async () => {
+      const id = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const expr = `(() => { const text = ${JSON.stringify(text)}; const id = ${JSON.stringify(id)};
+        const w = (window.__overtakeWatch ||= {});
+        const has = (n) => (n.nodeType === 3 ? n.data : n.textContent || '').includes(text);
+        const mo = new MutationObserver((list) => {
+          for (const m of list) {
+            if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { w[id] = true; mo.disconnect(); return; }
+          }
+        });
+        mo.observe(document, { subtree: true, childList: true, characterData: true });
+        w[id] = false; })()`;
+      await this.cdp(tabId, 'Runtime.evaluate', { expression: expr });
+      return id;
+    });
+  }
+
+  /** Wait for a watchText watch. If the page navigated (the watch is gone), the text on the new
+   *  page counts. */
+  async awaitText(tabId: number, id: string, text: string, timeoutMs: number) {
+    const fn = `(() => { const w = window.__overtakeWatch; if (w && ${JSON.stringify(id)} in w) return w[${JSON.stringify(id)}]; return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
+    try {
+      await this.wait(tabId, { function: fn, timeoutMs });
+    } catch (e) {
+      if (e instanceof OvertakeError && e.code === ErrorCode.TIMEOUT) throw new OvertakeError(ErrorCode.TIMEOUT, `The action ran, but "${text.slice(0, 80)}" did not appear on the page within ${timeoutMs} ms (text that was already there does not count).`);
+      throw e;
+    } finally {
+      void this.cdp(tabId, 'Runtime.evaluate', { expression: `delete window.__overtakeWatch?.[${JSON.stringify(id)}]` }).catch(() => {});
+    }
+    return { appeared: text };
+  }
+
+  /** Requests the page made since `since` (an action's start), skipping static assets. Waits
+   *  briefly (at most maxMs) for ones still in flight, so a save the action triggered shows
+   *  its status. */
+  async requestsSince(tabId: number, since: number, maxMs = 1000) {
+    const t = this.#tabs.get(tabId);
+    if (!t) return [];
+    const skip = new Set(['Image', 'Font', 'Stylesheet', 'Script', 'Media', 'Manifest', 'Ping', 'CSPViolationReport', 'EventSource', 'WebSocket']);
+    const pick = () => [...t.net.values()].filter((e) => e.startedAt >= since && !skip.has(e.type || '') && !e.url.startsWith('data:'));
+    await sleep(30); // a request started by the action's last event may not be reported yet
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline && pick().some((e) => inFlight(e, Date.now()))) await sleep(25);
+    return pick().slice(0, 10).map((e) => ({ method: e.method, url: redactUrl(e.url).slice(0, 200), status: e.status ?? (e.failed ? `failed: ${e.failed}` : 'pending'), ms: e.endedAt ? e.endedAt - e.startedAt : undefined }));
+  }
+
   /** Page URL, title and readyState. timeoutMs bounds the whole call, retries included. */
   async pageInfo(tabId: number, timeoutMs?: number) {
     const deadline = timeoutMs !== undefined ? Date.now() + timeoutMs : undefined;
@@ -757,8 +825,10 @@ export class Engine {
           }
         }
       }
+      const dom = await this.cdp<DomSnap>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] }).catch(() => null);
       let visible: Set<number> | undefined;
-      if ((opts.scope || 'viewport') === 'viewport') visible = await this.#visibleNodes(tabId);
+      if ((opts.scope || 'viewport') === 'viewport') visible = dom ? await this.#visibleNodes(tabId, dom) : new Set();
+      const draggable = dom ? draggableNodes(dom) : undefined;
       const exclude = new Set<number>();
       const host = await this.cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', { expression: `document.querySelector('overtake-overlay')` }).catch(() => null);
       if (host?.result.objectId) {
@@ -766,15 +836,14 @@ export class Engine {
         if (d) exclude.add(d.node.backendNodeId);
         void this.cdp(tabId, 'Runtime.releaseObject', { objectId: host.result.objectId }).catch(() => {});
       }
-      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, nextRef: () => ++refCounter, maxLines: opts.maxLines });
+      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, draggable, nextRef: () => ++refCounter, maxLines: opts.maxLines });
       t.refs = out.refs;
       const info = await this.pageInfo(tabId);
       return { url: info.url, title: info.title, snapshot: out.text, refCount: out.refs.size };
     });
   }
 
-  async #visibleNodes(tabId: number): Promise<Set<number>> {
-    const snap = await this.cdp<{ documents: { nodes: { backendNodeId: number[] }; layout: { nodeIndex: number[]; bounds: number[][] }; scrollOffsetX?: number; scrollOffsetY?: number }[] }>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] });
+  async #visibleNodes(tabId: number, snap: DomSnap): Promise<Set<number>> {
     const m = await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
     const vp = m.cssVisualViewport;
     const doc = snap.documents[0];
