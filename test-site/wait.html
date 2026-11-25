@@ -10,6 +10,7 @@
 <p id="other">Other text</p>
 <div id="host"></div>
 <div id="host2"></div>
+<div id="host3"></div>
 <p id="hidden-ok" hidden>Confirmed</p>
 <div id="sink"></div>
 <iframe id="frame" src="/drop-frame.html" title="Same-site frame" style="width:200px;height:60px;border:0"></iframe>
@@ -25,10 +26,16 @@
   <button id="reveal" onclick="document.getElementById('hidden-ok').hidden = false">Reveal</button>
   <button id="lateshadow" onclick="document.getElementById('host2').attachShadow({ mode: 'open' }).innerHTML = '<b>Late shadow</b>'">Late shadow</button>
   <button id="srcdoc" onclick="document.getElementById('frame').srcdoc = '<p>Srcdoc done</p>'">Srcdoc</button>
+  <button id="mixed" onclick="const d = document.createElement('div'); d.innerHTML = '<span hidden>Mixed hidden</span><span>Other</span>'; document.getElementById('sink').append(d)">Mixed</button>
+  <button id="vishidden" onclick="const p = document.createElement('p'); p.style.visibility = 'hidden'; p.textContent = 'Invisible text'; document.getElementById('sink').append(p)">Invisible</button>
+  <button id="shadowreveal" onclick="document.getElementById('host3').shadowRoot.querySelector('span').hidden = false">Shadow reveal</button>
+  <button id="go" onclick="location.href = '/wait.html?nav=1'">Go</button>
   <button id="secret" onclick="fetch('/api/data?code=oauth-secret-123&state=xyz')">Fetch</button>
 </div>
 <script>
   document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<span>Shadow idle</span>';
+  document.getElementById('host3').attachShadow({ mode: 'open' }).innerHTML = '<span hidden>Shadow reveal</span>';
+  if (location.search.includes('nav=1')) setTimeout(() => (document.getElementById('host').shadowRoot.querySelector('span').textContent = 'Arrived in shadow'), 200);
 </script>
 </body>
 </html>

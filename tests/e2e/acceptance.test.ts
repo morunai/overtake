@@ -732,6 +732,9 @@ test('waitForText waits for text the action makes appear; receipts list requests
   // Only visible text counts: hidden text appended does not, hidden text revealed does.
   await timesOut(click('#hiddenadd', { waitForText: 'Ghost text', waitTimeoutMs: 600 }));
   assert.equal((await click('#reveal', { waitForText: 'Confirmed' })).appeared, 'Confirmed');
+  await timesOut(click('#mixed', { waitForText: 'Mixed hidden', waitTimeoutMs: 600 }));
+  await timesOut(click('#vishidden', { waitForText: 'Invisible text', waitTimeoutMs: 600 }));
+  assert.equal((await click('#shadowreveal', { waitForText: 'Shadow reveal' })).appeared, 'Shadow reveal');
   // A shadow root attached by the action, and an iframe whose document the action replaces.
   assert.equal((await click('#lateshadow', { waitForText: 'Late shadow' })).appeared, 'Late shadow');
   assert.equal((await click('#srcdoc', { waitForText: 'Srcdoc done' })).appeared, 'Srcdoc done');
@@ -741,6 +744,8 @@ test('waitForText waits for text the action makes appear; receipts list requests
   const [first, second] = await Promise.allSettled([click('#alpha', { waitForText: 'Alpha' }), click('#noop', { waitForText: 'Alpha', waitTimeoutMs: 600 })]);
   assert.equal(first.status, 'fulfilled');
   assert.equal(second.status, 'rejected');
+  // After a navigation, the text on the new page counts, shadow roots included.
+  assert.equal((await click('#go', { waitForText: 'Arrived in shadow' })).appeared, 'Arrived in shadow');
   // Requests in receipts carry no query values or credentials.
   const f = await click('#secret');
   const req = f.requests?.find((r: { url: string }) => r.url.includes('/api/data'));

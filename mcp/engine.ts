@@ -225,6 +225,33 @@ export function receiptUrl(raw: string): string {
   }
 }
 
+/** Page-side helpers for waitForText (inlined into page expressions): shown(el) is rendered
+ *  and visible; roots() is the document plus open shadow roots and same-origin iframe documents,
+ *  skipping hidden iframes; count(text) is the number of visible copies across them. */
+const VISIBLE_TEXT_JS = `
+  const shown = (el) => !!el && (!el.checkVisibility || el.checkVisibility({ visibilityProperty: true }));
+  const roots = () => {
+    const out = [document];
+    const walk = (root) => {
+      for (const el of root.querySelectorAll('*')) {
+        if (out.length > 200) return;
+        if (el.shadowRoot) { out.push(el.shadowRoot); walk(el.shadowRoot); }
+        if (el.localName === 'iframe' && shown(el)) { try { const d = el.contentDocument; if (d) { out.push(d); walk(d); } } catch {} }
+      }
+    };
+    walk(document);
+    return out;
+  };
+  const visibleText = (root) => root.nodeType === 9 ? (root.body?.innerText || '') : [...root.children].filter(shown).map((c) => c.innerText ?? '').join('\\n');
+  const count = (text) => {
+    let n = 0;
+    for (const r of roots()) {
+      const t = visibleText(r);
+      for (let i = t.indexOf(text); i >= 0; i = t.indexOf(text, i + text.length)) n++;
+    }
+    return n;
+  };`;
+
 function inFlight(e: NetEntry, now: number) {
   if (e.endedAt) return false;
   if (e.respondedAt) return now - e.respondedAt < 150;
@@ -677,35 +704,12 @@ export class Engine {
       const id = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       const expr = `(() => { const text = ${JSON.stringify(text)}; const id = ${JSON.stringify(id)};
         const w = (window.__overtakeWatch ||= {});
-        const visibleText = (root) => {
-          if (root.nodeType === 9) return root.body?.innerText || '';
-          return [...root.children].map((c) => c.innerText ?? c.textContent ?? '').join('\\n');
+        ${VISIBLE_TEXT_JS}
+        const has = (node) => {
+          // The matching text itself must be rendered: innerText leaves out hidden descendants.
+          if (node.nodeType === 3) return node.data.includes(text) && shown(node.parentElement);
+          return node.nodeType === 1 && shown(node) && (node.innerText ?? '').includes(text);
         };
-        const roots = () => {
-          const out = [document];
-          const walk = (root) => {
-            for (const el of root.querySelectorAll('*')) {
-              if (out.length > 200) return;
-              if (el.shadowRoot) { out.push(el.shadowRoot); walk(el.shadowRoot); }
-              if (el.localName === 'iframe') { try { const d = el.contentDocument; if (d) { out.push(d); walk(d); } } catch {} }
-            }
-          };
-          walk(document);
-          return out;
-        };
-        const count = () => {
-          let n = 0;
-          for (const r of roots()) {
-            const t = visibleText(r);
-            for (let i = t.indexOf(text); i >= 0; i = t.indexOf(text, i + text.length)) n++;
-          }
-          return n;
-        };
-        const shown = (node) => {
-          const el = node.nodeType === 1 ? node : node.parentElement;
-          return !!el && (!el.checkVisibility || el.checkVisibility());
-        };
-        const has = (node) => (node.nodeType === 3 ? node.data : node.textContent || '').includes(text) && shown(node);
         const entry = { seen: false, low: 0 };
         const observers = [];
         const stop = () => { for (const o of observers) o.disconnect(); observers.length = 0; clearTimeout(entry.ttl); };
@@ -721,14 +725,14 @@ export class Engine {
         }
         entry.check = () => {
           if (!entry.seen) {
-            const c = count();
+            const c = count(text);
             if (c > entry.low) { entry.seen = true; stop(); }
             else entry.low = Math.min(entry.low, c);
           }
           return entry.seen;
         };
         entry.stop = () => { stop(); delete w[id]; };
-        entry.low = count();
+        entry.low = count(text);
         entry.ttl = setTimeout(entry.stop, ${Math.max(1000, Math.round(ttlMs))});
         w[id] = entry; })()`;
       await this.cdp(tabId, 'Runtime.evaluate', { expression: expr });
@@ -739,7 +743,8 @@ export class Engine {
   /** Wait for a watchText watch. If the page navigated (the watch is gone), the text on the new
    *  page counts. */
   async awaitText(tabId: number, id: string, text: string, timeoutMs: number) {
-    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.check(); return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
+    // After a navigation the watch is gone: then the text anywhere visible on the new page counts.
+    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.check(); ${VISIBLE_TEXT_JS} return count(${JSON.stringify(text)}) > 0; })()`;
     try {
       await this.wait(tabId, { function: fn, timeoutMs });
     } catch (e) {
