@@ -108,6 +108,23 @@ Two layers follow from that:
   4. The gate opens, the step is dispatched, and the gate closes.
   5. When the burst ends, the shields are restored and the native gate reopens.
 
+Native HTML5 drags (`browser_drag`): a drag burst turns on `Input.setInterceptDrags` for its
+own duration only (agents cannot call it through `browser_cdp`, since left on it would
+swallow the human's drags). If the page starts a native drag during the pointer moves, Chrome
+reports `Input.dragIntercepted` with the page's drag data; the burst skips its remaining
+pointer steps and runs `Input.dispatchDragEvent` steps (enter, over, drop) with that data
+instead. The permit admits `dragstart` at the press origin rather than the move's point.
+Native drag events reach the page even while Chrome ignores input, so the agent's drag events
+carry an extra `application/x-overtake-drag` item with a fresh secret per burst, and the
+shield admits a `drop`, in any frame, only while the agent's drop is dispatched, once, and
+carrying that secret. A human's drop during the burst is cancelled, even with the same data. A burst aborted mid-drag sends `dragCancel`, so
+the page gets `dragend` and no drop. Drag events go to the top page's process and cannot
+reach a cross-site (out-of-process) iframe, so a native drag with either end in one is
+cancelled the same way and reported as `ELEMENT_NOT_ACTIONABLE`. The extension hit-tests
+the press origin and, immediately before dispatching the drop, the drop point (while the shield
+is inert, so the hit is the page's real element): a frame element there is a cross-site iframe,
+since same-process frames are hit-tested through to their content.
+
 Measured in `tests/e2e/acceptance.test.ts`: **10,104–10,483 trusted human clicks during
 a 120-event agent typing burst; none landed; all 60 agent keystrokes landed.**
 

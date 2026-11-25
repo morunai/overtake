@@ -8,6 +8,7 @@ const METHOD_RE = /^[A-Z][A-Za-z]{1,40}\.[a-z][A-Za-z]{1,60}$/;
 /** Methods an agent may never call directly, with the reason surfaced to it. */
 const DENY: Record<string, string> = {
   'Input.setIgnoreInputEvents': 'reserved for the Overtake input gate',
+  'Input.setInterceptDrags': 'browser_drag handles native HTML5 drags; left on, it would swallow the user\'s own drags',
   'Network.getAllCookies': 'reads cookies for every site in the user profile',
   'Storage.getCookies': 'reads cookies for every site in the user profile',
   'Network.clearBrowserCookies': 'clears cookies for the whole user profile',

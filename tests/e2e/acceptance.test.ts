@@ -577,6 +577,190 @@ test('typing, keys, scroll and drag use real input', async () => {
   assert.equal(d.dragged.to.x, 400);
 });
 
+test('browser_drag completes native HTML5 drags and still does pointer drags', async () => {
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html` });
+  const ev = (e: string) => A.call('browser_evaluate', { tabId: space.tabId, expression: e }).then((r: { value: unknown }) => r.value);
+  // Snapshots mark native drag sources and give them refs.
+  const snap: string = await A.call('browser_snapshot', { tabId: space.tabId });
+  const n1 = /"Native one" (@\d+) \[[^\]]*draggable\]/.exec(snap)?.[1];
+  assert.ok(n1, `draggable item has a ref: ${snap}`);
+  assert.doesNotMatch(snap, /"Pointer one"[^\n]*\[draggable\]/);
+  // A draggable item dropped on a drop zone: the zone reads the page's own drag data. The
+  // result waits for the text the drop shows and lists the request it made.
+  const d1 = await A.call('browser_drag', { tabId: space.tabId, from: n1!, to: '#bin', waitForText: 'Dropped n1' });
+  assert.equal(d1.kind, 'html5');
+  assert.equal(d1.appeared, 'Dropped n1');
+  assert.ok(d1.requests?.some((r: { method: string; url: string; status: unknown }) => r.method === 'GET' && r.url.endsWith('/api/data?drop=…') && r.status === 200), JSON.stringify(d1.requests));
+  assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n1');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'bin:n1', 'dragend']);
+  assert.equal(await ev('clicks'), 0, 'a drag is not a click');
+  // Sortable list reorders through dragover and drop on other items.
+  const d2 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: 'text=Native three' });
+  assert.equal(d2.kind, 'html5');
+  assert.equal(await ev(`document.getElementById('native').dataset.order`), 'n2,n3,n1');
+  // Pointer-event lists still use the pointer path.
+  const d3 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer three' });
+  assert.equal(d3.kind, 'pointer');
+  assert.equal(await ev(`document.getElementById('pointer').dataset.order`), 'p2,p3,p1');
+  // A pointer drag does not wait out the native steps it skips.
+  const t0 = Date.now();
+  await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer two' });
+  assert.ok(Date.now() - t0 < 1500, `pointer drag took ${Date.now() - t0} ms`);
+  // waitForText needs the text to appear because of the action: text already there does not count.
+  await assert.rejects(A.call('browser_click', { tabId: space.tabId, target: '#after', waitForText: 'Drag Test Page', waitTimeoutMs: 500 }),
+    (e: Error) => code(e) === 'TIMEOUT' && /already there does not count/.test(e.message));
+  await ev(`document.getElementById('after').dataset.n = '0'`);
+  // Nothing is left held down or intercepted: a click works, and the agent cannot turn
+  // drag interception on itself (it would swallow the human's drags).
+  await A.call('browser_click', { tabId: space.tabId, target: '#after' });
+  assert.equal(await ev(`document.getElementById('after').dataset.n`), '1');
+  await assert.rejects(A.call('browser_cdp', { tabId: space.tabId, method: 'Input.setInterceptDrags', params: { enabled: true } }), (e) => code(e) === 'CDP_METHOD_DENIED');
+  // Works from a script too.
+  const r = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `return (await drag('text=Native two', '#bin')).kind;` })).content[0].text);
+  assert.equal(r.result, 'html5');
+  assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n2');
+  // A native drop into an iframe works too.
+  const df = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native three', to: '#frame' });
+  assert.equal(df.kind, 'html5');
+  assert.ok(((await ev('dragLog')) as string[]).includes('frame:n3'), 'dropped into the iframe');
+  // An iframe that appears only after the drag started (it missed the burst's start) still
+  // takes the agent's drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?late=1` });
+  const lz = await ev(`(() => { const r = document.getElementById('lateZone').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  const dl = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lz.x},${lz.y}` });
+  assert.equal(dl.kind, 'html5');
+  assert.ok(((await ev('dragLog')) as string[]).includes('frame:n2'), `dropped into the late iframe: ${await ev('JSON.stringify(dragLog)')}`);
+  // A native drag into a cross-site (out-of-process) iframe cannot be completed: it is
+  // cancelled (the source gets dragend) and reported, not claimed as a drop.
+  await ev('dragLog.length = 0');
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#xframe' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /cross-site iframe/.test(e.message));
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'dragend']);
+  {
+    const xr = await ev(`(() => { const r = document.getElementById('xframe').getBoundingClientRect(); return { x: r.x + 30, y: r.y + 16 }; })()`) as { x: number; y: number };
+    // And out of one: the iframe's drag is cancelled too.
+    const out = await A.callRaw('browser_drag', { tabId: space.tabId, from: `${xr.x},${xr.y}`, to: '#bin' });
+    assert.match(out.content[0].text, /^ELEMENT_NOT_ACTIONABLE.*cross-site iframe/);
+    const x = (await A.call('browser_frames', { tabId: space.tabId })).frames.find((f: { outOfProcess: boolean; sessionId?: string }) => f.outOfProcess && f.sessionId);
+    assert.equal((await A.call('browser_evaluate', { tabId: space.tabId, frameId: x.frameId, expression: 'JSON.stringify(frameLog)' })).value, '["fdragstart","fdragend"]');
+    assert.equal(await ev(`document.getElementById('bin').dataset.dropped ?? null`), null);
+  }
+  // A cross-site iframe that appears under the drop point during the drag: checked right
+  // before the drop, so it is cancelled and reported too.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?latex=1` });
+  const lzx = await ev(`(() => { const r = document.getElementById('lateZone').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lzx.x},${lzx.y}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'dragend']);
+  // The same when the iframe moves under the drop point just before the drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?move=1` });
+  const bc = await ev(`(() => { const r = document.getElementById('bin').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${bc.x},${bc.y}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'dragend']);
+  // A drop zone of the page drawn over a cross-site iframe is a normal drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?cover=1` });
+  const dc = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: '#cover' });
+  assert.equal(dc.kind, 'html5');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'cover:n2', 'dragend']);
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?late=1` });
+  // Raw drag events sent to a cross-site iframe's own session (frame coordinates) are marked
+  // and admitted too.
+  let xf: { frameId: string; sessionId?: string } | undefined;
+  let frameList: unknown;
+  for (let i = 0; i < 40 && !xf?.sessionId; i++) {
+    frameList = (await A.call('browser_frames', { tabId: space.tabId })).frames;
+    xf = (frameList as { url: string; outOfProcess: boolean; frameId: string; sessionId?: string }[]).find((f) => f.outOfProcess && !!f.sessionId); // the only cross-site frame (its url may read empty)
+    if (!xf?.sessionId) await sleep(50);
+  }
+  assert.ok(xf?.sessionId, `the cross-site drop frame has its own session: ${JSON.stringify(frameList)}`);
+  const raw = { items: [{ mimeType: 'text/plain', data: 'raw' }], dragOperationsMask: 1 };
+  for (const type of ['dragEnter', 'dragOver', 'drop']) {
+    await A.call('browser_cdp', { tabId: space.tabId, method: 'Input.dispatchDragEvent', params: { type, x: 100, y: 60, data: raw }, sessionId: xf!.sessionId });
+  }
+  const fl = await A.call('browser_evaluate', { tabId: space.tabId, frameId: xf!.frameId, expression: 'frameLog.at(-1)' });
+  assert.equal(fl.value, 'frame:raw');
+  // A human's native drop while the agent drags natively never lands, in the page or in an
+  // iframe, even carrying the agent's own drag data: native drag events bypass Chrome's input
+  // gate, so the shield admits one drop only while the agent's drop is dispatched. The human
+  // drop adds text/html, so the page can tell whose drop it got. (The human's drag events end
+  // Chrome's drag session, so the agent's drop is lost too; only the human's matters here.)
+  for (const [i, where] of ['#bin', '#frame'].entries()) {
+    await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?human-drop=${i}` });
+    const hp = await h.humanSession(`drag.html?human-drop=${i}`);
+    const pt = await h.eval<{ x: number; y: number }>(hp, `(() => { const r = document.querySelector('${where}').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    let done = false;
+    // The agent drops at the very point the human does.
+    const agentDrag = A.callRaw('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: `${pt.x},${pt.y}` }).finally(() => (done = true));
+    for (let k = 0; k < 200 && !done && !(await h.eval<string[]>(hp, 'dragLog')).length; k++) await sleep(5);
+    let tries = 0;
+    while (!done) {
+      await h.humanDrop(hp, pt.x, pt.y, 'n1', '<b>human</b>');
+      tries++;
+      await sleep(5);
+    }
+    const ad = JSON.parse((await agentDrag).content[0].text);
+    assert.equal(ad.kind, 'html5', `${where}: the agent drag was native`);
+    assert.ok(tries > 3, `${where}: human dropped ${tries} times`);
+    const log = await h.eval<string[]>(hp, 'dragLog');
+    assert.ok(!log.some((l) => l.endsWith('+html')), `${where}: the human drop was blocked: ${log.join(' ')}`);
+  }
+  // A take-over in the middle of a native drag cancels it: the page gets dragend, no drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?takeover=1` });
+  const page = await h.humanSession('drag.html?takeover=1');
+  const drag = A.callRaw('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#bin' });
+  for (let i = 0; i < 200 && !(await h.eval<string[]>(page, 'dragLog')).length; i++) await sleep(10);
+  await h.humanAction(ext, 'takeover', space.spaceId);
+  const r2 = await drag;
+  assert.ok(r2.isError);
+  assert.match(r2.content[0].text, /^USER_IN_CONTROL/);
+  assert.deepEqual(await h.eval(page, 'dragLog'), ['dragstart:n1', 'dragend']);
+  assert.equal(await h.eval(page, `document.getElementById('bin').dataset.dropped ?? null`), null);
+  await h.humanAction(ext, 'giveback', space.spaceId);
+  await A.call('space_wait_for_control', { spaceId: space.spaceId, timeoutMs: 5000 });
+});
+
+test('waitForText waits for text the action makes appear; receipts list requests without secrets', async () => {
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/wait.html` });
+  const ev = (e: string) => A.call('browser_evaluate', { tabId: space.tabId, expression: e }).then((r: { value: unknown }) => r.value);
+  const click = (target: string, extra: Record<string, unknown> = {}) => A.call('browser_click', { tabId: space.tabId, target, ...extra });
+  const timesOut = (p: Promise<unknown>) => assert.rejects(p, (e: Error) => code(e) === 'TIMEOUT');
+  // "Saved" is already on the page: a re-save (Saving..., then Saved) counts, a change elsewhere does not.
+  assert.equal((await click('#save', { waitForText: 'Saved' })).appeared, 'Saved');
+  await timesOut(click('#touch', { waitForText: 'Saved', waitTimeoutMs: 600 }));
+  // Text split across elements, in an open shadow root, and in a same-origin iframe.
+  assert.equal((await click('#split', { waitForText: 'Order saved' })).appeared, 'Order saved');
+  assert.equal((await click('#shadow', { waitForText: 'Shadow done' })).appeared, 'Shadow done');
+  assert.equal((await click('#inframe', { waitForText: 'Frame done' })).appeared, 'Frame done');
+  // Only visible text counts: hidden text appended does not, hidden text revealed does.
+  await timesOut(click('#hiddenadd', { waitForText: 'Ghost text', waitTimeoutMs: 600 }));
+  assert.equal((await click('#reveal', { waitForText: 'Confirmed' })).appeared, 'Confirmed');
+  await timesOut(click('#mixed', { waitForText: 'Mixed hidden', waitTimeoutMs: 600 }));
+  await timesOut(click('#vishidden', { waitForText: 'Invisible text', waitTimeoutMs: 600 }));
+  assert.equal((await click('#shadowreveal', { waitForText: 'Shadow reveal' })).appeared, 'Shadow reveal');
+  assert.equal((await click('#bareshadow', { waitForText: 'Bare shadow success' })).appeared, 'Bare shadow success');
+  // A shadow root attached by the action, and an iframe whose document the action replaces.
+  assert.equal((await click('#lateshadow', { waitForText: 'Late shadow' })).appeared, 'Late shadow');
+  assert.equal((await click('#srcdoc', { waitForText: 'Srcdoc done' })).appeared, 'Srcdoc done');
+  // Watches are cleaned up, after success and after a timeout.
+  assert.equal(await ev('Object.keys(window.__overtakeWatch || {}).length'), 0);
+  // Two actions sent at once run one after the other: the second cannot take the first's text.
+  const [first, second] = await Promise.allSettled([click('#alpha', { waitForText: 'Alpha' }), click('#noop', { waitForText: 'Alpha', waitTimeoutMs: 600 })]);
+  assert.equal(first.status, 'fulfilled');
+  assert.equal(second.status, 'rejected');
+  // After a navigation, the text on the new page counts, shadow roots included.
+  assert.equal((await click('#go', { waitForText: 'Arrived in shadow' })).appeared, 'Arrived in shadow');
+  // Requests in receipts carry no query values or credentials.
+  const f = await click('#secret');
+  const req = f.requests?.find((r: { url: string }) => r.url.includes('/api/data'));
+  assert.ok(req, JSON.stringify(f.requests));
+  assert.match(req.url, /\?code=…&state=…$/);
+  assert.doesNotMatch(JSON.stringify(f.requests), /oauth-secret|xyz/);
+  // A ref to an element the page replaced is reported as stale.
+  const snap: string = await A.call('browser_snapshot', { tabId: space.tabId });
+  const ref = /button "Nothing" (@\d+)/.exec(snap)![1];
+  await ev(`(() => { const b = document.getElementById('noop'); b.replaceWith(b.cloneNode(true)); })()`);
+  await assert.rejects(click(ref), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /stale/.test(e.message));
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: ref, to: '#status' }), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /stale/.test(e.message));
+});
+
 test('console, exceptions, interception, emulation, tracing, debugging', async () => {
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/?nav=3` });
   await A.call('browser_click', { tabId: space.tabId, target: '#boom' });

@@ -51,6 +51,8 @@ export interface SnapshotInput {
   maxLines?: number;
   /** backendNodeIds whose subtrees are hidden from the agent (the Overtake overlay). */
   exclude?: Set<number>;
+  /** backendNodeIds of draggable="true" elements: given refs and marked [draggable]. */
+  draggable?: Set<number>;
 }
 
 export interface SnapshotOutput {
@@ -63,6 +65,24 @@ export interface SnapshotOutput {
 function str(v?: AXValue): string {
   if (!v || v.value === undefined || v.value === null) return '';
   return String(v.value).replace(/\s+/g, ' ').trim();
+}
+
+/** The visible text under a node, from its StaticText descendants. */
+function textOf(n: AXNode, byId: Map<string, AXNode>, depth = 0): string {
+  if (depth > 20) return '';
+  if (str(n.role) === 'StaticText') return str(n.name);
+  return (n.childIds || []).map((id) => byId.get(id)).filter(Boolean).map((k) => textOf(k as AXNode, byId, depth + 1)).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Whether a node has descendants that get their own line with a ref (interactive or draggable). */
+function hasInteractive(n: AXNode, byId: Map<string, AXNode>, draggable: Set<number> | undefined, depth = 0): boolean {
+  if (depth > 20) return false;
+  return (n.childIds || []).some((id) => {
+    const k = byId.get(id);
+    if (!k) return false;
+    if (k.backendDOMNodeId !== undefined && draggable?.has(k.backendDOMNodeId)) return true;
+    return (!k.ignored && INTERACTIVE.has(str(k.role))) || hasInteractive(k, byId, draggable, depth + 1);
+  });
 }
 
 export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
@@ -108,11 +128,13 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
         omittedBelow = true;
         return;
       }
-      if (n.ignored || SKIP_ROLES.has(role)) {
+      const drag = tree === input.main || !tree.sessionId ? n.backendDOMNodeId !== undefined && !!input.draggable?.has(n.backendDOMNodeId) : false;
+      if (!drag && (n.ignored || SKIP_ROLES.has(role))) {
         for (const k of kids) visit(k, d);
         return;
       }
-      const name = str(n.name);
+      // A draggable element often has no accessible name of its own: use its text.
+      const name = str(n.name) || (drag ? textOf(n, byId).slice(0, 160) : '');
       if (role === 'StaticText') {
         if (name) lines.push(`${'  '.repeat(d)}- text "${name.slice(0, 200)}"`);
         return;
@@ -122,7 +144,7 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
         return;
       }
       // Collapse anonymous containers.
-      if (CONTAINER_ROLES.has(role) && !name) {
+      if (!drag && CONTAINER_ROLES.has(role) && !name) {
         for (const k of kids) visit(k, d);
         return;
       }
@@ -139,17 +161,19 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
       }
       const value = str(n.value);
       let ref = '';
-      if (n.backendDOMNodeId !== undefined && (INTERACTIVE.has(role) || (name && ['heading', 'img', 'image'].includes(role)))) {
+      if (drag) props.push('draggable');
+      if (n.backendDOMNodeId !== undefined && (drag || INTERACTIVE.has(role) || (name && ['heading', 'img', 'image'].includes(role)))) {
         const id = input.nextRef();
         refs.set(id, { backendNodeId: n.backendDOMNodeId, sessionId: tree.sessionId, frameId: tree.frameId, ownerBackendNodeId: tree.ownerBackendNodeId, role, name });
         ref = ` @${id}`;
       }
-      const label = role === 'Iframe' ? 'iframe' : role;
+      const label = role === 'Iframe' ? 'iframe' : !role || n.ignored ? 'generic' : role;
       lines.push(`${'  '.repeat(d)}- ${label}${name ? ` "${name.slice(0, 160)}"` : ''}${ref}${value && value !== name ? ` value="${value.slice(0, 120)}"` : ''}${props.length ? ` [${props.join(', ')}]` : ''}`);
       if (n.backendDOMNodeId !== undefined && input.children.has(n.backendDOMNodeId)) {
         walkTree(input.children.get(n.backendDOMNodeId)!, d + 1, undefined);
       }
-      if (onlyText && name) return;
+      // A draggable named from its own text: its text-only subtree would repeat that name.
+      if ((onlyText || (drag && !str(n.name))) && name && !hasInteractive(n, byId, input.draggable)) return;
       for (const k of kids) visit(k, d + 1);
     };
     visit(root, depth);

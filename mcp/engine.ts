@@ -189,6 +189,70 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all = false) {
 /** Whether a request still counts as in flight for idle checks. Chrome never reports
  *  loadingFinished for some requests that did get a response (fetch with keepalive, as
  *  analytics and event beacons use), so a response more than a moment old counts as done. */
+type DomSnap = { strings: string[]; documents: { nodes: { backendNodeId: number[]; attributes?: number[][] }; layout: { nodeIndex: number[]; bounds: number[][] } }[] };
+
+/** Elements with draggable="true" in the snapshot's documents (the main page and same-process
+ *  frames): native drag sources, which the accessibility tree does not mark. */
+function draggableNodes(snap: DomSnap): Set<number> {
+  const out = new Set<number>();
+  for (const doc of snap.documents) {
+    const attrs = doc.nodes.attributes || [];
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      for (let j = 0; j + 1 < a.length; j += 2) {
+        if (snap.strings[a[j]] === 'draggable' && snap.strings[a[j + 1]] === 'true') out.add(doc.nodes.backendNodeId[i]);
+      }
+    }
+  }
+  return out;
+}
+
+/** A URL for an action receipt, shown without being asked for: no credentials, no query
+ *  values (they can carry OAuth codes or tokens under any name), no fragment. Query names stay,
+ *  for context; browser_network has the full (redacted) details. */
+export function receiptUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    u.username = '';
+    u.password = '';
+    u.hash = '';
+    const names = [...new Set([...u.searchParams.keys()])];
+    u.search = '';
+    const q = names.length ? '?' + names.map((n) => `${encodeURIComponent(n)}=…`).join('&') : '';
+    return (u.toString() + q).slice(0, 200);
+  } catch {
+    return raw.split(/[?#]/)[0].replace(/\/\/[^/@]*@/, '//').slice(0, 200);
+  }
+}
+
+/** Page-side helpers for waitForText (inlined into page expressions): shown(el) is rendered
+ *  and visible; roots() is the document plus open shadow roots and same-origin iframe documents,
+ *  skipping hidden iframes; count(text) is the number of visible copies across them. */
+const VISIBLE_TEXT_JS = `
+  const shown = (el) => !!el && (!el.checkVisibility || el.checkVisibility({ visibilityProperty: true }));
+  const roots = () => {
+    const out = [document];
+    const walk = (root) => {
+      for (const el of root.querySelectorAll('*')) {
+        if (out.length > 200) return;
+        if (el.shadowRoot) { out.push(el.shadowRoot); walk(el.shadowRoot); }
+        if (el.localName === 'iframe' && shown(el)) { try { const d = el.contentDocument; if (d) { out.push(d); walk(d); } } catch {} }
+      }
+    };
+    walk(document);
+    return out;
+  };
+  const visibleText = (root) => root.nodeType === 9 ? (root.body?.innerText || '')
+    : [...root.childNodes].map((n) => n.nodeType === 3 ? (shown(root.host) ? n.data : '') : n.nodeType === 1 && shown(n) ? (n.innerText ?? '') : '').join('\\n');
+  const count = (text) => {
+    let n = 0;
+    for (const r of roots()) {
+      const t = visibleText(r);
+      for (let i = t.indexOf(text); i >= 0; i = t.indexOf(text, i + text.length)) n++;
+    }
+    return n;
+  };`;
+
 function inFlight(e: NetEntry, now: number) {
   if (e.endedAt) return false;
   if (e.respondedAt) return now - e.respondedAt < 150;
@@ -629,6 +693,91 @@ export class Engine {
     }
   }
 
+  /** Start watching for text that appears because of what happens from now on. The page
+   *  counts the visible copies of the text (innerText, across open shadow roots and same-origin
+   *  iframes, found afresh at every check); the text is seen once there are more than at their
+   *  lowest since the watch began. So a "Saved" already on the page does not count, but
+   *  "Saved", "Saving...", "Saved" does, as does text split across elements or revealed by a
+   *  style change. A mutation observer also catches visible text re-added between two checks.
+   *  The watch stops itself after ttlMs, in case unwatchText cannot run. */
+  async watchText(tabId: number, text: string, ttlMs: number): Promise<string> {
+    return this.action(tabId, async () => {
+      const id = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const expr = `(() => { const text = ${JSON.stringify(text)}; const id = ${JSON.stringify(id)};
+        const w = (window.__overtakeWatch ||= {});
+        ${VISIBLE_TEXT_JS}
+        const has = (node) => {
+          // The matching text itself must be rendered: innerText leaves out hidden descendants.
+          if (node.nodeType === 3) return node.data.includes(text) && shown(node.parentElement ?? node.parentNode?.host);
+          return node.nodeType === 1 && shown(node) && (node.innerText ?? '').includes(text);
+        };
+        const entry = { seen: false, low: 0 };
+        const observers = [];
+        // Matching disconnects the observers; the ttl still removes the entry if unwatchText
+        // never comes (a take-over, a disconnect).
+        const stop = () => { for (const o of observers) o.disconnect(); observers.length = 0; };
+        const onMutations = (list) => {
+          for (const m of list) {
+            if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { entry.seen = true; stop(); return; }
+          }
+        };
+        for (const r of roots()) {
+          const o = new MutationObserver(onMutations);
+          o.observe(r, { subtree: true, childList: true, characterData: true });
+          observers.push(o);
+        }
+        entry.check = () => {
+          if (!entry.seen) {
+            const c = count(text);
+            if (c > entry.low) { entry.seen = true; stop(); }
+            else entry.low = Math.min(entry.low, c);
+          }
+          return entry.seen;
+        };
+        entry.stop = () => { stop(); clearTimeout(entry.ttl); delete w[id]; };
+        entry.low = count(text);
+        entry.ttl = setTimeout(entry.stop, ${Math.max(1000, Math.round(ttlMs))});
+        w[id] = entry; })()`;
+      await this.cdp(tabId, 'Runtime.evaluate', { expression: expr });
+      return id;
+    });
+  }
+
+  /** Wait for a watchText watch. If the page navigated (the watch is gone), the text on the new
+   *  page counts. */
+  async awaitText(tabId: number, id: string, text: string, timeoutMs: number) {
+    // After a navigation the watch is gone: then the text anywhere visible on the new page counts.
+    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.check(); ${VISIBLE_TEXT_JS} return count(${JSON.stringify(text)}) > 0; })()`;
+    try {
+      await this.wait(tabId, { function: fn, timeoutMs });
+    } catch (e) {
+      if (e instanceof OvertakeError && e.code === ErrorCode.TIMEOUT) throw new OvertakeError(ErrorCode.TIMEOUT, `The action ran, but "${text.slice(0, 80)}" did not appear on the page within ${timeoutMs} ms (text that was already there does not count).`);
+      throw e;
+    }
+    return { appeared: text };
+  }
+
+  /** Stop a watchText watch and forget it. Best effort: if the human has control, the watch
+   *  still stops itself when its ttl ends. */
+  async unwatchText(tabId: number, id: string) {
+    const expr = `window.__overtakeWatch?.[${JSON.stringify(id)}]?.stop()`;
+    await this.cdp(tabId, 'Runtime.evaluate', { expression: expr }).catch(() => {});
+  }
+
+  /** Requests the page made since `since` (an action's start), skipping static assets. Waits
+   *  briefly (at most maxMs) for ones still in flight, so a save the action triggered shows
+   *  its status. */
+  async requestsSince(tabId: number, since: number, maxMs = 1000) {
+    const t = this.#tabs.get(tabId);
+    if (!t) return [];
+    const skip = new Set(['Image', 'Font', 'Stylesheet', 'Script', 'Media', 'Manifest', 'Ping', 'CSPViolationReport', 'EventSource', 'WebSocket']);
+    const pick = () => [...t.net.values()].filter((e) => e.startedAt >= since && !skip.has(e.type || '') && !e.url.startsWith('data:'));
+    await sleep(30); // a request started by the action's last event may not be reported yet
+    const deadline = Date.now() + maxMs;
+    while (Date.now() < deadline && pick().some((e) => inFlight(e, Date.now()))) await sleep(25);
+    return pick().slice(0, 10).map((e) => ({ method: e.method, url: receiptUrl(e.url), status: e.status ?? (e.failed ? `failed: ${e.failed}` : 'pending'), ms: e.endedAt ? e.endedAt - e.startedAt : undefined }));
+  }
+
   /** Page URL, title and readyState. timeoutMs bounds the whole call, retries included. */
   async pageInfo(tabId: number, timeoutMs?: number) {
     const deadline = timeoutMs !== undefined ? Date.now() + timeoutMs : undefined;
@@ -757,8 +906,10 @@ export class Engine {
           }
         }
       }
+      const dom = await this.cdp<DomSnap>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] }).catch(() => null);
       let visible: Set<number> | undefined;
-      if ((opts.scope || 'viewport') === 'viewport') visible = await this.#visibleNodes(tabId);
+      if ((opts.scope || 'viewport') === 'viewport') visible = dom ? await this.#visibleNodes(tabId, dom) : new Set();
+      const draggable = dom ? draggableNodes(dom) : undefined;
       const exclude = new Set<number>();
       const host = await this.cdp<{ result: { objectId?: string } }>(tabId, 'Runtime.evaluate', { expression: `document.querySelector('overtake-overlay')` }).catch(() => null);
       if (host?.result.objectId) {
@@ -766,15 +917,14 @@ export class Engine {
         if (d) exclude.add(d.node.backendNodeId);
         void this.cdp(tabId, 'Runtime.releaseObject', { objectId: host.result.objectId }).catch(() => {});
       }
-      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, nextRef: () => ++refCounter, maxLines: opts.maxLines });
+      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, draggable, nextRef: () => ++refCounter, maxLines: opts.maxLines });
       t.refs = out.refs;
       const info = await this.pageInfo(tabId);
       return { url: info.url, title: info.title, snapshot: out.text, refCount: out.refs.size };
     });
   }
 
-  async #visibleNodes(tabId: number): Promise<Set<number>> {
-    const snap = await this.cdp<{ documents: { nodes: { backendNodeId: number[] }; layout: { nodeIndex: number[]; bounds: number[][] }; scrollOffsetX?: number; scrollOffsetY?: number }[] }>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] });
+  async #visibleNodes(tabId: number, snap: DomSnap): Promise<Set<number>> {
     const m = await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
     const vp = m.cssVisualViewport;
     const doc = snap.documents[0];
@@ -834,10 +984,11 @@ export class Engine {
       if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
       objectId = res.object.objectId;
     }
-    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
+    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
       objectId,
       returnByValue: true,
       functionDeclaration: `function(){
+        if (!this.isConnected) return { ok: false, detached: true };
         const r = this.getBoundingClientRect();
         if (!r.width || !r.height) return { ok: false, reason: 'the element has no size (hidden?)' };
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -850,6 +1001,8 @@ export class Engine {
       }`,
     }, sid);
     const v = check.result.value;
+    // Pages that re-render replace their elements: an old ref then points at a removed one.
+    if (v.detached) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the page (it was removed or re-rendered, so this ref is stale). Take a new browser_snapshot.');
     if (!force) {
       if (v.reason) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `Cannot act on the element: ${v.reason}.`);
       if (!v.ok) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${v.top} at its center. Close the covering element or pass force:true.`);
@@ -1109,14 +1262,28 @@ export class Engine {
       const pa = a.point ?? (await this.#pointFor(t, a.node!, true));
       const b = await this.#resolve(t, to);
       const pb = b.point ?? (await this.#pointFor(t, b.node!, true));
-      const steps = this.#path(t, pa);
-      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pa.x, y: pa.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      const steps: InputStep[] = this.#path(t, pa);
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pa.x, y: pa.y, button: 'left', clickCount: 1, buttons: 1 }, delayMs: 40 });
       const n = 12;
-      for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: pa.x + ((pb.x - pa.x) * i) / n, y: pa.y + ((pb.y - pa.y) * i) / n, button: 'left', buttons: 1 }, delayMs: 18 });
-      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      const at = (i: number) => ({ x: pa.x + ((pb.x - pa.x) * i) / n, y: pa.y + ((pb.y - pa.y) * i) / n });
+      // Pointer moves first. If the page starts a native HTML5 drag on one of them, the
+      // extension intercepts it, skips the remaining pointer steps and runs the native ones
+      // (drag events with the page's own drag data) instead; otherwise those are skipped.
+      for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', ...at(i), button: 'left', buttons: 1 }, delayMs: 18, drag: 'pointer' });
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40, drag: 'pointer' });
+      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragEnter', ...at(1) }, drag: 'native' });
+      for (let i = 2; i <= n; i++) steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragOver', ...at(i) }, delayMs: 18, drag: 'native' });
+      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'drop', x: pb.x, y: pb.y }, delayMs: 40, drag: 'native' });
       t.cursor = pb;
-      await this.client.request('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
-      return { dragged: { from: pa, to: pb } };
+      // Native drag events go to the top page's process and cannot reach a cross-site
+      // (out-of-process) iframe. The extension hit-tests the press origin and, right before
+      // the drop, the drop point; if either is such an iframe it cancels the drag (the source
+      // gets dragend) and reports crossFrame, rather than claim a drop that never happened.
+      const r = await this.client.request<{ nativeDrag?: boolean; crossFrame?: boolean }>('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
+      if (r.nativeDrag && r.crossFrame) {
+        throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The page started a native HTML5 drag, and native drags into or out of a cross-site iframe cannot be completed from here; the drag was cancelled. Try the page\'s own alternative (a menu, buttons or keyboard reordering), or browser_evaluate.');
+      }
+      return { dragged: { from: pa, to: pb }, kind: r.nativeDrag ? 'html5' : 'pointer' };
     });
   }
 

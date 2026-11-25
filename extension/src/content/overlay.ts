@@ -55,23 +55,40 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   // match the permit for the step being dispatched (type + coordinates or key)
   // pass. Subframes cannot see the top frame's permit and pass during bursts;
   // Chrome's own input gate covers them outside the per-step dispatch window.
-  let permit: { types: string[]; x?: number; y?: number; key?: string; until: number } | null = null;
+  let permit: { types: string[]; x?: number; y?: number; key?: string; loose?: string[]; drop?: { mimeType: string; data?: string }[]; until: number } | null = null;
 
   function permitted(e: Event): boolean {
     if (!permit || Date.now() > permit.until) return false;
+    if (permit.loose?.includes(e.type)) return true;
     if (!permit.types.includes('*') && !permit.types.includes(e.type)) return false;
-    if (permit.x !== undefined && 'clientX' in e) {
+    // Subframes have their own coordinates; only drop permits reach them.
+    if (isTop && permit.x !== undefined && 'clientX' in e) {
       const me = e as MouseEvent;
       if (Math.abs(me.clientX - permit.x) > 2 || Math.abs(me.clientY - permit.y!) > 2) return false;
     }
     if (permit.key !== undefined && e instanceof KeyboardEvent && e.key !== permit.key && e.key.toLowerCase() !== permit.key.toLowerCase()) return false;
+    if (e.type === 'drop') {
+      // Native drag events reach the page even while Chrome ignores input: a drop passes
+      // only when it carries the agent's own drag data.
+      const dt = (e as DragEvent).dataTransfer;
+      if (!permit.drop || !dt) return false;
+      for (const item of permit.drop) {
+        if (!dt.types.includes(item.mimeType)) return false;
+        if (item.data !== undefined && dt.getData(item.mimeType) !== item.data) return false;
+      }
+      permit = { ...permit, types: permit.types.filter((t) => t !== 'drop'), drop: undefined }; // one drop per permit
+    }
     return true;
   }
 
   function onInput(e: Event) {
     if (!alive || !state?.shield || !e.isTrusted) return;
     if (host && e.composedPath().includes(host)) return; // the dock stays usable
-    if (pass && (!isTop || permitted(e))) return;
+    // Native drag events bypass Chrome's input gate, so a drop passes only with a permit, in
+    // every frame, and independently of pass: a frame created mid-burst missed the pass
+    // message but still gets the drop permit. Other events: subframes rely on Chrome's gate
+    // during a burst.
+    if (e.type === 'drop' ? permitted(e) : pass && (!isTop || permitted(e))) return;
     e.preventDefault();
     e.stopImmediatePropagation();
   }
@@ -599,7 +616,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
         sendResponse('ack');
         return false;
       case 'overtake:permit':
-        permit = { ...msg.permit, until: Date.now() + 1500 };
+        permit = msg.permit ? { ...msg.permit, until: Date.now() + 1500 } : null;
         sendResponse('ack');
         return false;
       case 'overtake:hidden':

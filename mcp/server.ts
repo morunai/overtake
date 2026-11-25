@@ -25,7 +25,8 @@ Rules:
 - SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
 - For many steps or repeated flows (test suites, filling many forms, checking many pages), write a script file once and run it with browser_run instead of one tool call per step. Re-run the same file after fixing it.
 - Use browser_select for native <select> dropdowns, not browser_evaluate.
-- Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
+- Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_drag, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
+- To confirm an action worked, pass waitForText (for example "Saved") to browser_click, browser_type, browser_select, browser_press or browser_drag: it waits for that text to appear because of the action, not text already on the page. Their results also list the requests the page made (method, URL, status).
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
 - A CERT_ERROR (untrusted certificate, Chrome's "Privacy error" page) cannot be bypassed from the extension: hand off so the user clicks "Proceed" once, then navigate again.
@@ -120,6 +121,44 @@ async function afterAction(tabId: number, r: unknown, o: SnapshotOpts, since?: n
 }
 
 const target = z.string().describe('Element: snapshot ref "@12", "text=Sign in", "xpath=//button", a CSS selector, or viewport coordinates "x,y".');
+
+const actionOpts = {
+  waitForText: z.string().min(1).max(200).optional().describe('Text this action should make appear, such as "Saved". Waits until it shows up through a page change after the action (text already on the page does not count). TIMEOUT if it does not appear.'),
+  waitTimeoutMs: z.number().int().min(100).max(60_000).default(10_000).describe('How long waitForText may wait.'),
+};
+type ActionOpts = { waitForText?: string; waitTimeoutMs?: number };
+
+/** Input actions with waitForText run one at a time per tab, so one action's text or requests
+ *  are never credited to another queued behind it. */
+const actChains = new Map<number, Promise<unknown>>();
+
+/** Run an input action: watch for waitForText from before it starts, then add what it caused
+ *  to the receipt (the text appearing, and the requests the page made) and the snapshot. */
+async function act(a: { tabId: number } & ActionOpts & SnapshotOpts, run: () => Promise<unknown>): Promise<ToolResult> {
+  const prev = actChains.get(a.tabId) ?? Promise.resolve();
+  const mine = prev.catch(() => {}).then(async () => {
+    const t0 = Date.now();
+    // The watch outlives the action plus the wait by a margin, then stops itself.
+    const watch = a.waitForText ? await engine.watchText(a.tabId, a.waitForText, (a.waitTimeoutMs ?? 10_000) + 60_000) : undefined;
+    let r: Record<string, unknown>;
+    try {
+      r = (await run()) as Record<string, unknown>;
+      if (watch) r = { ...r, ...(await engine.awaitText(a.tabId, watch, a.waitForText!, a.waitTimeoutMs ?? 10_000)) };
+    } finally {
+      if (watch) await engine.unwatchText(a.tabId, watch);
+    }
+    const requests = await engine.requestsSince(a.tabId, t0).catch(() => []);
+    if (requests.length) r = { ...r, requests };
+    return { r, t0 };
+  });
+  actChains.set(a.tabId, mine);
+  try {
+    const { r, t0 } = await mine;
+    return await afterAction(a.tabId, r, a, t0);
+  } finally {
+    if (actChains.get(a.tabId) === mine) actChains.delete(a.tabId);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Spaces and control
@@ -323,35 +362,35 @@ server.registerTool('browser_click', {
   inputSchema: {
     tabId, target, button: z.enum(['left', 'right', 'middle']).default('left'), clickCount: z.number().int().min(1).max(3).default(1), force: z.boolean().default(false),
     humanlike: z.boolean().default(false).describe('Also send real pointer moves along the path (slower; for pages that react to hover on the way).'),
-    label: z.string().max(60).optional().describe('3-6 word description shown next to the agent cursor.'), ...snapshotOpts,
+    label: z.string().max(60).optional().describe('3-6 word description shown next to the agent cursor.'), ...actionOpts, ...snapshotOpts,
   },
-}, wrap(async (a: { tabId: number; target: string; button: 'left' | 'right' | 'middle'; clickCount: number; force: boolean; humanlike: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.click(a.tabId, a.target, a), a, t0); }));
+}, wrap(async (a: { tabId: number; target: string; button: 'left' | 'right' | 'middle'; clickCount: number; force: boolean; humanlike: boolean; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.click(a.tabId, a.target, a))));
 
 server.registerTool('browser_hover', { description: 'Move the mouse over an element.', inputSchema: { tabId, target, label: z.string().max(60).optional() } },
   wrap(async (a: { tabId: number; target: string; label?: string }) => engine.hover(a.tabId, a.target, a.label)));
 
 server.registerTool('browser_select', {
   description: 'Choose option(s) in a native <select> by value or visible label (several for a multiple select). Checks the element like a click (visible, on top). For a custom dropdown built from other elements, click it and then click the option instead.',
-  inputSchema: { tabId, target, values: z.union([z.string(), z.array(z.string()).min(1).max(100)]).describe('Option value or visible label, or a list for a multiple select.'), force: z.boolean().default(false), label: z.string().max(60).optional(), ...snapshotOpts },
-}, wrap(async (a: { tabId: number; target: string; values: string | string[]; force: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.select(a.tabId, a.target, a.values, a), a, t0); }));
+  inputSchema: { tabId, target, values: z.union([z.string(), z.array(z.string()).min(1).max(100)]).describe('Option value or visible label, or a list for a multiple select.'), force: z.boolean().default(false), label: z.string().max(60).optional(), ...actionOpts, ...snapshotOpts },
+}, wrap(async (a: { tabId: number; target: string; values: string | string[]; force: boolean; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.select(a.tabId, a.target, a.values, a))));
 
 server.registerTool('browser_type', {
   description: 'Type text. With target, clicks it first. clear replaces existing text; submit presses Enter; slowly sends per-key events instead of a single insertText.',
-  inputSchema: { tabId, text: z.string(), target: target.optional(), clear: z.boolean().default(false), submit: z.boolean().default(false), slowly: z.boolean().default(false), label: z.string().max(60).optional(), ...snapshotOpts },
-}, wrap(async (a: { tabId: number; text: string; target?: string; clear: boolean; submit: boolean; slowly: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.type(a.tabId, a), a, t0); }));
+  inputSchema: { tabId, text: z.string(), target: target.optional(), clear: z.boolean().default(false), submit: z.boolean().default(false), slowly: z.boolean().default(false), label: z.string().max(60).optional(), ...actionOpts, ...snapshotOpts },
+}, wrap(async (a: { tabId: number; text: string; target?: string; clear: boolean; submit: boolean; slowly: boolean; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.type(a.tabId, a))));
 
 server.registerTool('browser_press', {
   description: 'Press a key or chord, Playwright syntax: "Enter", "Tab", "Shift+Tab", "ControlOrMeta+a", "ArrowDown".',
-  inputSchema: { tabId, keys: z.string(), repeat: z.number().int().min(1).max(50).default(1), ...snapshotOpts },
-}, wrap(async (a: { tabId: number; keys: string; repeat: number } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.press(a.tabId, a.keys, a.repeat), a, t0); }));
+  inputSchema: { tabId, keys: z.string(), repeat: z.number().int().min(1).max(50).default(1), ...actionOpts, ...snapshotOpts },
+}, wrap(async (a: { tabId: number; keys: string; repeat: number } & ActionOpts & SnapshotOpts) => act(a, () => engine.press(a.tabId, a.keys, a.repeat))));
 
 server.registerTool('browser_scroll', {
   description: 'Scroll with real mouse-wheel input at an element or the viewport center. Positive dy scrolls down.',
   inputSchema: { tabId, target: target.optional(), dx: z.number().default(0), dy: z.number().default(600), label: z.string().max(60).optional() },
 }, wrap(async (a: { tabId: number; target?: string; dx: number; dy: number; label?: string }) => engine.scroll(a.tabId, a)));
 
-server.registerTool('browser_drag', { description: 'Drag with real mouse input from one target to another (pointer-event drags; native HTML5 drag-and-drop may not respond).', inputSchema: { tabId, from: target, to: target, label: z.string().max(60).optional() } },
-  wrap(async (a: { tabId: number; from: string; to: string; label?: string }) => engine.drag(a.tabId, a.from, a.to, a.label)));
+server.registerTool('browser_drag', { description: 'Drag with real mouse input from one target to another. Works for pointer-event drags and native HTML5 drag and drop (draggable elements, SortableJS, react-dnd): when the page starts a native drag, it is completed with real drag events carrying the page\'s own drag data. Returns kind: "pointer" or "html5". Native drags into or out of a cross-site iframe are cancelled with an error. Snapshots mark native drag sources [draggable].', inputSchema: { tabId, from: target, to: target, label: z.string().max(60).optional(), ...actionOpts, ...snapshotOpts } },
+  wrap(async (a: { tabId: number; from: string; to: string; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.drag(a.tabId, a.from, a.to, a.label))));
 
 server.registerTool('browser_upload', {
   description: 'Upload local files: target an <input type=file> directly, or a button/area that opens the file chooser (it is clicked and the chooser is answered). Paths must be absolute.',

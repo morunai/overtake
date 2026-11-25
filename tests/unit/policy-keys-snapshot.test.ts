@@ -97,3 +97,45 @@ test('snapshot: the Overtake overlay subtree is excluded', () => {
   assert.match(out.text, /Page button/);
   assert.doesNotMatch(out.text, /Take over|Agent control/);
 });
+
+test('snapshot: draggable elements get refs and a name from their text', () => {
+  const nodes: AXNode[] = [
+    { nodeId: '1', ignored: false, role: { type: 'role', value: 'RootWebArea' }, childIds: ['2', '4'], backendDOMNodeId: 1 },
+    { nodeId: '2', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['3'], parentId: '1', backendDOMNodeId: 2 },
+    { nodeId: '3', ignored: false, role: { type: 'role', value: 'StaticText' }, name: { type: 's', value: 'Write docs' }, parentId: '2' },
+    { nodeId: '4', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['5'], parentId: '1', backendDOMNodeId: 4 },
+    { nodeId: '5', ignored: false, role: { type: 'role', value: 'StaticText' }, name: { type: 's', value: 'Not draggable' }, parentId: '4' },
+  ];
+  let n = 0;
+  const s = buildSnapshot({ main: { nodes }, children: new Map(), draggable: new Set([2]), nextRef: () => ++n });
+  assert.match(s.text, /- generic "Write docs" @1 \[draggable\]/);
+  assert.doesNotMatch(s.text, /text "Write docs"/, 'its text is not repeated');
+  assert.match(s.text, /- text "Not draggable"/);
+  assert.equal(s.refs.get(1)?.backendNodeId, 2);
+  assert.equal(s.refs.size, 1);
+});
+
+test('snapshot: a draggable inside a draggable keeps its own ref', () => {
+  const nodes: AXNode[] = [
+    { nodeId: '1', ignored: false, role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 },
+    { nodeId: '2', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['3'], parentId: '1', backendDOMNodeId: 2 },
+    { nodeId: '3', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['4'], parentId: '2', backendDOMNodeId: 3 },
+    { nodeId: '4', ignored: false, role: { type: 'role', value: 'StaticText' }, name: { type: 's', value: 'Card' }, parentId: '3' },
+  ];
+  let n = 0;
+  const s = buildSnapshot({ main: { nodes }, children: new Map(), draggable: new Set([2, 3]), nextRef: () => ++n });
+  assert.equal(s.refs.size, 2);
+  assert.match(s.text, /- generic "Card" @2 \[draggable\]/);
+});
+
+test('snapshot: a draggable under an ignored child of a draggable keeps its ref', () => {
+  const nodes: AXNode[] = [
+    { nodeId: '1', ignored: false, role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'], backendDOMNodeId: 1 },
+    { nodeId: '2', ignored: false, role: { type: 'role', value: 'generic' }, childIds: ['3'], parentId: '1', backendDOMNodeId: 2 },
+    { nodeId: '3', ignored: true, role: { type: 'role', value: 'none' }, childIds: ['4'], parentId: '2', backendDOMNodeId: 3 },
+    { nodeId: '4', ignored: false, role: { type: 'role', value: 'StaticText' }, name: { type: 's', value: 'Card' }, parentId: '3' },
+  ];
+  let n = 0;
+  const s = buildSnapshot({ main: { nodes }, children: new Map(), draggable: new Set([2, 3]), nextRef: () => ++n });
+  assert.equal(s.refs.size, 2, s.text);
+});

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Wait Test Page</title>
+<style>body { font: 15px system-ui; margin: 24px; } button { margin: 4px; }</style>
+</head>
+<body>
+<h1>Wait Test Page</h1>
+<p id="status" role="status">Saved</p>
+<p id="order">Order <span id="state">pending</span></p>
+<p id="other">Other text</p>
+<div id="host"></div>
+<div id="host2"></div>
+<div id="host3"></div>
+<div id="host4"></div>
+<p id="hidden-ok" hidden>Confirmed</p>
+<div id="sink"></div>
+<iframe id="frame" src="/drop-frame.html" title="Same-site frame" style="width:200px;height:60px;border:0"></iframe>
+<div>
+  <button id="save" onclick="const s = document.getElementById('status'); s.textContent = 'Saving...'; setTimeout(() => (s.textContent = 'Saved'), 150)">Save</button>
+  <button id="split" onclick="document.getElementById('state').textContent = 'saved'">Finish order</button>
+  <button id="touch" onclick="document.getElementById('other').textContent = 'Other text ' + Date.now()">Touch other</button>
+  <button id="shadow" onclick="document.getElementById('host').shadowRoot.querySelector('span').textContent = 'Shadow done'">Shadow</button>
+  <button id="inframe" onclick="document.getElementById('frame').contentDocument.getElementById('fbin').textContent = 'Frame done'">In frame</button>
+  <button id="alpha" onclick="setTimeout(() => (document.getElementById('other').textContent = 'Alpha'), 100)">Alpha</button>
+  <button id="noop">Nothing</button>
+  <button id="hiddenadd" onclick="const p = document.createElement('p'); p.hidden = true; p.textContent = 'Ghost text'; document.getElementById('sink').append(p)">Hidden add</button>
+  <button id="reveal" onclick="document.getElementById('hidden-ok').hidden = false">Reveal</button>
+  <button id="lateshadow" onclick="document.getElementById('host2').attachShadow({ mode: 'open' }).innerHTML = '<b>Late shadow</b>'">Late shadow</button>
+  <button id="srcdoc" onclick="document.getElementById('frame').srcdoc = '<p>Srcdoc done</p>'">Srcdoc</button>
+  <button id="mixed" onclick="const d = document.createElement('div'); d.innerHTML = '<span hidden>Mixed hidden</span><span>Other</span>'; document.getElementById('sink').append(d)">Mixed</button>
+  <button id="vishidden" onclick="const p = document.createElement('p'); p.style.visibility = 'hidden'; p.textContent = 'Invisible text'; document.getElementById('sink').append(p)">Invisible</button>
+  <button id="shadowreveal" onclick="document.getElementById('host3').shadowRoot.querySelector('span').hidden = false">Shadow reveal</button>
+  <button id="bareshadow" onclick="document.getElementById('host4').shadowRoot.textContent = 'Bare shadow success'">Bare shadow</button>
+  <button id="go" onclick="location.href = '/wait.html?nav=1'">Go</button>
+  <button id="secret" onclick="fetch('/api/data?code=oauth-secret-123&state=xyz')">Fetch</button>
+</div>
+<script>
+  document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<span>Shadow idle</span>';
+  document.getElementById('host4').attachShadow({ mode: 'open' }).textContent = 'Bare idle';
+  document.getElementById('host3').attachShadow({ mode: 'open' }).innerHTML = '<span hidden>Shadow reveal</span>';
+  if (location.search.includes('nav=1')) setTimeout(() => (document.getElementById('host').shadowRoot.querySelector('span').textContent = 'Arrived in shadow'), 200);
+</script>
+</body>
+</html>

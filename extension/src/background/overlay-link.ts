@@ -22,12 +22,17 @@ export interface Permit {
   x?: number; // mouse: viewport coordinates of the agent event
   y?: number;
   key?: string; // keyboard: KeyboardEvent.key
+  /** Types admitted without the coordinate check: dragstart, which Chrome fires at the press
+   *  origin when a held-button move starts a native drag. */
+  loose?: string[];
+  /** For a drop: the drag data it must carry (the agent's intercepted drag). */
+  drop?: { mimeType: string; data?: string }[];
 }
 
 export type OverlayMessage =
   | { type: 'overtake:state'; state: OverlayState }
   | { type: 'overtake:pass'; pass: boolean } // agent burst in progress
-  | { type: 'overtake:permit'; permit: Permit } // admit exactly the next step's events (top frame)
+  | { type: 'overtake:permit'; permit: Permit | null } // admit exactly the next step's events; null revokes
   | { type: 'overtake:hidden'; hidden: boolean } // hide visuals for agent screenshots
   | { type: 'overtake:cursor'; x: number; y: number; kind: string; label?: string }
   | { type: 'overtake:busy'; busy: boolean; label?: string }
