@@ -565,4 +565,6 @@ test('closing the space ends it and releases the debugger', async () => {
   assert.equal(r.closed, true);
   const list = await A.call('spaces_list');
   assert.ok(!list.spaces.some((s: { spaceId: number }) => s.spaceId === space.spaceId));
+  // The agent's own close is not reported as the user's.
+  await assert.rejects(A.call('browser_snapshot', { tabId: space.tabId }), (e: Error) => code(e) === 'SPACE_CLOSED' && /closed by its agent/.test(e.message));
 });

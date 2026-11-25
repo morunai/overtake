@@ -195,12 +195,7 @@ server.registerTool('browser_navigate', {
   },
 }, wrap(async (a: { tabId: number; url: string; waitUntil: 'load' | 'commit' | 'none'; timeoutMs: number; waitFor?: string } & SnapshotOpts) => {
   const t0 = Date.now();
-  let r: Record<string, unknown> = await engine.navigate(a.tabId, a.url, a);
-  if (a.waitFor) {
-    await engine.wait(a.tabId, { selector: a.waitFor, state: 'visible', timeoutMs: Math.max(1000, a.timeoutMs - (Date.now() - t0)) });
-    r = { ...r, ...(await engine.pageInfo(a.tabId)), found: a.waitFor };
-  }
-  return afterAction(a.tabId, r, a, t0);
+  return afterAction(a.tabId, await engine.navigate(a.tabId, a.url, a), a, t0);
 }));
 
 server.registerTool('browser_wait', {

@@ -214,11 +214,17 @@ export class Engine {
     return t;
   }
 
+  /** Authoritative membership from the extension: an earlier "gone" reason no longer applies. */
+  #joined(tabId: number, spaceId: number) {
+    this.#tabSpace.set(tabId, spaceId);
+    this.#gone.delete(tabId);
+  }
+
   #onEvent(e: AgentEvent) {
     switch (e.type) {
       case 'control':
         this.#spaces.set(e.space.spaceId, e.space);
-        for (const tab of e.space.tabs) this.#tabSpace.set(tab.tabId, e.space.spaceId);
+        for (const tab of e.space.tabs) this.#joined(tab.tabId, e.space.spaceId);
         if (e.space.control === 'AGENT_CONTROL' && e.space.owner === this.client.agentKey) {
           // Interception is lifted while the human drives; restore it on return.
           for (const tab of e.space.tabs) {
@@ -426,7 +432,7 @@ export class Engine {
     const { spaces } = await this.client.request<{ spaces: SpaceSummary[] }>('spaces.list');
     for (const s of spaces) {
       this.#spaces.set(s.spaceId, s);
-      for (const tab of s.tabs) this.#tabSpace.set(tab.tabId, s.spaceId);
+      for (const tab of s.tabs) this.#joined(tab.tabId, s.spaceId);
     }
     const id = this.#tabSpace.get(tabId);
     if (id === undefined) {
@@ -450,7 +456,7 @@ export class Engine {
     const { spaces } = await this.client.request<{ spaces: SpaceSummary[] }>('spaces.list');
     for (const s of spaces) {
       this.#spaces.set(s.spaceId, s);
-      for (const tab of s.tabs) this.#tabSpace.set(tab.tabId, s.spaceId);
+      for (const tab of s.tabs) this.#joined(tab.tabId, s.spaceId);
     }
     return spaces;
   }
@@ -480,9 +486,10 @@ export class Engine {
   // -------------------------------------------------------------------------
   // Navigation and waiting
 
-  async navigate(tabId: number, url: string, opts: { timeoutMs?: number; waitUntil?: 'load' | 'commit' | 'none' } = {}) {
+  async navigate(tabId: number, url: string, opts: { timeoutMs?: number; waitUntil?: 'load' | 'commit' | 'none'; waitFor?: string } = {}) {
     return this.action(tabId, async (t) => {
       const timeoutMs = opts.timeoutMs ?? 30_000;
+      const started = Date.now();
       const loaded = new Promise<boolean>((resolve) => {
         const w = () => {
           t.loadWaiters.delete(w);
@@ -512,8 +519,17 @@ export class Engine {
       } else if (opts.waitUntil !== 'none' && opts.waitUntil !== 'commit' && r.loaderId) {
         didLoad = await Promise.race([loaded, this.#pollLoaded(tabId, url, timeoutMs)]);
       }
+      const isLoaded = didLoad || !r.loaderId;
+      if (opts.waitFor) {
+        // Same action (and Space lock) as the navigation, so no other call can navigate in between.
+        // One budget: timeoutMs covers the navigation and the wait together.
+        const left = timeoutMs - (Date.now() - started);
+        if (left <= 0) throw new OvertakeError(ErrorCode.TIMEOUT, `Navigation used the whole ${timeoutMs} ms; ${opts.waitFor} was not checked.`);
+        const w = await this.#waitIn(t, { selector: opts.waitFor, state: 'visible', timeoutMs: left });
+        return { url: w.url, title: w.title, readyState: w.readyState, loaded: isLoaded, sameDocument: !r.loaderId, found: opts.waitFor };
+      }
       const info = await this.pageInfo(tabId);
-      return { ...info, loaded: didLoad || !r.loaderId, sameDocument: !r.loaderId };
+      return { ...info, loaded: isLoaded, sameDocument: !r.loaderId };
     });
   }
 
@@ -566,13 +582,17 @@ export class Engine {
     }
   }
 
-  async pageInfo(tabId: number) {
+  /** Page URL, title and readyState. timeoutMs bounds the whole call, retries included. */
+  async pageInfo(tabId: number, timeoutMs?: number) {
+    const deadline = timeoutMs !== undefined ? Date.now() + timeoutMs : undefined;
     // Read-only, so safe to retry when a redirect replaces the document mid-call.
     for (let i = 0; ; i++) {
+      const left = deadline !== undefined ? deadline - Date.now() : undefined;
+      if (left !== undefined && left <= 0) throw new OvertakeError(ErrorCode.TIMEOUT, `The page did not answer within ${timeoutMs} ms.`);
       try {
         const r = await this.cdp<{ result: { value: { url: string; title: string; readyState: string } } }>(tabId, 'Runtime.evaluate', {
           expression: '({url: location.href, title: document.title, readyState: document.readyState})', returnByValue: true,
-        });
+        }, undefined, left !== undefined ? Math.max(left, 100) : undefined);
         return r.result.value;
       } catch (e) {
         if (i >= 5 || !contextGone(e)) throw e;
@@ -596,7 +616,13 @@ export class Engine {
       }
       if (!cond.selector && !cond.text && !cond.urlIncludes && !cond.function && !cond.networkIdleMs && !cond.load) return { waited: cond.delayMs };
     }
-    return this.action(tabId, async (t) => {
+    return this.action(tabId, (t) => this.#waitIn(t, cond));
+  }
+
+  /** The polling part of wait, for callers already inside the tab's action. */
+  async #waitIn(t: TabState, cond: { selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
+    const tabId = t.tabId;
+    {
       const timeoutMs = cond.timeoutMs ?? 10_000;
       const deadline = Date.now() + timeoutMs;
       const check = async (): Promise<boolean> => {
@@ -634,7 +660,7 @@ export class Engine {
         await sleep(elapsed < 1000 ? 20 : elapsed < 5000 ? 50 : 100);
       }
       return { satisfied: true, ...(await this.pageInfo(tabId)) };
-    });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1059,7 +1085,7 @@ export class Engine {
     let info: { url: string; title: string; readyState: string } | null = null;
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      info = await this.pageInfo(tabId).catch(softFail(null));
+      info = await this.pageInfo(tabId, Math.min(1000, deadline - Date.now())).catch(softFail(null));
       if (info && info.readyState !== 'loading') break;
       await sleep(200);
     }

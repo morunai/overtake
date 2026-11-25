@@ -215,6 +215,21 @@ function rememberGone(tabId: number, code: string, message: string) {
 function rememberSpaceGone(s: Space, code: string, message: string) {
   for (const tabId of s.tabs.keys()) rememberGone(tabId, code, message);
 }
+/** A live tab joins a Space: any earlier "gone" reason for it no longer applies. */
+function addTab(s: Space, entry: Parameters<Space['tabs']['set']>[1]) {
+  goneTabs.delete(entry.tabId);
+  s.tabs.set(entry.tabId, entry);
+}
+// The reason for a close the extension starts itself, read by windows.onRemoved, which can
+// fire before chrome.windows.remove() resolves.
+const closingSpaces = new Map<number, { code: string; message: string }>();
+async function closeSpaceWindow(s: Space, code: string, message: string) {
+  closingSpaces.set(s.id, { code, message });
+  rememberSpaceGone(s, code, message);
+  if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
+  endSpace(s, code, message);
+}
+
 function notInSpace(tabId: number): OvertakeError {
   const g = goneTabs.get(tabId);
   if (g) return new OvertakeError(g.code, `${g.message} Tab ${tabId} is gone; check spaces_list or create a new Space if the user wants you to continue.`);
@@ -420,7 +435,7 @@ async function reconcileTabs(s: Space) {
   const live = new Set(tabs.map((t) => t.id!));
   for (const id of [...s.tabs.keys()]) if (!live.has(id)) s.tabs.delete(id);
   for (const t of tabs) {
-    if (!s.tabs.has(t.id!)) s.tabs.set(t.id!, { tabId: t.id!, openedBy: 'user', managed: false });
+    if (!s.tabs.has(t.id!)) addTab(s, { tabId: t.id!, openedBy: 'user', managed: false });
     tabInfo.set(t.id!, { url: t.url || t.pendingUrl, title: t.title, active: t.active });
   }
 }
@@ -454,7 +469,7 @@ async function createSpace(name: string, createdBy: 'agent' | 'user', agentKey: 
     createdAt: Date.now(),
   };
   if (tab?.id !== undefined) {
-    s.tabs.set(tab.id, { tabId: tab.id, openedBy: createdBy, managed: createdBy === 'agent' });
+    addTab(s, { tabId: tab.id, openedBy: createdBy, managed: createdBy === 'agent' });
     tabInfo.set(tab.id, { url: tab.pendingUrl || tab.url, title: tab.title, active: true });
   }
   spaces.set(s.id, s);
@@ -468,6 +483,8 @@ async function createSpace(name: string, createdBy: 'agent' | 'user', agentKey: 
 }
 
 function endSpace(s: Space, code: string, message: string) {
+  if (spaces.get(s.id) !== s) return; // already ended (window close events race with closeSpaceWindow)
+  closingSpaces.delete(s.id);
   rememberSpaceGone(s, code, message);
   executors.get(s.id)?.cancelQueued(code, message);
   executors.delete(s.id);
@@ -497,7 +514,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   const url = tab.pendingUrl || tab.url || '';
   const agentPopup = !!opener?.managed && s.ctl.control === 'AGENT_CONTROL' && !/^(chrome|edge|about:(?!blank)|chrome-extension):/i.test(url);
   const byAgent = pendingAgentTabs.has(tab.id) || agentPopup;
-  s.tabs.set(tab.id, { tabId: tab.id, openedBy: byAgent ? 'agent' : 'user', managed: byAgent });
+  addTab(s, { tabId: tab.id, openedBy: byAgent ? 'agent' : 'user', managed: byAgent });
   tabInfo.set(tab.id, { url: tab.pendingUrl || tab.url, title: tab.title, active: tab.active });
   void ensureGroup(s, [tab.id]);
   persist();
@@ -522,7 +539,7 @@ chrome.downloads.onCreated.addListener((item) => {
 chrome.tabs.onAttached.addListener((tabId, info) => {
   const s = spaceOfWindow(info.newWindowId);
   if (!s || s.tabs.has(tabId)) return;
-  s.tabs.set(tabId, { tabId, openedBy: 'user', managed: false });
+  addTab(s, { tabId, openedBy: 'user', managed: false });
   void ensureGroup(s, [tabId]);
   persist();
   broadcastState(tabId, overlayStateFor(s));
@@ -553,7 +570,7 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
   const endsSpace = wasManaged && !byAgent && !info.isWindowClosing && ![...s.tabs.values()].some((t) => t.managed);
   // Tabs go before their window does, so a window close is recorded here, per tab. Closes
   // the extension starts itself record their own reason first (rememberSpaceGone).
-  if (info.isWindowClosing) rememberGone(tabId, ErrorCode.SPACE_CLOSED, `The user closed the window of Space ${s.id}.`);
+  if (info.isWindowClosing) rememberGone(tabId, closingSpaces.get(s.id)?.code ?? ErrorCode.SPACE_CLOSED, closingSpaces.get(s.id)?.message ?? `The user closed the window of Space ${s.id}.`);
   else if (endsSpace) rememberGone(tabId, ErrorCode.SPACE_CLOSED, `The user closed the last tab of Space ${s.id}.`);
   else rememberGone(tabId, ErrorCode.TAB_CLOSED, byAgent ? `Tab ${tabId} was closed by the agent.` : `The user closed tab ${tabId} in Space ${s.id}.`);
   const gone = goneTabs.get(tabId)!;
@@ -586,7 +603,9 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
 
 chrome.windows.onRemoved.addListener((windowId) => {
   const s = spaceOfWindow(windowId);
-  if (s) endSpace(s, ErrorCode.SPACE_CLOSED, `The user closed the window of Space ${s.id}.`);
+  if (!s) return;
+  const closing = closingSpaces.get(s.id);
+  endSpace(s, closing?.code ?? ErrorCode.SPACE_CLOSED, closing?.message ?? `The user closed the window of Space ${s.id}.`);
 });
 
 // ---------------------------------------------------------------------------
@@ -720,9 +739,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         await detachSpaceDebuggers(s);
         return { closed: false, released: true, keptUserTabs: userTabs.map((t) => t.tabId), note: 'User-opened tabs are protected, so the Space was released instead of closed.' };
       }
-      rememberSpaceGone(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by its agent.`);
-      if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
-      endSpace(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by its agent.`);
+      await closeSpaceWindow(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by its agent.`);
       return { closed: true };
     }
 
@@ -824,7 +841,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         const tab = await chrome.tabs.create({ windowId: s.windowId, url: typeof args.url === 'string' ? args.url : 'about:blank', active: args.active !== false });
         pendingAgentTabs.add(tab.id!);
         setTimeout(() => pendingAgentTabs.delete(tab.id!), 5000);
-        s.tabs.set(tab.id!, { tabId: tab.id!, openedBy: 'agent', managed: true });
+        addTab(s, { tabId: tab.id!, openedBy: 'agent', managed: true });
         tabInfo.set(tab.id!, { url: tab.pendingUrl || tab.url, title: tab.title, active: tab.active });
         await ensureGroup(s, [tab.id!]);
         persist();
@@ -994,9 +1011,7 @@ async function handleHuman(action: HumanAction, spaceId: number | undefined, ext
       return summary(s);
     }
     case 'close': {
-      rememberSpaceGone(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by the user.`);
-      if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
-      endSpace(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by the user.`);
+      await closeSpaceWindow(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by the user.`);
       return { closed: true };
     }
     case 'rename':
