@@ -203,6 +203,39 @@ function spaceOfTab(tabId: number): Space | undefined {
   return undefined;
 }
 
+// Why a tab left its Space (Space closed, tab closed, by whom). Without this, the agent's
+// next call on that tab only gets TAB_NOT_IN_SPACE and has to guess what happened.
+// Chrome does not reuse tab ids within a session; the map is capped and in memory only.
+const goneTabs = new Map<number, { code: string; message: string }>();
+function rememberGone(tabId: number, code: string, message: string) {
+  if (goneTabs.has(tabId)) return; // the first, most specific reason wins
+  goneTabs.set(tabId, { code, message });
+  if (goneTabs.size > 500) goneTabs.delete(goneTabs.keys().next().value!);
+}
+function rememberSpaceGone(s: Space, code: string, message: string) {
+  for (const tabId of s.tabs.keys()) rememberGone(tabId, code, message);
+}
+/** A live tab joins a Space: any earlier "gone" reason for it no longer applies. */
+function addTab(s: Space, entry: Parameters<Space['tabs']['set']>[1]) {
+  goneTabs.delete(entry.tabId);
+  s.tabs.set(entry.tabId, entry);
+}
+// The reason for a close the extension starts itself, read by windows.onRemoved, which can
+// fire before chrome.windows.remove() resolves.
+const closingSpaces = new Map<number, { code: string; message: string }>();
+async function closeSpaceWindow(s: Space, code: string, message: string) {
+  closingSpaces.set(s.id, { code, message });
+  rememberSpaceGone(s, code, message);
+  if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
+  endSpace(s, code, message);
+}
+
+function notInSpace(tabId: number): OvertakeError {
+  const g = goneTabs.get(tabId);
+  if (g) return new OvertakeError(g.code, `${g.message} Tab ${tabId} is gone; check spaces_list or create a new Space if the user wants you to continue.`);
+  return new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in any agent Space. Agents only operate tabs inside their Spaces.`);
+}
+
 function spaceOfWindow(windowId: number): Space | undefined {
   for (const s of spaces.values()) if (s.windowId === windowId) return s;
   return undefined;
@@ -217,7 +250,7 @@ function requireOwner(s: Space, agentKey: string) {
 function managedTab(agentKey: string, tabId: unknown): { space: Space; tabId: number } {
   if (typeof tabId !== 'number') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'tabId must be a number.');
   const space = spaceOfTab(tabId);
-  if (!space) throw new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in any agent Space. Agents only operate tabs inside their Spaces.`);
+  if (!space) throw notInSpace(tabId);
   requireOwner(space, agentKey);
   const t = space.tabs.get(tabId)!;
   if (!t.managed) throw new OvertakeError(ErrorCode.TAB_NOT_MANAGED, `Tab ${tabId} was opened by the user; adopt it with browser_tabs {action:"adopt"} before operating it.`);
@@ -246,7 +279,8 @@ function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promis
       // Re-validate at execution time: the tab may have closed or left the space while queued.
       if (opts.tabId !== undefined) {
         const cur = spaceOfTab(opts.tabId);
-        if (!cur || cur.id !== s.id) throw new OvertakeError(ErrorCode.TAB_CLOSED, `Tab ${opts.tabId} closed or left the Space before the command ran.`);
+        if (!cur) throw notInSpace(opts.tabId);
+        if (cur.id !== s.id) throw new OvertakeError(ErrorCode.TAB_CLOSED, `Tab ${opts.tabId} left the Space before the command ran.`);
       }
       setBusy(s, true, label);
       lastAgentAt.set(s.id, Date.now());
@@ -401,7 +435,7 @@ async function reconcileTabs(s: Space) {
   const live = new Set(tabs.map((t) => t.id!));
   for (const id of [...s.tabs.keys()]) if (!live.has(id)) s.tabs.delete(id);
   for (const t of tabs) {
-    if (!s.tabs.has(t.id!)) s.tabs.set(t.id!, { tabId: t.id!, openedBy: 'user', managed: false });
+    if (!s.tabs.has(t.id!)) addTab(s, { tabId: t.id!, openedBy: 'user', managed: false });
     tabInfo.set(t.id!, { url: t.url || t.pendingUrl, title: t.title, active: t.active });
   }
 }
@@ -435,7 +469,7 @@ async function createSpace(name: string, createdBy: 'agent' | 'user', agentKey: 
     createdAt: Date.now(),
   };
   if (tab?.id !== undefined) {
-    s.tabs.set(tab.id, { tabId: tab.id, openedBy: createdBy, managed: createdBy === 'agent' });
+    addTab(s, { tabId: tab.id, openedBy: createdBy, managed: createdBy === 'agent' });
     tabInfo.set(tab.id, { url: tab.pendingUrl || tab.url, title: tab.title, active: true });
   }
   spaces.set(s.id, s);
@@ -449,6 +483,9 @@ async function createSpace(name: string, createdBy: 'agent' | 'user', agentKey: 
 }
 
 function endSpace(s: Space, code: string, message: string) {
+  if (spaces.get(s.id) !== s) return; // already ended (window close events race with closeSpaceWindow)
+  closingSpaces.delete(s.id);
+  rememberSpaceGone(s, code, message);
   executors.get(s.id)?.cancelQueued(code, message);
   executors.delete(s.id);
   for (const tabId of s.tabs.keys()) {
@@ -459,7 +496,7 @@ function endSpace(s: Space, code: string, message: string) {
   spaceDownloads.delete(s.id);
   lastAgentAt.delete(s.id);
   persist();
-  emit(null, { type: 'space-closed', spaceId: s.id });
+  emit(null, { type: 'space-closed', spaceId: s.id, reason: message });
   pushUi();
   updateBadge();
 }
@@ -477,7 +514,7 @@ chrome.tabs.onCreated.addListener((tab) => {
   const url = tab.pendingUrl || tab.url || '';
   const agentPopup = !!opener?.managed && s.ctl.control === 'AGENT_CONTROL' && !/^(chrome|edge|about:(?!blank)|chrome-extension):/i.test(url);
   const byAgent = pendingAgentTabs.has(tab.id) || agentPopup;
-  s.tabs.set(tab.id, { tabId: tab.id, openedBy: byAgent ? 'agent' : 'user', managed: byAgent });
+  addTab(s, { tabId: tab.id, openedBy: byAgent ? 'agent' : 'user', managed: byAgent });
   tabInfo.set(tab.id, { url: tab.pendingUrl || tab.url, title: tab.title, active: tab.active });
   void ensureGroup(s, [tab.id]);
   persist();
@@ -502,7 +539,7 @@ chrome.downloads.onCreated.addListener((item) => {
 chrome.tabs.onAttached.addListener((tabId, info) => {
   const s = spaceOfWindow(info.newWindowId);
   if (!s || s.tabs.has(tabId)) return;
-  s.tabs.set(tabId, { tabId, openedBy: 'user', managed: false });
+  addTab(s, { tabId, openedBy: 'user', managed: false });
   void ensureGroup(s, [tabId]);
   persist();
   broadcastState(tabId, overlayStateFor(s));
@@ -527,11 +564,18 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
   if (!s) return;
   const wasManaged = s.tabs.get(tabId)?.managed;
   s.tabs.delete(tabId);
-  if (s.ctl.owner) emit(s.ctl.owner, { type: 'tab-closed', tabId, spaceId: s.id });
   const byAgent = agentClosingTabs.delete(tabId);
   // The human closed the Space's last agent tab (tab ✕, "Close group", ...): that is a
   // close of the Space. Leave any remaining window/tabs to the user as a normal window.
-  if (wasManaged && !byAgent && !info.isWindowClosing && ![...s.tabs.values()].some((t) => t.managed)) {
+  const endsSpace = wasManaged && !byAgent && !info.isWindowClosing && ![...s.tabs.values()].some((t) => t.managed);
+  // Tabs go before their window does, so a window close is recorded here, per tab. Closes
+  // the extension starts itself record their own reason first (rememberSpaceGone).
+  if (info.isWindowClosing) rememberGone(tabId, closingSpaces.get(s.id)?.code ?? ErrorCode.SPACE_CLOSED, closingSpaces.get(s.id)?.message ?? `The user closed the window of Space ${s.id}.`);
+  else if (endsSpace) rememberGone(tabId, ErrorCode.SPACE_CLOSED, `The user closed the last tab of Space ${s.id}.`);
+  else rememberGone(tabId, ErrorCode.TAB_CLOSED, byAgent ? `Tab ${tabId} was closed by the agent.` : `The user closed tab ${tabId} in Space ${s.id}.`);
+  const gone = goneTabs.get(tabId)!;
+  if (s.ctl.owner) emit(s.ctl.owner, { type: 'tab-closed', tabId, spaceId: s.id, code: gone.code, reason: gone.message });
+  if (endsSpace) {
     endSpace(s, ErrorCode.SPACE_CLOSED, `The user closed the last tab of Space ${s.id}.`);
     return;
   }
@@ -559,7 +603,9 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
 
 chrome.windows.onRemoved.addListener((windowId) => {
   const s = spaceOfWindow(windowId);
-  if (s) endSpace(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed.`);
+  if (!s) return;
+  const closing = closingSpaces.get(s.id);
+  endSpace(s, closing?.code ?? ErrorCode.SPACE_CLOSED, closing?.message ?? `The user closed the window of Space ${s.id}.`);
 });
 
 // ---------------------------------------------------------------------------
@@ -693,8 +739,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         await detachSpaceDebuggers(s);
         return { closed: false, released: true, keptUserTabs: userTabs.map((t) => t.tabId), note: 'User-opened tabs are protected, so the Space was released instead of closed.' };
       }
-      if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
-      endSpace(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by its agent.`);
+      await closeSpaceWindow(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by its agent.`);
       return { closed: true };
     }
 
@@ -796,7 +841,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         const tab = await chrome.tabs.create({ windowId: s.windowId, url: typeof args.url === 'string' ? args.url : 'about:blank', active: args.active !== false });
         pendingAgentTabs.add(tab.id!);
         setTimeout(() => pendingAgentTabs.delete(tab.id!), 5000);
-        s.tabs.set(tab.id!, { tabId: tab.id!, openedBy: 'agent', managed: true });
+        addTab(s, { tabId: tab.id!, openedBy: 'agent', managed: true });
         tabInfo.set(tab.id!, { url: tab.pendingUrl || tab.url, title: tab.title, active: tab.active });
         await ensureGroup(s, [tab.id!]);
         persist();
@@ -841,7 +886,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
       if (typeof args.tabId !== 'number') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'tabId must be a number.');
       const tabId = args.tabId;
       const space = spaceOfTab(tabId);
-      if (!space) throw new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in a Space.`);
+      if (!space) throw notInSpace(tabId);
       requireOwner(space, agentKey);
       return runGated(space, agentKey, 'adopting a tab', async () => {
         space.tabs.get(tabId)!.managed = true;
@@ -966,8 +1011,7 @@ async function handleHuman(action: HumanAction, spaceId: number | undefined, ext
       return summary(s);
     }
     case 'close': {
-      if (s.windowId !== null) await chrome.windows.remove(s.windowId).catch(() => {});
-      endSpace(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by the user.`);
+      await closeSpaceWindow(s, ErrorCode.SPACE_CLOSED, `Space ${s.id} was closed by the user.`);
       return { closed: true };
     }
     case 'rename':

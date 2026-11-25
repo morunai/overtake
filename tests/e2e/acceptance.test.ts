@@ -491,6 +491,33 @@ test('the human closing the last agent tab ends the Space', async () => {
   await sleep(400);
   const list = await A.call('spaces_list');
   assert.ok(!list.spaces.some((x: { spaceId: number }) => x.spaceId === s.spaceId), 'Space ended');
+  // The agent's next call says what happened, not just TAB_NOT_IN_SPACE.
+  await assert.rejects(A.call('browser_snapshot', { tabId: s.tabId }), (e: Error) => code(e) === 'SPACE_CLOSED' && /user closed the last tab/.test(e.message));
+});
+
+test('the human closing the Space window is reported as SPACE_CLOSED with the reason', async () => {
+  const s = await A.call('spaces_create', { name: 'window closed by human', url: `${SITE}/?window-close=1` });
+  await A.call('browser_wait', { tabId: s.tabId, load: true });
+  await h.eval(ext, `chrome.tabs.get(${s.tabId}).then((t) => chrome.windows.remove(t.windowId))`);
+  await sleep(400);
+  for (const tool of ['browser_click', 'browser_snapshot']) {
+    await assert.rejects(A.call(tool, { tabId: s.tabId, target: '#btn' }), (e: Error) => code(e) === 'SPACE_CLOSED' && /user closed the window/.test(e.message), tool);
+  }
+});
+
+test('navigation under a script and late redirects get clear answers', async () => {
+  // A script that navigates the page: a clear PAGE_NAVIGATED with the new URL, no raw CDP error.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/` });
+  await assert.rejects(
+    A.call('browser_evaluate', { tabId: space.tabId, expression: `setTimeout(() => location.href = '/?nav=2', 50); await new Promise((r) => setTimeout(r, 3000)); 1` }),
+    (e: Error) => code(e) === 'PAGE_NAVIGATED' && e.message.includes('?nav=2'),
+  );
+  // A page that redirects after its own load: waitFor returns once the element is really there.
+  const r = await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/late`, waitFor: '#btn' });
+  assert.ok(r.url.includes('from=late'), r.url);
+  assert.equal(r.found, '#btn');
+  assert.equal(await A.call('browser_evaluate', { tabId: space.tabId, expression: `location.search` }).then((x: { value: string }) => x.value), '?from=late');
+  await assert.rejects(A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/`, waitFor: '#never-there', timeoutMs: 1500 }), (e: Error) => code(e) === 'TIMEOUT');
 });
 
 test('click receipts: navigation is detected from events, humanlike clicks still work', async () => {
@@ -538,4 +565,6 @@ test('closing the space ends it and releases the debugger', async () => {
   assert.equal(r.closed, true);
   const list = await A.call('spaces_list');
   assert.ok(!list.spaces.some((s: { spaceId: number }) => s.spaceId === space.spaceId));
+  // The agent's own close is not reported as the user's.
+  await assert.rejects(A.call('browser_snapshot', { tabId: space.tabId }), (e: Error) => code(e) === 'SPACE_CLOSED' && /closed by its agent/.test(e.message));
 });

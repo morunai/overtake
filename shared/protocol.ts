@@ -33,6 +33,7 @@ export const ErrorCode = {
   ELEMENT_NOT_FOUND: 'ELEMENT_NOT_FOUND',
   ELEMENT_AMBIGUOUS: 'ELEMENT_AMBIGUOUS',
   ELEMENT_NOT_ACTIONABLE: 'ELEMENT_NOT_ACTIONABLE',
+  PAGE_NAVIGATED: 'PAGE_NAVIGATED',
   INTERNAL: 'INTERNAL',
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -143,8 +144,8 @@ export interface EventMessage {
 export type AgentEvent =
   | { type: 'cdp'; tabId: number; sessionId?: string; method: string; params: unknown }
   | { type: 'control'; space: SpaceSummary }
-  | { type: 'space-closed'; spaceId: number }
-  | { type: 'tab-closed'; tabId: number; spaceId: number }
+  | { type: 'space-closed'; spaceId: number; reason?: string }
+  | { type: 'tab-closed'; tabId: number; spaceId: number; code?: string; reason?: string }
   | { type: 'debugger-detached'; tabId: number; reason: string }
   | { type: 'debugger-attached'; tabId: number } // fresh session: CDP domain state must be rebuilt
   | { type: 'extension'; connected: boolean };

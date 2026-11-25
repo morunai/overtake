@@ -19,6 +19,13 @@ export function startTestServer(p = port) {
       res.end(JSON.stringify({ message: 'hello from api', query: Object.fromEntries(url.searchParams) }));
       return;
     }
+    if (url.pathname === '/late') {
+      // Loads, then replaces itself with the main page a moment later, like an app
+      // that redirects after its own load (auth checks, client routing).
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(`<!doctype html><title>Loading</title><p>Loading...</p><script>setTimeout(() => location.replace('/?from=late'), 400)</script>`);
+      return;
+    }
     if (url.pathname === '/api/session') {
       // Fake login endpoint for the redaction test: a session cookie and a token in the body.
       res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': 'sid=test-session-secret; Path=/; HttpOnly' });
