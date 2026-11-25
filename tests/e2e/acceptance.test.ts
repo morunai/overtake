@@ -614,6 +614,20 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const dl = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lz.x},${lz.y}` });
   assert.equal(dl.kind, 'html5');
   assert.ok(((await ev('dragLog')) as string[]).includes('frame:n2'), `dropped into the late iframe: ${await ev('JSON.stringify(dragLog)')}`);
+  // A native drag into a cross-site (out-of-process) iframe cannot be completed: it is
+  // cancelled (the source gets dragend) and reported, not claimed as a drop.
+  await ev('dragLog.length = 0');
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#xframe' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /cross-site iframe/.test(e.message));
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'dragend']);
+  {
+    const xr = await ev(`(() => { const r = document.getElementById('xframe').getBoundingClientRect(); return { x: r.x + 30, y: r.y + 16 }; })()`) as { x: number; y: number };
+    // And out of one: the iframe's drag is cancelled too.
+    const out = await A.callRaw('browser_drag', { tabId: space.tabId, from: `${xr.x},${xr.y}`, to: '#bin' });
+    assert.match(out.content[0].text, /^ELEMENT_NOT_ACTIONABLE.*cross-site iframe/);
+    const x = (await A.call('browser_frames', { tabId: space.tabId })).frames.find((f: { outOfProcess: boolean; sessionId?: string }) => f.outOfProcess && f.sessionId);
+    assert.equal((await A.call('browser_evaluate', { tabId: space.tabId, frameId: x.frameId, expression: 'JSON.stringify(frameLog)' })).value, '["fdragstart","fdragend"]');
+    assert.equal(await ev(`document.getElementById('bin').dataset.dropped ?? null`), null);
+  }
   // Raw drag events sent to a cross-site iframe's own session (frame coordinates) are marked
   // and admitted too.
   let xf: { frameId: string; sessionId?: string } | undefined;
@@ -628,8 +642,8 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   for (const type of ['dragEnter', 'dragOver', 'drop']) {
     await A.call('browser_cdp', { tabId: space.tabId, method: 'Input.dispatchDragEvent', params: { type, x: 100, y: 60, data: raw }, sessionId: xf!.sessionId });
   }
-  const fl = await A.call('browser_evaluate', { tabId: space.tabId, frameId: xf!.frameId, expression: 'JSON.stringify(frameLog)' });
-  assert.equal(fl.value, '["frame:raw"]');
+  const fl = await A.call('browser_evaluate', { tabId: space.tabId, frameId: xf!.frameId, expression: 'frameLog.at(-1)' });
+  assert.equal(fl.value, 'frame:raw');
   // A human's native drop while the agent drags natively never lands, in the page or in an
   // iframe, even carrying the agent's own drag data: native drag events bypass Chrome's input
   // gate, so the shield admits one drop only while the agent's drop is dispatched. The human

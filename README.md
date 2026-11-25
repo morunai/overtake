@@ -249,6 +249,8 @@ used. Human actions are simulated as trusted mouse and keyboard events.
 - The overlay and dock live inside the page, so they do not cover the omnibox, tab strip or
   DevTools. The toolbar icon and hotkeys always work as escape routes.
 - `Profiler` and `HeapProfiler` are not available to extensions. Use `browser_trace` instead.
+- Native HTML5 drags into or out of a cross-site iframe are cancelled with an error. Pointer-based
+  drags there work.
 - Spaces end when Chrome closes and are not restored.
 - Certificate errors cannot be bypassed from an extension. On an untrusted certificate (such as a
   local dev server) the agent gets `CERT_ERROR` and hands off; click **Advanced**, then **Proceed**

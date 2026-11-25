@@ -1118,13 +1118,41 @@ export class Engine {
       // (drag events with the page's own drag data) instead; otherwise those are skipped.
       for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', ...at(i), button: 'left', buttons: 1 }, delayMs: 18, drag: 'pointer' });
       steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40, drag: 'pointer' });
-      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragEnter', ...at(1) }, drag: 'native' });
-      for (let i = 2; i <= n; i++) steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragOver', ...at(i) }, delayMs: 18, drag: 'native' });
-      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'drop', x: pb.x, y: pb.y }, delayMs: 40, drag: 'native' });
+      // Native drag events go to the top page's process: they cannot reach a cross-site
+      // (out-of-process) iframe. If either end is in one and the page starts a native drag,
+      // cancel it (the source gets dragend) and say so, rather than report a drop that never
+      // happened.
+      const crossSite = !!(a.node?.sessionId || b.node?.sessionId) || (await this.#crossSiteFrameAt(t, pa)) || (await this.#crossSiteFrameAt(t, pb));
+      if (crossSite) steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragCancel', ...at(1) }, drag: 'native' });
+      else {
+        steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragEnter', ...at(1) }, drag: 'native' });
+        for (let i = 2; i <= n; i++) steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragOver', ...at(i) }, delayMs: 18, drag: 'native' });
+        steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'drop', x: pb.x, y: pb.y }, delayMs: 40, drag: 'native' });
+      }
       t.cursor = pb;
       const r = await this.client.request<{ nativeDrag?: boolean }>('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
+      if (r.nativeDrag && crossSite) {
+        throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The page started a native HTML5 drag, and native drags into or out of a cross-site iframe cannot be completed from here; the drag was cancelled. Try the page\'s own alternative (a menu, buttons or keyboard reordering), or browser_evaluate.');
+      }
       return { dragged: { from: pa, to: pb }, kind: r.nativeDrag ? 'html5' : 'pointer' };
     });
+  }
+
+  /** Whether a viewport point is over a cross-site (out-of-process) iframe. Uses the frame
+   *  owners' boxes: a hit test would find the shield overlay, which covers the page. */
+  async #crossSiteFrameAt(t: TabState, p: { x: number; y: number }): Promise<boolean> {
+    for (const c of t.children.values()) {
+      if (c.type !== 'iframe') continue;
+      const owner = await this.cdp<{ backendNodeId: number }>(t.tabId, 'DOM.getFrameOwner', { frameId: c.targetId }).catch(() => null);
+      if (!owner) continue;
+      const q = await this.cdp<{ quads: number[][] }>(t.tabId, 'DOM.getContentQuads', { backendNodeId: owner.backendNodeId }).catch(() => ({ quads: [] as number[][] }));
+      for (const quad of q.quads) {
+        const xs = [quad[0], quad[2], quad[4], quad[6]];
+        const ys = [quad[1], quad[3], quad[5], quad[7]];
+        if (p.x >= Math.min(...xs) && p.x <= Math.max(...xs) && p.y >= Math.min(...ys) && p.y <= Math.max(...ys)) return true;
+      }
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------

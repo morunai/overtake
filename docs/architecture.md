@@ -118,7 +118,9 @@ Native drag events reach the page even while Chrome ignores input, so the agent'
 carry an extra `application/x-overtake-drag` item with a fresh secret per burst, and the
 shield admits a `drop`, in any frame, only while the agent's drop is dispatched, once, and
 carrying that secret. A human's drop during the burst is cancelled, even with the same data. A burst aborted mid-drag sends `dragCancel`, so
-the page gets `dragend` and no drop.
+the page gets `dragend` and no drop. Drag events go to the top page's process and cannot
+reach a cross-site (out-of-process) iframe, so a native drag with either end in one is
+cancelled the same way and reported as `ELEMENT_NOT_ACTIONABLE`.
 
 Measured in `tests/e2e/acceptance.test.ts`: **10,104–10,483 trusted human clicks during
 a 120-event agent typing burst; none landed; all 60 agent keystrokes landed.**

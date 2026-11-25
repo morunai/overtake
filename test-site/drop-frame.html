@@ -1,14 +1,21 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Drop Frame</title>
-<style>html, body { margin: 0; height: 100%; } #fbin { height: 100%; background: #e9d5ff; font: 14px system-ui; display: grid; place-items: center; }</style>
+<style>html, body { margin: 0; height: 100%; } #fsrc { position: absolute; left: 6px; top: 6px; padding: 4px 8px; background: #c4b5fd; } #fbin { height: 100%; background: #e9d5ff; font: 14px system-ui; display: grid; place-items: center; }</style>
 </head>
 <body>
 <div id="fbin">Frame drop zone</div>
+<span id="fsrc" draggable="true">Frame item</span>
 <script>
   window.frameLog = [];
   const fbin = document.getElementById('fbin');
   fbin.addEventListener('dragover', (e) => e.preventDefault());
+  const fsrc = document.getElementById('fsrc');
+  fsrc.addEventListener('dragstart', (e) => {
+    e.dataTransfer.setData('text/plain', 'frame-item');
+    frameLog.push('fdragstart');
+  });
+  fsrc.addEventListener('dragend', () => frameLog.push('fdragend'));
   fbin.addEventListener('drop', (e) => {
     e.preventDefault();
     const html = e.dataTransfer.getData('text/html');
