@@ -6,12 +6,17 @@
 <body>
 <div id="fbin">Frame drop zone</div>
 <script>
+  window.frameLog = [];
   const fbin = document.getElementById('fbin');
   fbin.addEventListener('dragover', (e) => e.preventDefault());
   fbin.addEventListener('drop', (e) => {
     e.preventDefault();
     const html = e.dataTransfer.getData('text/html');
-    parent.dragLog.push('frame:' + e.dataTransfer.getData('text/plain') + (html ? '+html' : ''));
+    const entry = 'frame:' + e.dataTransfer.getData('text/plain') + (html ? '+html' : '');
+    frameLog.push(entry);
+    try {
+      parent.dragLog.push(entry); // same-origin parent
+    } catch {}
   });
 </script>
 </body>

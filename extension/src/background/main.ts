@@ -377,13 +377,15 @@ function permitFor(step: InputStep, held: boolean): Permit {
     const loose = (held || (typeof p.buttons === 'number' && p.buttons > 0)) && p.type === 'mouseMoved' ? ['dragstart'] : undefined;
     return { types: MOUSE_TYPES[String(p.type)] || [], x: p.x, y: p.y, ...(loose ? { loose } : {}) };
   }
-  if (step.method === 'Input.dispatchDragEvent' && typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
+  if (step.method === 'Input.dispatchDragEvent') {
     // Only drop is blocked by the shield (enter, over, leave and end are not). Native drag
     // events reach the page even while Chrome ignores input, so a drop is admitted once, while
-    // this step is dispatched, and only carrying this burst's secret mark (see DRAG_MARK).
+    // this step is dispatched, and only carrying this burst's secret mark (see DRAG_MARK). A
+    // step sent to a child frame's session has that frame's coordinates: no point check.
     if (p.type !== 'drop') return { types: [] };
-    const mark = (p.data as { items?: { mimeType: string; data: string }[] } | undefined)?.items?.find((i) => i.mimeType === DRAG_MARK);
-    return { types: mark ? ['drop'] : [], x: p.x, y: p.y, drop: mark ? [{ mimeType: DRAG_MARK, data: mark.data }] : [] };
+    const mark = (p.data as { items?: { mimeType: string; data: string }[] } | undefined)?.items?.find((i) => i?.mimeType === DRAG_MARK);
+    const at = typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId ? { x: p.x, y: p.y } : {};
+    return { types: mark ? ['drop'] : [], ...at, drop: mark ? [{ mimeType: DRAG_MARK, data: mark.data }] : [] };
   }
   if (step.method === 'Input.dispatchKeyEvent') {
     return { types: ['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'paste', 'cut'], key: typeof p.key === 'string' ? p.key : undefined };

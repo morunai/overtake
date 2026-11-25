@@ -84,9 +84,11 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   function onInput(e: Event) {
     if (!alive || !state?.shield || !e.isTrusted) return;
     if (host && e.composedPath().includes(host)) return; // the dock stays usable
-    // Subframes rely on Chrome's input gate during a burst, except for drops: native drag
-    // events bypass it, so a drop needs a permit in every frame.
-    if (pass && (isTop || e.type === 'drop' ? permitted(e) : true)) return;
+    // Native drag events bypass Chrome's input gate, so a drop passes only with a permit, in
+    // every frame, and independently of pass: a frame created mid-burst missed the pass
+    // message but still gets the drop permit. Other events: subframes rely on Chrome's gate
+    // during a burst.
+    if (e.type === 'drop' ? permitted(e) : pass && (!isTop || permitted(e))) return;
     e.preventDefault();
     e.stopImmediatePropagation();
   }

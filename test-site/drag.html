@@ -23,6 +23,9 @@
 </ul>
 <div id="bin" aria-label="Drop zone">Drop here</div>
 <iframe id="frame" src="/drop-frame.html" title="Drop frame" style="width:200px;height:120px;border:0;vertical-align:top"></iframe>
+<iframe id="xframe" src="http://localhost:8765/drop-frame.html" title="Cross-site drop frame" style="width:200px;height:120px;border:0;vertical-align:top"></iframe>
+<!-- An iframe that appears only once a drag starts. -->
+<div id="lateZone" style="display:inline-block;position:relative;width:200px;height:120px;background:#eee;vertical-align:top">Late frame</div>
 <button id="after" onclick="this.dataset.n = (+this.dataset.n || 0) + 1">After</button>
 <!-- Pointer-event dragging, like dnd-kit. -->
 <ul id="pointer" aria-label="Pointer list">
@@ -60,6 +63,14 @@
     li.parentNode.insertBefore(dragged, after ? li.nextSibling : li);
     dragLog.push('drop:' + e.dataTransfer.getData('text/plain') + '>' + li.dataset.id);
     native.dataset.order = order(native);
+  });
+  native.addEventListener('dragstart', () => {
+    if (!location.search.includes('late=1') || document.getElementById('late')) return;
+    const f = document.createElement('iframe');
+    f.id = 'late';
+    f.src = '/drop-frame.html?late=1';
+    f.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0';
+    document.getElementById('lateZone').append(f);
   });
   native.addEventListener('dragend', () => {
     dragLog.push('dragend');

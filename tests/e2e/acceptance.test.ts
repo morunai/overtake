@@ -607,6 +607,29 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const df = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native three', to: '#frame' });
   assert.equal(df.kind, 'html5');
   assert.ok(((await ev('dragLog')) as string[]).includes('frame:n3'), 'dropped into the iframe');
+  // An iframe that appears only after the drag started (it missed the burst's start) still
+  // takes the agent's drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?late=1` });
+  const lz = await ev(`(() => { const r = document.getElementById('lateZone').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  const dl = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lz.x},${lz.y}` });
+  assert.equal(dl.kind, 'html5');
+  assert.ok(((await ev('dragLog')) as string[]).includes('frame:n2'), `dropped into the late iframe: ${await ev('JSON.stringify(dragLog)')}`);
+  // Raw drag events sent to a cross-site iframe's own session (frame coordinates) are marked
+  // and admitted too.
+  let xf: { frameId: string; sessionId?: string } | undefined;
+  let frameList: unknown;
+  for (let i = 0; i < 40 && !xf?.sessionId; i++) {
+    frameList = (await A.call('browser_frames', { tabId: space.tabId })).frames;
+    xf = (frameList as { url: string; outOfProcess: boolean; frameId: string; sessionId?: string }[]).find((f) => f.outOfProcess && !!f.sessionId); // the only cross-site frame (its url may read empty)
+    if (!xf?.sessionId) await sleep(50);
+  }
+  assert.ok(xf?.sessionId, `the cross-site drop frame has its own session: ${JSON.stringify(frameList)}`);
+  const raw = { items: [{ mimeType: 'text/plain', data: 'raw' }], dragOperationsMask: 1 };
+  for (const type of ['dragEnter', 'dragOver', 'drop']) {
+    await A.call('browser_cdp', { tabId: space.tabId, method: 'Input.dispatchDragEvent', params: { type, x: 100, y: 60, data: raw }, sessionId: xf!.sessionId });
+  }
+  const fl = await A.call('browser_evaluate', { tabId: space.tabId, frameId: xf!.frameId, expression: 'JSON.stringify(frameLog)' });
+  assert.equal(fl.value, '["frame:raw"]');
   // A human's native drop while the agent drags natively never lands, in the page or in an
   // iframe, even carrying the agent's own drag data: native drag events bypass Chrome's input
   // gate, so the shield admits one drop only while the agent's drop is dispatched. The human
