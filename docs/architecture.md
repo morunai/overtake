@@ -113,9 +113,11 @@ own duration only (agents cannot call it through `browser_cdp`, since left on it
 swallow the human's drags). If the page starts a native drag during the pointer moves, Chrome
 reports `Input.dragIntercepted` with the page's drag data; the burst skips its remaining
 pointer steps and runs `Input.dispatchDragEvent` steps (enter, over, drop) with that data
-instead. The permit admits `dragstart` (fired at the press origin) and `dragend` (on the
-source) without the coordinate check. A burst aborted mid-drag sends `dragCancel`, so the page
-gets `dragend` and no drop.
+instead. The permit admits `dragstart` at the press origin rather than the move's point.
+Native drag events reach the page even while Chrome ignores input, so the shield admits a
+`drop` only at the agent's drop step, at its point, and carrying its intercepted drag data; a
+human's drop during the burst is cancelled. A burst aborted mid-drag sends `dragCancel`, so
+the page gets `dragend` and no drop.
 
 Measured in `tests/e2e/acceptance.test.ts`: **10,104–10,483 trusted human clicks during
 a 120-event agent typing burst; none landed; all 60 agent keystrokes landed.**

@@ -55,7 +55,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   // match the permit for the step being dispatched (type + coordinates or key)
   // pass. Subframes cannot see the top frame's permit and pass during bursts;
   // Chrome's own input gate covers them outside the per-step dispatch window.
-  let permit: { types: string[]; x?: number; y?: number; key?: string; loose?: string[]; until: number } | null = null;
+  let permit: { types: string[]; x?: number; y?: number; key?: string; loose?: string[]; drop?: { mimeType: string; data?: string }[]; until: number } | null = null;
 
   function permitted(e: Event): boolean {
     if (!permit || Date.now() > permit.until) return false;
@@ -66,6 +66,16 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
       if (Math.abs(me.clientX - permit.x) > 2 || Math.abs(me.clientY - permit.y!) > 2) return false;
     }
     if (permit.key !== undefined && e instanceof KeyboardEvent && e.key !== permit.key && e.key.toLowerCase() !== permit.key.toLowerCase()) return false;
+    if (e.type === 'drop') {
+      // Native drag events reach the page even while Chrome ignores input: a drop passes
+      // only when it carries the agent's own drag data.
+      const dt = (e as DragEvent).dataTransfer;
+      if (!permit.drop || !dt) return false;
+      for (const item of permit.drop) {
+        if (!dt.types.includes(item.mimeType)) return false;
+        if (item.data !== undefined && dt.getData(item.mimeType) !== item.data) return false;
+      }
+    }
     return true;
   }
 

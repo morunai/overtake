@@ -364,7 +364,7 @@ async function setNativeIgnore(tabId: number, ignore: boolean) {
 const MOUSE_TYPES: Record<string, string[]> = {
   mouseMoved: ['pointermove', 'mousemove', 'pointerover', 'pointerout', 'pointerenter', 'pointerleave', 'mouseover', 'mouseout', 'mouseenter', 'mouseleave'],
   mousePressed: ['pointerdown', 'mousedown', 'contextmenu', 'dragstart'],
-  mouseReleased: ['pointerup', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'drop'],
+  mouseReleased: ['pointerup', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu'],
   mouseWheel: ['wheel'],
 };
 
@@ -378,7 +378,12 @@ function permitFor(step: InputStep, held: boolean): Permit {
     return { types: MOUSE_TYPES[String(p.type)] || [], x: p.x, y: p.y, ...(loose ? { loose } : {}) };
   }
   if (step.method === 'Input.dispatchDragEvent' && typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
-    return { types: ['dragenter', 'dragover', 'dragleave', 'drop'], x: p.x, y: p.y, loose: ['dragend'] };
+    // Only drop is blocked by the shield (enter, over, leave and end are not). Native drag
+    // events reach the page even while Chrome ignores input, so a drop is admitted only at
+    // this point and only carrying the agent's intercepted drag data: a human drop is not.
+    if (p.type !== 'drop') return { types: [] };
+    const items = ((p.data as { items?: { mimeType: string; data: string }[] } | undefined)?.items || []).slice(0, 8);
+    return { types: ['drop'], x: p.x, y: p.y, drop: items.map((i) => ({ mimeType: i.mimeType, data: i.data.length <= 20_000 ? i.data : undefined })) };
   }
   if (step.method === 'Input.dispatchKeyEvent') {
     return { types: ['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'paste', 'cut'], key: typeof p.key === 'string' ? p.key : undefined };
@@ -398,15 +403,6 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   let dragData: unknown = null;
   let dropped = false;
   let last = { x: 0, y: 0 };
-  if (dragBurst) {
-    dragWatch.set(tabId, (data) => (dragData ??= data));
-    try {
-      await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: true });
-    } catch (e) {
-      dragWatch.delete(tabId);
-      throw e;
-    }
-  }
   if (label) {
     s.statusText = label;
     pushOverlay(s);
@@ -415,9 +411,15 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   const shield = shieldActive(s.ctl);
   let dispatched = 0;
   let pressed: { x: number; y: number; button: string } | null = null;
-  await setNativeIgnore(tabId, true);
-  if (shield) await sendAllFramesAcked(tabId, { type: 'overtake:pass', pass: true });
+  const watcher = (data: unknown) => (dragData ??= data);
   try {
+    // Set up inside the try, so the finally always undoes what was done.
+    if (dragBurst) {
+      dragWatch.set(tabId, watcher);
+      await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: true });
+    }
+    await setNativeIgnore(tabId, true);
+    if (shield) await sendAllFramesAcked(tabId, { type: 'overtake:pass', pass: true });
     for (let step of steps) {
       if (step.drag === 'pointer' && dragData) continue; // the page took it as a native drag
       if (step.drag === 'native') {
@@ -427,6 +429,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         step = { ...step, params: { ...step.params, data: dragData } };
       }
       if (step.delayMs) await new Promise((r) => setTimeout(r, Math.min(step.delayMs!, 2000)));
+      if (step.drag === 'pointer' && dragData) continue; // intercepted during the delay
       const d = gate(s.ctl, agentKey);
       if (!d.run) {
         throw new OvertakeError(d.wait ? ErrorCode.USER_IN_CONTROL : d.code, d.wait ? 'The human paused the agent mid-action.' : d.message, { dispatched });
@@ -472,7 +475,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
     if (shield) await sendAllFramesAcked(tabId, { type: 'overtake:pass', pass: false }).catch(() => 0);
     await setNativeIgnore(tabId, false).catch(() => {});
     if (dragBurst) {
-      dragWatch.delete(tabId);
+      if (dragWatch.get(tabId) === watcher) dragWatch.delete(tabId);
       await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: false }).catch(() => {});
     }
   }

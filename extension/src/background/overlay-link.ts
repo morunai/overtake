@@ -22,9 +22,11 @@ export interface Permit {
   x?: number; // mouse: viewport coordinates of the agent event
   y?: number;
   key?: string; // keyboard: KeyboardEvent.key
-  /** Types admitted without the coordinate check: the native drag events Chrome fires away
-   *  from the step's point (dragstart at the press origin, dragend on the source). */
+  /** Types admitted without the coordinate check: dragstart, which Chrome fires at the press
+   *  origin when a held-button move starts a native drag. */
   loose?: string[];
+  /** For a drop: the drag data it must carry (the agent's intercepted drag). */
+  drop?: { mimeType: string; data?: string }[];
 }
 
 export type OverlayMessage =
