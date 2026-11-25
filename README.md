@@ -131,6 +131,10 @@ It prints the `claude mcp add` command for that instance.
 | Scripts | `browser_run` (a whole flow from one script file; each call uses the same real input and checks) |
 | Advanced | `browser_intercept` `browser_emulate` `browser_trace` `browser_debug` `browser_cdp` `browser_capabilities` |
 
+`browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_navigate`,
+`browser_wait` and `browser_run` take `snapshot: true` to also return a snapshot of the page after
+the action, with fresh `@refs`, so the agent does not need a separate `browser_snapshot` call.
+
 The server ships instructions that tell the agent how to behave: one Space per goal, snapshot
 before acting, treat `USER_IN_CONTROL` as a hard stop, and use `space_handoff` when a human is
 needed.
@@ -258,7 +262,6 @@ used. Human actions are simulated as trusted mouse and keyboard events.
 ## Roadmap
 
 - Restore Spaces across Chrome restarts.
-- Return a snapshot together with an action to cut agent turns ([docs/TODO.md](docs/TODO.md)).
 - HTML5 drag and drop.
 - Per-frame input permits for cross-origin iframes.
 
