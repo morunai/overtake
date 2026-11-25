@@ -138,7 +138,8 @@ async function act(a: { tabId: number } & ActionOpts & SnapshotOpts, run: () => 
   const prev = actChains.get(a.tabId) ?? Promise.resolve();
   const mine = prev.catch(() => {}).then(async () => {
     const t0 = Date.now();
-    const watch = a.waitForText ? await engine.watchText(a.tabId, a.waitForText) : undefined;
+    // The watch outlives the action plus the wait by a margin, then stops itself.
+    const watch = a.waitForText ? await engine.watchText(a.tabId, a.waitForText, (a.waitTimeoutMs ?? 10_000) + 60_000) : undefined;
     let r: Record<string, unknown>;
     try {
       r = (await run()) as Record<string, unknown>;

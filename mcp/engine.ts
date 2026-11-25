@@ -665,64 +665,72 @@ export class Engine {
     }
   }
 
-  /** Start watching for text that appears through a DOM change from now on: an added or
-   *  changed node containing it, or more copies of it on the page than at their lowest since
-   *  the watch began (so "Order <span>saved</span>" matches "Order saved"). Covers open shadow roots and same-origin
-   *  iframes. Text already on the page does not count, so waiting for "Saved" after an action
-   *  is not satisfied by an earlier "Saved". Stop it with unwatchText. */
-  async watchText(tabId: number, text: string): Promise<string> {
+  /** Start watching for text that appears because of what happens from now on. The page
+   *  counts the visible copies of the text (innerText, across open shadow roots and same-origin
+   *  iframes, found afresh at every check); the text is seen once there are more than at their
+   *  lowest since the watch began. So a "Saved" already on the page does not count, but
+   *  "Saved", "Saving...", "Saved" does, as does text split across elements or revealed by a
+   *  style change. A mutation observer also catches visible text re-added between two checks.
+   *  The watch stops itself after ttlMs, in case unwatchText cannot run. */
+  async watchText(tabId: number, text: string, ttlMs: number): Promise<string> {
     return this.action(tabId, async () => {
       const id = `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       const expr = `(() => { const text = ${JSON.stringify(text)}; const id = ${JSON.stringify(id)};
         const w = (window.__overtakeWatch ||= {});
-        const entry = { seen: false, observers: [] };
-        const has = (node) => (node.nodeType === 3 ? node.data : node.textContent || '').includes(text);
-        const roots = [document];
-        const observed = new WeakSet();
+        const visibleText = (root) => {
+          if (root.nodeType === 9) return root.body?.innerText || '';
+          return [...root.children].map((c) => c.innerText ?? c.textContent ?? '').join('\\n');
+        };
+        const roots = () => {
+          const out = [document];
+          const walk = (root) => {
+            for (const el of root.querySelectorAll('*')) {
+              if (out.length > 200) return;
+              if (el.shadowRoot) { out.push(el.shadowRoot); walk(el.shadowRoot); }
+              if (el.localName === 'iframe') { try { const d = el.contentDocument; if (d) { out.push(d); walk(d); } } catch {} }
+            }
+          };
+          walk(document);
+          return out;
+        };
         const count = () => {
           let n = 0;
-          for (const r of roots) {
-            const t = (r.nodeType === 9 ? r.documentElement?.textContent : r.textContent) || '';
+          for (const r of roots()) {
+            const t = visibleText(r);
             for (let i = t.indexOf(text); i >= 0; i = t.indexOf(text, i + text.length)) n++;
           }
           return n;
         };
-        const stop = () => { for (const o of entry.observers) o.disconnect(); entry.observers.length = 0; };
-        // Seen when an added or changed node contains the text, or when the page holds more
-        // copies of it than at its lowest since the watch began ("Saved", "Saving...", "Saved"
-        // counts; so does text split across elements, like "Order <span>saved</span>").
-        let low;
+        const shown = (node) => {
+          const el = node.nodeType === 1 ? node : node.parentElement;
+          return !!el && (!el.checkVisibility || el.checkVisibility());
+        };
+        const has = (node) => (node.nodeType === 3 ? node.data : node.textContent || '').includes(text) && shown(node);
+        const entry = { seen: false, low: 0 };
+        const observers = [];
+        const stop = () => { for (const o of observers) o.disconnect(); observers.length = 0; clearTimeout(entry.ttl); };
         const onMutations = (list) => {
           for (const m of list) {
-            for (const n of m.addedNodes) watchTree(n);
             if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { entry.seen = true; stop(); return; }
           }
-          const c = count();
-          if (c > low) { entry.seen = true; stop(); return; }
-          low = Math.min(low, c);
         };
-        const observe = (root) => {
-          if (entry.seen || entry.observers.length > 200 || observed.has(root)) return;
-          observed.add(root);
-          if (root !== document) roots.push(root);
+        for (const r of roots()) {
           const o = new MutationObserver(onMutations);
-          o.observe(root, { subtree: true, childList: true, characterData: true });
-          entry.observers.push(o);
-        };
-        // Open shadow roots and same-origin iframes have their own trees to observe.
-        const watchTree = (root) => {
-          if (!root || root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
-          const walk = root.nodeType === 1 ? [root, ...root.querySelectorAll('*')] : [...root.querySelectorAll('*')];
-          for (const el of walk.slice(0, 5000)) {
-            if (el.shadowRoot) { observe(el.shadowRoot); watchTree(el.shadowRoot); }
-            if (el.localName === 'iframe') { try { const d = el.contentDocument; if (d) { observe(d); watchTree(d); } } catch {} }
+          o.observe(r, { subtree: true, childList: true, characterData: true });
+          observers.push(o);
+        }
+        entry.check = () => {
+          if (!entry.seen) {
+            const c = count();
+            if (c > entry.low) { entry.seen = true; stop(); }
+            else entry.low = Math.min(entry.low, c);
           }
+          return entry.seen;
         };
-        entry.stop = stop;
-        w[id] = entry;
-        observe(document);
-        watchTree(document);
-        low = count(); })()`;
+        entry.stop = () => { stop(); delete w[id]; };
+        entry.low = count();
+        entry.ttl = setTimeout(entry.stop, ${Math.max(1000, Math.round(ttlMs))});
+        w[id] = entry; })()`;
       await this.cdp(tabId, 'Runtime.evaluate', { expression: expr });
       return id;
     });
@@ -731,7 +739,7 @@ export class Engine {
   /** Wait for a watchText watch. If the page navigated (the watch is gone), the text on the new
    *  page counts. */
   async awaitText(tabId: number, id: string, text: string, timeoutMs: number) {
-    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.seen; return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
+    const fn = `(() => { const w = window.__overtakeWatch?.[${JSON.stringify(id)}]; if (w) return w.check(); return (document.body?.innerText || '').includes(${JSON.stringify(text)}); })()`;
     try {
       await this.wait(tabId, { function: fn, timeoutMs });
     } catch (e) {
@@ -741,9 +749,10 @@ export class Engine {
     return { appeared: text };
   }
 
-  /** Disconnect a watchText watch and forget it (always call it, whatever happened). */
+  /** Stop a watchText watch and forget it. Best effort: if the human has control, the watch
+   *  still stops itself when its ttl ends. */
   async unwatchText(tabId: number, id: string) {
-    const expr = `(() => { const w = window.__overtakeWatch; const e = w?.[${JSON.stringify(id)}]; if (e) { e.stop(); delete w[${JSON.stringify(id)}]; } })()`;
+    const expr = `window.__overtakeWatch?.[${JSON.stringify(id)}]?.stop()`;
     await this.cdp(tabId, 'Runtime.evaluate', { expression: expr }).catch(() => {});
   }
 

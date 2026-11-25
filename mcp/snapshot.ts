@@ -173,7 +173,7 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
         walkTree(input.children.get(n.backendDOMNodeId)!, d + 1, undefined);
       }
       // A draggable named from its own text: its text-only subtree would repeat that name.
-      if ((onlyText || (drag && !str(n.name) && !hasInteractive(n, byId, input.draggable))) && name) return;
+      if ((onlyText || (drag && !str(n.name))) && name && !hasInteractive(n, byId, input.draggable)) return;
       for (const k of kids) visit(k, d + 1);
     };
     visit(root, depth);

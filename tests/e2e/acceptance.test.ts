@@ -729,6 +729,12 @@ test('waitForText waits for text the action makes appear; receipts list requests
   assert.equal((await click('#split', { waitForText: 'Order saved' })).appeared, 'Order saved');
   assert.equal((await click('#shadow', { waitForText: 'Shadow done' })).appeared, 'Shadow done');
   assert.equal((await click('#inframe', { waitForText: 'Frame done' })).appeared, 'Frame done');
+  // Only visible text counts: hidden text appended does not, hidden text revealed does.
+  await timesOut(click('#hiddenadd', { waitForText: 'Ghost text', waitTimeoutMs: 600 }));
+  assert.equal((await click('#reveal', { waitForText: 'Confirmed' })).appeared, 'Confirmed');
+  // A shadow root attached by the action, and an iframe whose document the action replaces.
+  assert.equal((await click('#lateshadow', { waitForText: 'Late shadow' })).appeared, 'Late shadow');
+  assert.equal((await click('#srcdoc', { waitForText: 'Srcdoc done' })).appeared, 'Srcdoc done');
   // Watches are cleaned up, after success and after a timeout.
   assert.equal(await ev('Object.keys(window.__overtakeWatch || {}).length'), 0);
   // Two actions sent at once run one after the other: the second cannot take the first's text.

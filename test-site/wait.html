@@ -9,6 +9,9 @@
 <p id="order">Order <span id="state">pending</span></p>
 <p id="other">Other text</p>
 <div id="host"></div>
+<div id="host2"></div>
+<p id="hidden-ok" hidden>Confirmed</p>
+<div id="sink"></div>
 <iframe id="frame" src="/drop-frame.html" title="Same-site frame" style="width:200px;height:60px;border:0"></iframe>
 <div>
   <button id="save" onclick="const s = document.getElementById('status'); s.textContent = 'Saving...'; setTimeout(() => (s.textContent = 'Saved'), 150)">Save</button>
@@ -18,6 +21,10 @@
   <button id="inframe" onclick="document.getElementById('frame').contentDocument.getElementById('fbin').textContent = 'Frame done'">In frame</button>
   <button id="alpha" onclick="setTimeout(() => (document.getElementById('other').textContent = 'Alpha'), 100)">Alpha</button>
   <button id="noop">Nothing</button>
+  <button id="hiddenadd" onclick="const p = document.createElement('p'); p.hidden = true; p.textContent = 'Ghost text'; document.getElementById('sink').append(p)">Hidden add</button>
+  <button id="reveal" onclick="document.getElementById('hidden-ok').hidden = false">Reveal</button>
+  <button id="lateshadow" onclick="document.getElementById('host2').attachShadow({ mode: 'open' }).innerHTML = '<b>Late shadow</b>'">Late shadow</button>
+  <button id="srcdoc" onclick="document.getElementById('frame').srcdoc = '<p>Srcdoc done</p>'">Srcdoc</button>
   <button id="secret" onclick="fetch('/api/data?code=oauth-secret-123&state=xyz')">Fetch</button>
 </div>
 <script>
