@@ -3,7 +3,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer as createHttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
@@ -141,6 +141,103 @@ test('an action with snapshot: true returns the page after it, with working refs
   assert.match(w.content[1].text, new RegExp(`clicks: ${n + 2}`));
   const p = await A.callRaw('browser_press', { tabId: space.tabId, keys: 'Shift', snapshot: true, snapshotScope: 'full_page' });
   assert.match(p.content[1].text, /button "Click me" @\d+/);
+});
+
+test('browser_run runs a whole flow from one script with real input', async () => {
+  const n = await count();
+  const r = await A.callRaw('browser_run', {
+    tabId: space.tabId,
+    args: { times: 3, name: 'Ada' },
+    script: `
+      await fill('#name', args.name);
+      for (let i = 0; i < args.times; i++) await click('#btn');
+      await wait({ text: 'clicks: ' + (${n} + args.times) });
+      const value = await evaluate(() => document.getElementById('name').value);
+      assert(value === 'Ada', 'name was typed');
+      log('typed', value);
+      return { value, url: await url() };
+    `,
+  });
+  assert.ok(!r.isError, r.content[0].text);
+  assert.equal(r.content.length, 1, 'no snapshot unless asked or failed');
+  const out = JSON.parse(r.content[0].text);
+  assert.equal(out.ok, true);
+  assert.equal(out.result.value, 'Ada');
+  assert.equal(out.steps, 7);
+  assert.deepEqual(out.logs, ['typed Ada']);
+  assert.equal(await count(), n + 3, 'all three clicks landed');
+  // Each click went through the real-input path (the page saw trusted events).
+  assert.equal(await h.eval<boolean>(human, `window.__lastPointer?.trusted`), true);
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('name').value = ''` });
+});
+
+test('browser_run from a file: errors carry the step, the line and a snapshot; caught errors continue', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overtake-run-'));
+  try {
+    const file = join(dir, 'flow.js');
+    writeFileSync(file, [
+      `let caught = null;`,
+      `try { await click('#missing-optional', { force: true }); } catch (e) { caught = e.code; }`,
+      `await click('#btn');`,
+      `await click('#does-not-exist');`,
+      `return 'unreachable';`,
+    ].join('\n'));
+    const r = await A.callRaw('browser_run', { tabId: space.tabId, file });
+    assert.ok(!r.isError, r.content[0].text);
+    const out = JSON.parse(r.content[0].text);
+    assert.equal(out.ok, false);
+    assert.equal(out.error.code, 'ELEMENT_NOT_FOUND');
+    assert.equal(out.error.line, 4, 'line of the failing call in the file');
+    assert.equal(out.error.step, 3);
+    assert.equal(out.error.op, 'click');
+    assert.equal(out.trail.length, 3);
+    assert.equal(r.content.length, 2, 'a failed run comes with a snapshot');
+    assert.match(r.content[1].text, /button "Click me" @\d+/);
+    // Re-running the same file after a fix needs no re-sent script.
+    writeFileSync(file, `await click('#btn'); return await evaluate('document.title');`);
+    const again = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, file })).content[0].text);
+    assert.equal(again.ok, true);
+    assert.equal(typeof again.result, 'string');
+    // browser_evaluate takes a file too.
+    const ev = join(dir, 'probe.js');
+    writeFileSync(ev, `document.querySelectorAll('button').length`);
+    const e = await A.call('browser_evaluate', { tabId: space.tabId, file: ev });
+    assert.ok(e.ok && e.value > 0);
+    await assert.rejects(A.call('browser_evaluate', { tabId: space.tabId, file: 'relative.js' }), (x) => code(x) === 'BAD_REQUEST');
+    await assert.rejects(A.call('browser_run', { tabId: space.tabId, file: join(dir, 'x.txt') }), (x) => code(x) === 'BAD_REQUEST');
+    // Syntax errors point at the line.
+    const bad = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `await click('#btn');\nconst = 1;` })).content[0].text);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.error.code, 'SCRIPT_SYNTAX_ERROR');
+    // The run limits hold.
+    const many = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (;;) await url();`, maxSteps: 5 })).content[0].text);
+    assert.equal(many.error.code, 'STEP_LIMIT');
+    const slow = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (;;) {}`, timeoutMs: 1000 })).content[0].text);
+    assert.equal(slow.error.code, 'TIMEOUT', 'even a busy loop is stopped');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('browser_run stops at once when the human stops the agent, even if the script catches errors', async () => {
+  const s = await A.call('spaces_create', { name: 'script stop', url: `${SITE}/?script-stop=1` });
+  await A.call('browser_wait', { tabId: s.tabId, load: true });
+  const page = await h.humanSession('?script-stop=1');
+  const run = A.callRaw('browser_run', {
+    tabId: s.tabId,
+    timeoutMs: 20_000,
+    script: `for (let i = 0; i < 200; i++) { try { await click('#btn'); await sleep(50); } catch (e) { log('caught', e.code); } }`,
+  });
+  await sleep(1500);
+  await h.humanAction(ext, 'stop', s.spaceId);
+  const r = await run;
+  assert.ok(r.isError, 'a hard stop is a tool error');
+  assert.match(r.content[0].text, /^STOPPED: .*browser_run stopped at step \d+/);
+  const after = await h.eval<string>(page, `document.getElementById('count').dataset.count`);
+  await sleep(800);
+  assert.equal(await h.eval<string>(page, `document.getElementById('count').dataset.count`), after, 'no click after the stop');
+  assert.ok(Number(after) > 2, `the script ran before the stop (${after} clicks)`);
+  await h.humanAction(ext, 'close', s.spaceId);
 });
 
 test('network results mask credentials (headers, cookies, tokens, passwords)', async () => {

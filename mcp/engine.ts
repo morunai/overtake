@@ -88,6 +88,9 @@ let refCounter = 0;
 
 /** Refusals that mean "stop now", as opposed to transient page states worth retrying. */
 const HARD_STOP = new Set<string>([ErrorCode.USER_IN_CONTROL, ErrorCode.STOPPED, ErrorCode.NOT_OWNER, ErrorCode.SPACE_CLOSED, ErrorCode.TAB_CLOSED, ErrorCode.SPACE_NOT_FOUND, ErrorCode.TAB_NOT_IN_SPACE, ErrorCode.EXTENSION_NOT_CONNECTED, ErrorCode.AGENT_PAUSED_TIMEOUT]);
+export function isHardStop(code: string) {
+  return HARD_STOP.has(code);
+}
 function softFail<T>(fallback: T) {
   return (e: unknown): T => {
     if (e instanceof OvertakeError && HARD_STOP.has(e.code)) throw e;

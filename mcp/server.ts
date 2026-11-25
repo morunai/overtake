@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { BrokerClient } from './broker-client.ts';
 import { Engine, DEVICES } from './engine.ts';
 import { redactCdp } from './redact.ts';
+import { readScriptFile, runScript, scriptName } from './run.ts';
 import { OvertakeError, toWireError } from '../shared/protocol.ts';
 import { overtakeHome } from '../bridge/paths.ts';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -22,6 +23,7 @@ Rules:
 - Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages.
 - Pages often keep changing after load. To wait for an element, pass waitFor to browser_navigate or use browser_wait with a selector; do not guess with fixed delays.
 - SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
+- For many steps or repeated flows (test suites, filling many forms, checking many pages), write a script file once and run it with browser_run instead of one tool call per step. Re-run the same file after fixing it.
 - Pass snapshot: true to browser_click, browser_type, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
@@ -236,9 +238,47 @@ server.registerTool('browser_screenshot', {
 }));
 
 server.registerTool('browser_evaluate', {
-  description: 'Evaluate JavaScript in the page (console-style: top-level await allowed). Returns the JSON value or the exception. Use frameId (from browser_frames) for iframes.',
-  inputSchema: { tabId, expression: z.string(), frameId: z.string().optional(), awaitPromise: z.boolean().default(true), timeoutMs: z.number().int().max(120_000).optional() },
-}, wrap(async (a: { tabId: number; expression: string; frameId?: string; awaitPromise: boolean; timeoutMs?: number }) => engine.evaluate(a.tabId, a.expression, a)));
+  description: 'Evaluate JavaScript in the page (console-style: top-level await allowed). Returns the JSON value or the exception. Pass expression, or file (absolute path to a .js file) to run a script you wrote once without re-sending it. Use frameId (from browser_frames) for iframes.',
+  inputSchema: {
+    tabId, expression: z.string().optional(), file: z.string().optional().describe('Absolute path to a .js, .mjs or .cjs file (max 1 MB) whose contents are evaluated instead of expression.'),
+    frameId: z.string().optional(), awaitPromise: z.boolean().default(true), timeoutMs: z.number().int().max(120_000).optional(),
+  },
+}, wrap(async (a: { tabId: number; expression?: string; file?: string; frameId?: string; awaitPromise: boolean; timeoutMs?: number }) => {
+  if (!!a.expression === !!a.file) throw new OvertakeError('BAD_REQUEST', 'Pass exactly one of expression or file.');
+  return engine.evaluate(a.tabId, a.file ? readScriptFile(a.file) : a.expression!, a);
+}));
+
+server.registerTool('browser_run', {
+  description: [
+    'Run a whole flow from one script in this tab, so you are in the loop only at the start and the end. Write the script to a file once (file), then re-run it after fixes; or pass a short one inline (script).',
+    'The script is the body of an async function. Each call uses the same real input and checks as the tools:',
+    'click(target, {button, clickCount, force, humanlike, label}), type(target|null, text, {clear, submit, slowly}), fill(target, text), press(keys, {repeat}), hover(target), scroll({target, dx, dy}), drag(from, to), upload(target, files), dialog(accept, promptText),',
+    'navigate(url, {waitFor, waitUntil, timeoutMs}), wait(selector | ms | {selector, state, text, urlIncludes, function, networkIdleMs, load, timeoutMs}), sleep(ms), snapshot({scope}) -> text with @refs, url(), evaluate(expressionOrFunction, ...args) -> value in the page,',
+    'assert(condition, message), log(...values), console.log, args (your input). Targets are the same as the tools: @refs, CSS, "text=...", "xpath=...".',
+    'Errors are thrown into the script (e.code, e.message) and may be caught. Uncaught ones fail the run with the step, the script line and a snapshot of the page.',
+    'USER_IN_CONTROL, STOPPED and SPACE_CLOSED end the script at once, cannot be caught, and come back as a tool error. The return value of the script is returned as result.',
+  ].join(' '),
+  inputSchema: {
+    tabId,
+    file: z.string().optional().describe('Absolute path to a .js, .mjs or .cjs script file (max 1 MB).'),
+    script: z.string().max(100_000).optional().describe('The script inline, for short one-off flows.'),
+    args: z.unknown().optional().describe('Any JSON value, available to the script as args.'),
+    timeoutMs: z.number().int().min(1000).max(600_000).default(120_000).describe('Limit for the whole run.'),
+    maxSteps: z.number().int().min(1).max(5000).default(1000).describe('Limit on API calls.'),
+    ...snapshotOpts,
+  },
+}, wrap(async (a: { tabId: number; file?: string; script?: string; args?: unknown; timeoutMs: number; maxSteps: number } & SnapshotOpts) => {
+  if (!!a.file === !!a.script) throw new OvertakeError('BAD_REQUEST', 'Pass exactly one of file or script.');
+  const code = a.file ? readScriptFile(a.file) : a.script!;
+  const r = await runScript(engine, client, { tabId: a.tabId, code, filename: a.file || scriptName(), args: a.args, timeoutMs: a.timeoutMs, maxSteps: a.maxSteps });
+  if (r.hardStop) {
+    const where = [r.error?.step && `step ${r.error.step}`, r.error?.line && `line ${r.error.line}`].filter(Boolean).join(', ');
+    throw new OvertakeError(r.hardStop.code, `${r.hardStop.message} browser_run stopped${where ? ` at ${where}` : ''}; the steps before it ran.`);
+  }
+  const { hardStop: _h, lastActionAt, ...receipt } = r;
+  // A failed run always comes with the page, so the script can be fixed without another call.
+  return afterAction(a.tabId, receipt, { ...a, snapshot: a.snapshot || !r.ok }, lastActionAt);
+}));
 
 server.registerTool('browser_network', {
   description: 'Inspect network traffic captured since the tab was first used: list (filters), get (headers, post data, response body), or clear. Credentials (auth headers, cookies, token/password fields) are masked.',
