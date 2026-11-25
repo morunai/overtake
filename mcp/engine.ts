@@ -6,7 +6,7 @@
 import { writeFile, mkdir, stat, copyFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { BrokerClient } from './broker-client.ts';
+import { BrokerClient, requestScope } from './broker-client.ts';
 import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
@@ -457,14 +457,15 @@ export class Engine {
     const t = this.#tab(tabId);
     if (t.enabled) return t;
     if (!t.enabling) {
-      t.enabling = (async () => {
+      // Shared by every caller on this tab, so it runs outside any one run's scope.
+      t.enabling = requestScope.exit(() => (async () => {
         await this.cdp(tabId, 'Page.enable');
         await this.cdp(tabId, 'Page.setLifecycleEventsEnabled', { enabled: true }).catch(() => {});
         await this.cdp(tabId, 'Runtime.enable');
         await this.cdp(tabId, 'Network.enable', { maxPostDataSize: 65536 });
         await this.cdp(tabId, 'Log.enable').catch(() => {});
         t.enabled = true;
-      })().finally(() => {
+      })()).finally(() => {
         t.enabling = null;
       });
     }

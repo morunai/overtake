@@ -174,12 +174,13 @@ export type Operation =
   | 'tabs.adopt'
   | 'cdp'
   | 'input.batch'
-  | 'screenshot';
+  | 'screenshot'
+  | 'run.cancel';
 
 export const OPERATIONS: readonly Operation[] = [
   'hello', 'capabilities', 'spaces.list', 'spaces.create', 'spaces.close', 'spaces.switch', 'spaces.rename',
   'space.claim', 'space.release', 'space.handoff', 'space.resume', 'space.setStatus', 'space.markError',
-  'tabs.list', 'downloads.list', 'tabs.create', 'tabs.close', 'tabs.activate', 'tabs.navigate', 'tabs.adopt', 'cdp', 'input.batch', 'screenshot',
+  'tabs.list', 'downloads.list', 'tabs.create', 'tabs.close', 'tabs.activate', 'tabs.navigate', 'tabs.adopt', 'cdp', 'input.batch', 'screenshot', 'run.cancel',
 ];
 
 // ---------------------------------------------------------------------------

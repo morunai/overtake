@@ -45,8 +45,17 @@ function call(op: string, ...args: unknown[]): Promise<unknown> {
   const line = lineOf(new Error().stack);
   const id = ++seq;
   return new Promise((resolve, reject) => {
+    try {
+      port.postMessage({ type: 'call', id, op, args, line });
+    } catch (e) {
+      // Not cloneable (a function in the options, say): fail this call, nothing is pending.
+      const err = new Error(`Bad arguments to ${op}: ${(e as Error).message}`) as Error & { code: string; line?: number };
+      err.code = 'BAD_REQUEST';
+      err.line = line;
+      reject(err);
+      return;
+    }
     pending.set(id, { resolve, reject, line });
-    port.postMessage({ type: 'call', id, op, args, line });
   });
 }
 

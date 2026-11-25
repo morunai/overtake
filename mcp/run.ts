@@ -13,6 +13,7 @@
 // - Other errors are thrown into the script, which may catch them; if it does not, the run
 //   fails with the step, the script line and a snapshot of the page.
 import { Worker } from 'node:worker_threads';
+import { randomUUID } from 'node:crypto';
 import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { extname, isAbsolute, basename } from 'node:path';
 import { OvertakeError, ErrorCode, toWireError } from '../shared/protocol.ts';
@@ -131,10 +132,10 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
     unsubscribe();
     throw before;
   }
-  // Requests made for this run carry its deadline; the extension refuses ones still queued
-  // after it. On any end of the run the deadline moves to now, so later sub-steps of an
-  // action in flight are refused too.
-  const scope = { notAfter: t0 + o.timeoutMs };
+  // Requests made for this run carry its runId. When the run ends, run.cancel tells the
+  // extension to refuse any of them still queued (behind a pause, say), and later sub-steps
+  // of an action in flight are refused the same way.
+  const scope = { runId: randomUUID() };
   const logs: string[] = [];
   const trail: Step[] = [];
   let steps = 0;
@@ -198,7 +199,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
       if (ended) return;
       ended = true;
       queue.length = 0; // calls not started yet never run
-      scope.notAfter = Math.min(scope.notAfter, Date.now());
+      void requestScope.exit(() => client.request('run.cancel', { runId: scope.runId })).catch(() => {});
       clearTimeout(timer);
       unsubscribe();
       void worker.terminate().catch(() => {});

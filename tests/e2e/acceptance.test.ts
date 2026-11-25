@@ -224,6 +224,9 @@ test('browser_run from a file: errors carry the step, the line and a snapshot; c
     const chained = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn').then(() => click('#btn')); return 1;` })).content[0].text);
     assert.equal(chained.ok, true);
     assert.equal(await count(), n2 + 2, 'a chained call started after the return still runs');
+    const badArgs = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, timeoutMs: 5000, script: `let code; try { await click('#btn', { bad: () => 1 }); } catch (e) { code = e.code; } return code;` })).content[0].text);
+    assert.equal(badArgs.ok, true);
+    assert.equal(badArgs.result, 'BAD_REQUEST', 'uncloneable arguments fail that call only');
     const failedLater = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#nope-3', { force: true }); return 'early';` })).content[0].text);
     assert.equal(failedLater.ok, false, 'an unawaited call that fails fails the run');
     assert.equal(failedLater.error.code, 'ELEMENT_NOT_FOUND');
@@ -286,6 +289,10 @@ test('browser_run stops on a take-over even while the script is sleeping or busy
   await h.humanAction(ext, 'pause', s.spaceId);
   const r = JSON.parse((await A.callRaw('browser_run', { tabId: s.tabId, timeoutMs: 1500, script: `await click('#btn');` })).content[0].text);
   assert.equal(r.error.code, 'TIMEOUT');
+  // The same when the script fails early with a click still queued behind the pause.
+  const early = JSON.parse((await A.callRaw('browser_run', { tabId: s.tabId, script: `click('#btn'); await new Promise((r) => r()); throw new Error('early');` })).content[0].text);
+  assert.equal(early.ok, false);
+  assert.match(early.error.message, /early/);
   await h.humanAction(ext, 'resume', s.spaceId);
   await sleep(1000);
   assert.equal(await clicks(), c0, 'the timed-out click did not run after Resume');

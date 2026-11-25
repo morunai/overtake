@@ -10,9 +10,9 @@ import { OvertakeError, ErrorCode, PROTOCOL_VERSION } from '../shared/protocol.t
 import type { AgentEvent, Operation, ResponseMessage } from '../shared/protocol.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-/** Per-call context for requests: browser_run sets notAfter, its deadline, so the extension
- *  refuses commands that are still queued (for example behind a pause) once it has passed. */
-export const requestScope = new AsyncLocalStorage<{ notAfter?: number }>();
+/** Per-call context for requests: browser_run tags its requests with its runId, so the
+ *  extension can refuse ones still queued (for example behind a pause) after the run ends. */
+export const requestScope = new AsyncLocalStorage<{ runId: string }>();
 
 export interface BrokerClientOptions {
   socketPath?: string;
@@ -44,7 +44,9 @@ export class BrokerClient extends EventEmitter {
   /** Connect lazily; reconnects on the next request after a drop. */
   connect(): Promise<void> {
     if (this.#ready) return this.#ready;
-    this.#ready = new Promise<void>((resolve, reject) => {
+    // Outside any run's scope: the socket's callbacks (and requests made from event
+    // handlers) must not inherit the scope of whichever call happened to connect.
+    this.#ready = requestScope.exit(() => new Promise<void>((resolve, reject) => {
       const token = this.#opts.token ?? readToken();
       if (!token) {
         reject(new OvertakeError(ErrorCode.EXTENSION_NOT_CONNECTED, 'No Overtake token found. Run `npm run install:host` and load the extension in Chrome.'));
@@ -100,7 +102,7 @@ export class BrokerClient extends EventEmitter {
         this.#pending.clear();
         if (welcomed) this.emit('event', { type: 'extension', connected: false } satisfies AgentEvent);
       });
-    }).catch((e) => {
+    })).catch((e) => {
       this.#ready = null;
       throw e;
     });
@@ -118,7 +120,7 @@ export class BrokerClient extends EventEmitter {
 
   async request<T = unknown>(op: Operation, args: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
     const scope = requestScope.getStore();
-    if (scope?.notAfter !== undefined && args.notAfter === undefined) args = { ...args, notAfter: scope.notAfter };
+    if (scope && args.runId === undefined) args = { ...args, runId: scope.runId };
     if (this.#closed) throw new OvertakeError(ErrorCode.EXTENSION_NOT_CONNECTED, 'Client closed.');
     await this.connect();
     const sock = this.#sock;

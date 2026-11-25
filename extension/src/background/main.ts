@@ -272,12 +272,15 @@ const COMMAND_DEADLINE_MS = 45_000;
 /** Run an agent command for a space through its serialized, gated queue. A command
  *  that exceeds its deadline fails with TIMEOUT and frees the queue (chrome.debugger
  *  calls cannot be cancelled, but they must never wedge a Space). */
-function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promise<T>, opts: { tabId?: number; pausedTimeoutMs?: number; deadlineMs?: number; notAfter?: number } = {}): Promise<T> {
+/** browser_run runs that have ended (agentKey:runId): their queued commands must not run. */
+const endedRuns = new Set<string>();
+
+function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promise<T>, opts: { tabId?: number; pausedTimeoutMs?: number; deadlineMs?: number; runKey?: string } = {}): Promise<T> {
   return executorFor(s).submit(
     agentKey,
     async () => {
-      if (opts.notAfter !== undefined && Date.now() > opts.notAfter) {
-        throw new OvertakeError(ErrorCode.TIMEOUT, `${label} was still queued at the caller's deadline, so it did not run.`);
+      if (opts.runKey !== undefined && endedRuns.has(opts.runKey)) {
+        throw new OvertakeError(ErrorCode.STOPPED, `${label} was queued by a script run that has ended, so it did not run.`);
       }
       // Re-validate at execution time: the tab may have closed or left the space while queued.
       if (opts.tabId !== undefined) {
@@ -709,11 +712,17 @@ async function releaseInterception(s: Space) {
 }
 
 async function handleRequest(agentKey: string, op: Operation, args: Record<string, unknown>): Promise<unknown> {
-  // A caller deadline (epoch ms, same machine clock): a command still queued after it, for
-  // example behind a pause, is refused instead of running late (browser_run timeouts).
-  const notAfter = typeof args.notAfter === 'number' ? args.notAfter : undefined;
-  const gated = <T>(s: Space, key: string, label: string, fn: () => Promise<T>, opts: Parameters<typeof runGated>[4] = {}) => runGated(s, key, label, fn, { ...opts, notAfter });
+  // Commands made for a browser_run carry its runId. Once the run ends (run.cancel), any of
+  // them still queued, for example behind a pause, is refused instead of running late.
+  const runKey = typeof args.runId === 'string' ? `${agentKey}:${args.runId}` : undefined;
+  const gated = <T>(s: Space, key: string, label: string, fn: () => Promise<T>, opts: Parameters<typeof runGated>[4] = {}) => runGated(s, key, label, fn, { ...opts, runKey });
   switch (op) {
+    case 'run.cancel': {
+      if (typeof args.runId !== 'string') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'runId must be a string.');
+      endedRuns.add(`${agentKey}:${args.runId}`);
+      if (endedRuns.size > 1000) endedRuns.delete(endedRuns.values().next().value!);
+      return { cancelled: true };
+    }
     case 'hello':
       return { extensionVersion: chrome.runtime.getManifest().version, agentKey };
 
