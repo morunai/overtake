@@ -114,9 +114,10 @@ swallow the human's drags). If the page starts a native drag during the pointer 
 reports `Input.dragIntercepted` with the page's drag data; the burst skips its remaining
 pointer steps and runs `Input.dispatchDragEvent` steps (enter, over, drop) with that data
 instead. The permit admits `dragstart` at the press origin rather than the move's point.
-Native drag events reach the page even while Chrome ignores input, so the shield admits a
-`drop` only at the agent's drop step, at its point, and carrying its intercepted drag data; a
-human's drop during the burst is cancelled. A burst aborted mid-drag sends `dragCancel`, so
+Native drag events reach the page even while Chrome ignores input, so the agent's drag events
+carry an extra `application/x-overtake-drag` item with a fresh secret per burst, and the
+shield admits a `drop`, in any frame, only while the agent's drop is dispatched, once, and
+carrying that secret. A human's drop during the burst is cancelled, even with the same data. A burst aborted mid-drag sends `dragCancel`, so
 the page gets `dragend` and no drop.
 
 Measured in `tests/e2e/acceptance.test.ts`: **10,104–10,483 trusted human clicks during

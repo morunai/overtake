@@ -379,17 +379,29 @@ function permitFor(step: InputStep, held: boolean): Permit {
   }
   if (step.method === 'Input.dispatchDragEvent' && typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
     // Only drop is blocked by the shield (enter, over, leave and end are not). Native drag
-    // events reach the page even while Chrome ignores input, so a drop is admitted only at
-    // this point and only carrying the agent's intercepted drag data: a human drop is not.
+    // events reach the page even while Chrome ignores input, so a drop is admitted once, while
+    // this step is dispatched, and only carrying this burst's secret mark (see DRAG_MARK).
     if (p.type !== 'drop') return { types: [] };
-    const items = ((p.data as { items?: { mimeType: string; data: string }[] } | undefined)?.items || []).slice(0, 8);
-    return { types: ['drop'], x: p.x, y: p.y, drop: items.map((i) => ({ mimeType: i.mimeType, data: i.data.length <= 20_000 ? i.data : undefined })) };
+    const mark = (p.data as { items?: { mimeType: string; data: string }[] } | undefined)?.items?.find((i) => i.mimeType === DRAG_MARK);
+    return { types: mark ? ['drop'] : [], x: p.x, y: p.y, drop: mark ? [{ mimeType: DRAG_MARK, data: mark.data }] : [] };
   }
   if (step.method === 'Input.dispatchKeyEvent') {
     return { types: ['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'paste', 'cut'], key: typeof p.key === 'string' ? p.key : undefined };
   }
   if (step.method === 'Input.insertText' || step.method === 'Input.imeSetComposition') return { types: ['beforeinput', 'input', 'keydown', 'keyup'] };
   return { types: ['*'] };
+}
+
+/** Every agent drag event carries this type with a fresh secret per burst, and the shield
+ *  admits a drop only when it carries the current one: payload matching alone cannot tell the
+ *  agent's drop from a human's, since native drag events bypass Chrome's input gate. */
+const DRAG_MARK = 'application/x-overtake-drag';
+
+function markDrag(params: Record<string, unknown>, secret: string): Record<string, unknown> {
+  const data = params.data as { items?: { mimeType: string; data: string }[] } | undefined;
+  if (!data || typeof data !== 'object') return params;
+  const items = (Array.isArray(data.items) ? data.items : []).filter((i) => i?.mimeType !== DRAG_MARK);
+  return { ...params, data: { ...data, items: [...items, { mimeType: DRAG_MARK, data: secret }] } };
 }
 
 /** Native drags the page started during a drag burst (Input.dragIntercepted), by tab. */
@@ -412,6 +424,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   let dispatched = 0;
   let pressed: { x: number; y: number; button: string } | null = null;
   const watcher = (data: unknown) => (dragData ??= data);
+  const secret = crypto.randomUUID();
   try {
     // Set up inside the try, so the finally always undoes what was done.
     if (dragBurst) {
@@ -428,6 +441,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         if (!dragData) continue;
         step = { ...step, params: { ...step.params, data: dragData } };
       }
+      if (step.method === 'Input.dispatchDragEvent') step = { ...step, params: markDrag(step.params, secret) };
       if (step.delayMs) await new Promise((r) => setTimeout(r, Math.min(step.delayMs!, 2000)));
       if (step.drag === 'pointer' && dragData) continue; // intercepted during the delay
       const d = gate(s.ctl, agentKey);
@@ -449,16 +463,21 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
           last = { x: p.x, y: p.y };
         }
       }
-      // Tell the top frame exactly which trusted events this step will produce.
-      if (shield) await sendTopAcked(tabId, { type: 'overtake:permit', permit: permitFor(step, pressed !== null) });
+      // Tell the top frame exactly which trusted events this step will produce. A native drop
+      // bypasses Chrome's input gate, so its permit goes to every frame (the drop may land in
+      // an iframe) and is revoked right after the dispatch.
+      const isDrop = step.method === 'Input.dispatchDragEvent' && (step.params as { type?: string }).type === 'drop';
+      const permit = permitFor(step, pressed !== null);
+      if (shield) await (isDrop ? sendAllFramesAcked(tabId, { type: 'overtake:permit', permit }) : sendTopAcked(tabId, { type: 'overtake:permit', permit }));
       await setNativeIgnore(tabId, false);
       try {
         await dbg.send(tabId, step.method, step.params, step.sessionId);
       } finally {
         await setNativeIgnore(tabId, true).catch(() => {});
+        if (shield && isDrop) await sendAllFramesAcked(tabId, { type: 'overtake:permit', permit: null }).catch(() => 0);
       }
       dispatched++;
-      if (step.method === 'Input.dispatchDragEvent' && (step.params as { type?: string }).type === 'drop') dropped = true;
+      if (isDrop) dropped = true;
     }
   } catch (e) {
     // Never leave a native drag or a held button in the page after an aborted burst.

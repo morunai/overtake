@@ -603,27 +603,35 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const r = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `return (await drag('text=Native two', '#bin')).kind;` })).content[0].text);
   assert.equal(r.result, 'html5');
   assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n2');
-  // A human's native drop while the agent drags natively never lands: the shield admits a
-  // drop only at the agent's drop step and carrying its intercepted drag data. (The human's
-  // drag events end Chrome's drag session, so the agent's drop is lost too; only the human's
-  // getting through matters here.)
-  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?human-drop=1` });
-  const hp = await h.humanSession('drag.html?human-drop=1');
-  const bin = await h.eval<{ x: number; y: number }>(hp, `(() => { const r = document.getElementById('bin').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
-  let done = false;
-  // The agent drops at the same point the human does, so only the drag data tells them apart.
-  const agentDrag = A.callRaw('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: `${bin.x},${bin.y}` }).finally(() => (done = true));
-  for (let i = 0; i < 200 && !done && !(await h.eval<string[]>(hp, 'dragLog')).length; i++) await sleep(5);
-  let tries = 0;
-  while (!done) {
-    await h.humanDrop(hp, bin.x, bin.y, 'HUMAN');
-    tries++;
-    await sleep(5);
+  // A native drop into an iframe works too.
+  const df = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native three', to: '#frame' });
+  assert.equal(df.kind, 'html5');
+  assert.ok(((await ev('dragLog')) as string[]).includes('frame:n3'), 'dropped into the iframe');
+  // A human's native drop while the agent drags natively never lands, in the page or in an
+  // iframe, even carrying the agent's own drag data: native drag events bypass Chrome's input
+  // gate, so the shield admits one drop only while the agent's drop is dispatched. The human
+  // drop adds text/html, so the page can tell whose drop it got. (The human's drag events end
+  // Chrome's drag session, so the agent's drop is lost too; only the human's matters here.)
+  for (const [i, where] of ['#bin', '#frame'].entries()) {
+    await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?human-drop=${i}` });
+    const hp = await h.humanSession(`drag.html?human-drop=${i}`);
+    const pt = await h.eval<{ x: number; y: number }>(hp, `(() => { const r = document.querySelector('${where}').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    let done = false;
+    // The agent drops at the very point the human does.
+    const agentDrag = A.callRaw('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: `${pt.x},${pt.y}` }).finally(() => (done = true));
+    for (let k = 0; k < 200 && !done && !(await h.eval<string[]>(hp, 'dragLog')).length; k++) await sleep(5);
+    let tries = 0;
+    while (!done) {
+      await h.humanDrop(hp, pt.x, pt.y, 'n1', '<b>human</b>');
+      tries++;
+      await sleep(5);
+    }
+    const ad = JSON.parse((await agentDrag).content[0].text);
+    assert.equal(ad.kind, 'html5', `${where}: the agent drag was native`);
+    assert.ok(tries > 3, `${where}: human dropped ${tries} times`);
+    const log = await h.eval<string[]>(hp, 'dragLog');
+    assert.ok(!log.some((l) => l.endsWith('+html')), `${where}: the human drop was blocked: ${log.join(' ')}`);
   }
-  const ad = JSON.parse((await agentDrag).content[0].text);
-  assert.equal(ad.kind, 'html5', 'the agent drag was native');
-  assert.ok(tries > 3, `human dropped ${tries} times`);
-  assert.ok(!(await h.eval<string[]>(hp, 'dragLog')).includes('bin:HUMAN'), 'the human drop was blocked');
   // A take-over in the middle of a native drag cancels it: the page gets dragend, no drop.
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?takeover=1` });
   const page = await h.humanSession('drag.html?takeover=1');

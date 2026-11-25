@@ -144,8 +144,9 @@ export class Harness {
   }
 
   /** A human native drop of plain text (drag events reach the page even while Chrome ignores input). */
-  async humanDrop(sessionId: string, x: number, y: number, text: string) {
-    const data = { items: [{ mimeType: 'text/plain', data: text }], dragOperationsMask: 1 };
+  async humanDrop(sessionId: string, x: number, y: number, text: string, html?: string) {
+    const items = [{ mimeType: 'text/plain', data: text }, ...(html ? [{ mimeType: 'text/html', data: html }] : [])];
+    const data = { items, dragOperationsMask: 1 };
     for (const type of ['dragEnter', 'dragOver', 'drop']) await this.browser.send('Input.dispatchDragEvent', { type, x, y, data }, sessionId);
   }
 

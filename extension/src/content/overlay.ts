@@ -61,7 +61,8 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
     if (!permit || Date.now() > permit.until) return false;
     if (permit.loose?.includes(e.type)) return true;
     if (!permit.types.includes('*') && !permit.types.includes(e.type)) return false;
-    if (permit.x !== undefined && 'clientX' in e) {
+    // Subframes have their own coordinates; only drop permits reach them.
+    if (isTop && permit.x !== undefined && 'clientX' in e) {
       const me = e as MouseEvent;
       if (Math.abs(me.clientX - permit.x) > 2 || Math.abs(me.clientY - permit.y!) > 2) return false;
     }
@@ -75,6 +76,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
         if (!dt.types.includes(item.mimeType)) return false;
         if (item.data !== undefined && dt.getData(item.mimeType) !== item.data) return false;
       }
+      permit = { ...permit, types: permit.types.filter((t) => t !== 'drop'), drop: undefined }; // one drop per permit
     }
     return true;
   }
@@ -82,7 +84,9 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   function onInput(e: Event) {
     if (!alive || !state?.shield || !e.isTrusted) return;
     if (host && e.composedPath().includes(host)) return; // the dock stays usable
-    if (pass && (!isTop || permitted(e))) return;
+    // Subframes rely on Chrome's input gate during a burst, except for drops: native drag
+    // events bypass it, so a drop needs a permit in every frame.
+    if (pass && (isTop || e.type === 'drop' ? permitted(e) : true)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
   }
@@ -610,7 +614,7 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
         sendResponse('ack');
         return false;
       case 'overtake:permit':
-        permit = { ...msg.permit, until: Date.now() + 1500 };
+        permit = msg.permit ? { ...msg.permit, until: Date.now() + 1500 } : null;
         sendResponse('ack');
         return false;
       case 'overtake:hidden':

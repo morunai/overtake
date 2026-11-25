@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Drop Frame</title>
+<style>html, body { margin: 0; height: 100%; } #fbin { height: 100%; background: #e9d5ff; font: 14px system-ui; display: grid; place-items: center; }</style>
+</head>
+<body>
+<div id="fbin">Frame drop zone</div>
+<script>
+  const fbin = document.getElementById('fbin');
+  fbin.addEventListener('dragover', (e) => e.preventDefault());
+  fbin.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const html = e.dataTransfer.getData('text/html');
+    parent.dragLog.push('frame:' + e.dataTransfer.getData('text/plain') + (html ? '+html' : ''));
+  });
+</script>
+</body>
+</html>
