@@ -4,12 +4,16 @@
 //
 // Stops:
 // - A hard stop (USER_IN_CONTROL, STOPPED, SPACE_CLOSED, ...) terminates the worker at once,
-//   so a script cannot catch the error and keep going after the human takes over.
+//   so a script cannot catch the error and keep going after the human takes over. It is seen
+//   from control events too, so a script that is sleeping or busy is stopped as well.
 // - The total timeout and the step limit also terminate it.
+// - Calls run one at a time, in order. When the run ends, calls not started yet are dropped;
+//   the one in flight (a single action, such as one click) finishes. A script that returns
+//   without awaiting its calls still has them run before success is reported.
 // - Other errors are thrown into the script, which may catch them; if it does not, the run
 //   fails with the step, the script line and a snapshot of the page.
 import { Worker } from 'node:worker_threads';
-import { readFileSync, statSync } from 'node:fs';
+import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { extname, isAbsolute, basename } from 'node:path';
 import { OvertakeError, ErrorCode, toWireError } from '../shared/protocol.ts';
 import { isHardStop, type Engine } from './engine.ts';
@@ -18,18 +22,36 @@ import type { BrokerClient } from './broker-client.ts';
 const SCRIPT_EXT = new Set(['.js', '.mjs', '.cjs']);
 const MAX_SCRIPT_BYTES = 1024 * 1024;
 
-/** Read an agent-written script file: absolute path, .js/.mjs/.cjs, at most 1 MB. */
+/** Read an agent-written script file: absolute path, a regular .js/.mjs/.cjs file, at most 1 MB.
+ *  Opened non-blocking and checked on the descriptor, so a FIFO or device cannot hang the server. */
 export function readScriptFile(path: string): string {
   if (!isAbsolute(path)) throw new OvertakeError(ErrorCode.BAD_REQUEST, `file must be an absolute path: ${path}`);
   if (!SCRIPT_EXT.has(extname(path).toLowerCase())) throw new OvertakeError(ErrorCode.BAD_REQUEST, `file must be a .js, .mjs or .cjs file: ${path}`);
-  let size: number;
+  let fd: number;
   try {
-    size = statSync(path).size;
-  } catch {
-    throw new OvertakeError(ErrorCode.BAD_REQUEST, `file not found: ${path}`);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (e) {
+    throw new OvertakeError(ErrorCode.BAD_REQUEST, `cannot open ${path}: ${(e as NodeJS.ErrnoException).code || (e as Error).message}`);
   }
-  if (size > MAX_SCRIPT_BYTES) throw new OvertakeError(ErrorCode.BAD_REQUEST, `file is larger than 1 MB: ${path}`);
-  return readFileSync(path, 'utf8');
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new OvertakeError(ErrorCode.BAD_REQUEST, `not a regular file: ${path}`);
+    if (st.size > MAX_SCRIPT_BYTES) throw new OvertakeError(ErrorCode.BAD_REQUEST, `file is larger than 1 MB: ${path}`);
+    const buf = Buffer.alloc(MAX_SCRIPT_BYTES + 1);
+    let len = 0;
+    for (;;) {
+      const n = readSync(fd, buf, len, buf.length - len, null);
+      if (n === 0) break;
+      len += n;
+      if (len > MAX_SCRIPT_BYTES) throw new OvertakeError(ErrorCode.BAD_REQUEST, `file is larger than 1 MB: ${path}`);
+    }
+    return buf.subarray(0, len).toString('utf8');
+  } catch (e) {
+    if (e instanceof OvertakeError) throw e;
+    throw new OvertakeError(ErrorCode.BAD_REQUEST, `cannot read ${path}: ${(e as NodeJS.ErrnoException).code || (e as Error).message}`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export interface RunOptions {
@@ -67,16 +89,26 @@ export interface RunOutcome {
 const MAX_LOGS = 200;
 const MAX_TRAIL = 40;
 
-function short(v: unknown, n = 60) {
-  const s = typeof v === 'string' ? v : JSON.stringify(v) ?? '';
+function short(v: unknown, n = 60): string {
+  let s: string;
+  try {
+    s = typeof v === 'string' ? v : JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? `${x}n` : x)) ?? String(v);
+  } catch {
+    s = Object.prototype.toString.call(v);
+  }
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
 type Opts = Record<string, unknown> | undefined;
+type Call = { id: number; op: string; args?: unknown[]; line?: number };
+type Where = { step?: number; op?: string; line?: number };
 
 export async function runScript(engine: Engine, client: BrokerClient, o: RunOptions): Promise<RunOutcome> {
   const { tabId } = o;
   const spaceId = await engine.spaceOf(tabId);
+  await engine.listSpaces(); // fresh control state for the stop checks below
+  const before = engine.controlLost(spaceId);
+  if (before) throw before;
   const t0 = Date.now();
   const logs: string[] = [];
   const trail: Step[] = [];
@@ -97,7 +129,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
   };
 
   const ops: Record<string, (...a: any[]) => Promise<unknown>> = {
-    click: (target: string, opts: Opts) => acting(() => engine.click(tabId, target, { label: `script: click`, ...opts })),
+    click: (target: string, opts: Opts) => acting(() => engine.click(tabId, target, { label: 'script: click', ...opts })),
     type: (target: string | null, text: string, opts: Opts) => acting(() => engine.type(tabId, { ...opts, target: target ?? undefined, text: String(text) })),
     fill: (target: string, text: string, opts: Opts) => acting(() => engine.type(tabId, { ...opts, target, text: String(text), clear: true })),
     press: (keys: string, opts: Opts) => acting(() => engine.press(tabId, keys, Number(opts?.repeat ?? 1))),
@@ -121,7 +153,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
     },
     url: async () => (await engine.pageInfo(tabId)).url,
     evaluate: async (expression: string) => {
-      const r = await engine.evaluate(tabId, expression);
+      const r = await engine.evaluate(tabId, String(expression));
       if (!r.ok) throw new OvertakeError('PAGE_EXCEPTION', String(r.exception));
       return r.value;
     },
@@ -130,55 +162,99 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
   const worker = new Worker(new URL('./run-worker.ts', import.meta.url), { resourceLimits: { maxOldGenerationSizeMb: 256 } });
   status('Running a script', true);
 
+  let unsubscribe = () => {};
   const outcome = await new Promise<RunOutcome>((resolve) => {
-    let settled = false;
+    let ended = false;
+    let active: (Where & { started: number }) | null = null;
+    const queue: Call[] = [];
+    let pumping: Promise<void> | null = null;
+    let drained: (() => void) | null = null;
+
     const finish = (r: Omit<RunOutcome, 'steps' | 'ms' | 'logs' | 'trail' | 'lastActionAt'>) => {
-      if (settled) return;
-      settled = true;
+      if (ended) return;
+      ended = true;
+      queue.length = 0; // calls not started yet never run
       clearTimeout(timer);
-      void worker.terminate();
+      unsubscribe();
+      void worker.terminate().catch(() => {});
       resolve({ ...r, steps, ms: Date.now() - t0, logs, trail: trail.slice(-MAX_TRAIL), lastActionAt });
     };
-    const timer = setTimeout(() => finish({ ok: false, error: { code: ErrorCode.TIMEOUT, message: `The script did not finish within ${o.timeoutMs} ms.`, step: steps } }), o.timeoutMs);
+    const hardStop = (code: string, message: string, where: Where = active ?? {}) =>
+      finish({ ok: false, hardStop: { code, message }, error: { code, message, ...where } });
+    const fail = (error: RunOutcome['error'] & object) => finish({ ok: false, error });
 
-    worker.on('message', async (m: any) => {
-      if (settled) return;
-      if (m.type === 'log') {
-        if (logs.length < MAX_LOGS) logs.push(String(m.text).slice(0, 2000));
-        else if (logs.length === MAX_LOGS) logs.push('(more logs dropped)');
-        return;
+    const timer = setTimeout(() => fail({ code: ErrorCode.TIMEOUT, message: `The script did not finish within ${o.timeoutMs} ms.`, ...(active ?? { step: steps }) }), o.timeoutMs);
+
+    // Control changes stop the run at once, even while the script sleeps or computes.
+    unsubscribe = engine.subscribe((e) => {
+      if (ended) return;
+      if (e.type === 'extension' && !e.connected) return hardStop(ErrorCode.EXTENSION_NOT_CONNECTED, 'The Overtake extension disconnected.');
+      if (e.type === 'space-closed' && e.spaceId === spaceId) return hardStop(ErrorCode.SPACE_CLOSED, e.reason || `Space ${spaceId} was closed.`);
+      if (e.type === 'control' && e.space.spaceId === spaceId) {
+        const lost = engine.controlLost(spaceId);
+        if (lost) hardStop(lost.code, lost.message);
       }
-      if (m.type === 'done') return finish({ ok: true, result: m.value });
-      if (m.type === 'fail') {
-        const last = trail[trail.length - 1];
-        return finish({ ok: false, error: { ...m.error, ...(last && !last.ok ? { step: last.n, op: last.op } : {}) } });
-      }
-      if (m.type !== 'call') return;
+    });
+
+    const runOne = async (m: Call) => {
       const n = ++steps;
-      if (n > o.maxSteps) {
-        return finish({ ok: false, error: { code: 'STEP_LIMIT', message: `The script went over maxSteps (${o.maxSteps}).`, step: n, op: m.op, line: m.line } });
-      }
-      const fn = ops[m.op];
-      const detail = m.args?.length ? short(m.args.filter((a: unknown) => a !== undefined && a !== null).slice(0, 2).map((a: unknown) => short(a, 40)).join(' ')) : undefined;
+      if (n > o.maxSteps) return fail({ code: 'STEP_LIMIT', message: `The script went over maxSteps (${o.maxSteps}).`, step: n, op: m.op, line: m.line });
+      const args = Array.isArray(m.args) ? m.args : [];
+      const detail = args.length ? short(args.filter((a) => a !== undefined && a !== null).slice(0, 2).map((a) => short(a, 40)).join(' ')) : undefined;
+      const where: Where = { step: n, op: m.op, line: m.line };
+      active = { ...where, started: Date.now() };
       status(`Script step ${n}: ${m.op}${detail ? ` ${detail}` : ''}`);
       const s0 = Date.now();
       try {
+        const fn = Object.hasOwn(ops, m.op) ? ops[m.op] : undefined;
         if (!fn) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Unknown script call ${m.op}.`);
-        const value = await fn(...(m.args ?? []));
+        const value = await fn(...args);
         trail.push({ n, op: m.op, detail, line: m.line, ms: Date.now() - s0, ok: true });
-        if (!settled) worker.postMessage({ type: 'reply', id: m.id, ok: true, value });
+        if (!ended) worker.postMessage({ type: 'reply', id: m.id, ok: true, value });
       } catch (e) {
         const w = toWireError(e);
         trail.push({ n, op: m.op, detail, line: m.line, ms: Date.now() - s0, ok: false });
-        if (isHardStop(w.code)) {
-          // Terminate now: the script must not be able to catch this and continue.
-          return finish({ ok: false, hardStop: { code: w.code, message: w.message }, error: { code: w.code, message: w.message, step: n, op: m.op, line: m.line } });
+        // Terminate now: the script must not be able to catch this and continue.
+        if (isHardStop(w.code)) return hardStop(w.code, w.message, where);
+        if (!ended) worker.postMessage({ type: 'reply', id: m.id, ok: false, error: { code: w.code, message: w.message, ...where } });
+      } finally {
+        active = null;
+      }
+    };
+
+    // One call at a time, in order (the Engine serializes per Space anyway).
+    const pump = () => {
+      if (pumping) return;
+      pumping = (async () => {
+        while (!ended && queue.length) await runOne(queue.shift()!);
+        pumping = null;
+        drained?.();
+      })().catch((e) => fail({ code: ErrorCode.INTERNAL, message: (e as Error).message }));
+    };
+
+    worker.on('message', (m: any) => {
+      if (ended) return;
+      try {
+        if (m.type === 'log') {
+          if (logs.length < MAX_LOGS) logs.push(String(m.text).slice(0, 2000));
+          else if (logs.length === MAX_LOGS) logs.push('(more logs dropped)');
+        } else if (m.type === 'call') {
+          queue.push(m);
+          pump();
+        } else if (m.type === 'done') {
+          // Calls the script started but did not await still run before success is reported.
+          const ok = () => finish({ ok: true, result: m.value });
+          if (!pumping && !queue.length) ok();
+          else drained = () => { if (!queue.length && !pumping) ok(); };
+        } else if (m.type === 'fail') {
+          fail(m.error);
         }
-        if (!settled) worker.postMessage({ type: 'reply', id: m.id, ok: false, error: { code: w.code, message: w.message } });
+      } catch (e) {
+        fail({ code: ErrorCode.INTERNAL, message: (e as Error).message });
       }
     });
-    worker.on('error', (e: Error) => finish({ ok: false, error: { code: 'SCRIPT_ERROR', message: e.message, step: steps } }));
-    worker.on('exit', (code) => finish({ ok: false, error: { code: 'SCRIPT_ERROR', message: `The script worker exited (${code}).`, step: steps } }));
+    worker.on('error', (e: Error) => fail({ code: 'SCRIPT_ERROR', message: e.message, ...(active ?? { step: steps }) }));
+    worker.on('exit', (code) => fail({ code: 'SCRIPT_ERROR', message: `The script worker exited (${code}).`, ...(active ?? { step: steps }) }));
     worker.postMessage({ type: 'start', code: o.code, filename: o.filename, args: o.args ?? null });
   });
 

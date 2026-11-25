@@ -39,13 +39,35 @@ Turns dropped as estimated (37 to 24); cost only slightly (about 5%). Wall time 
 model time per turn went up (bigger results to read), and one run is too few to say more. A
 multi-run benchmark would settle it.
 
-### Not now: `browser_batch`
+## Done: `browser_run` (run a flow from one script)
 
-A tool running several actions plus a final wait and snapshot could cut turns further (estimate:
-37 → ~12). It also brings harder problems:
-- partial failure and error reporting mid-batch;
-- applying the hard-stop rules when the human takes over inside a batch;
-- the model planning several steps blind. In the benchmark, the batching agent on the other side
-  fell back to fixed sleeps.
+Agents asked for a way to write a flow once and run it, instead of one tool call (and one model
+turn) per step. `browser_run` runs a script file (or an inline script) in a worker. Each API call
+goes through the same Engine methods as the tools, so real input, top-hit checks and settle all
+apply. `browser_evaluate` also takes a `file`.
 
-Reconsider after the snapshot option is in use.
+How the hard problems above were handled:
+- Errors are thrown into the script, which may catch them. Uncaught ones fail the run with the
+  step, the script line and a snapshot of the page, so the agent can fix and re-run the file.
+- Hard stops (take-over, stop, Space closed, extension gone) terminate the worker at once, seen
+  from errors and from control events, so a sleeping or busy script is stopped too. The script
+  cannot catch them.
+- Calls run one at a time in order. When a run ends, calls not started yet are dropped.
+- The timeout and step limit hold even for a busy loop (the worker is terminated).
+
+Results (`bench/agent.ts --only overtake`, 1 run each, main vs this change):
+
+| questions | | main | browser_run |
+|---|---|---|---|
+| 5 | wall | 42.0 s | 43.9 s |
+| 5 | turns / tool calls | 24 / 23 | 24 / 23 |
+| 5 | cost | $0.365 | $0.373 |
+| 20 | wall | 116.2 s | 44.1 s |
+| 20 | turns / tool calls | 69 / 68 | 10 / 9 |
+| 20 | cost | $0.934 | $0.257 |
+| 20 | checkpoints | 25/25 | 25/25 |
+
+On 5 questions the agent did not choose `browser_run` (stepping was simpler), so nothing changed.
+On 20 it explored the first question step by step, then ran the rest from one script: 2.6x faster
+and 3.6x cheaper, with every checkpoint. One run each; the direction is clear, the exact factor
+is not.

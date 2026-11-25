@@ -209,6 +209,23 @@ test('browser_run from a file: errors carry the step, the line and a snapshot; c
     const bad = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `await click('#btn');\nconst = 1;` })).content[0].text);
     assert.equal(bad.ok, false);
     assert.equal(bad.error.code, 'SCRIPT_SYNTAX_ERROR');
+    assert.equal(bad.error.line, 2, 'syntax errors point at the line');
+    // Rethrowing an older error keeps its own step and line.
+    const kept = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `let first;\ntry { await click('#nope-1', { force: true }); } catch (e) { first = e; }\ntry { await click('#nope-2', { force: true }); } catch {}\nthrow first;` })).content[0].text);
+    assert.equal(kept.error.code, 'ELEMENT_NOT_FOUND');
+    assert.equal(kept.error.step, 1);
+    assert.equal(kept.error.line, 2);
+    // Calls the script did not await still run before success is reported.
+    const n0 = await count();
+    const unawaited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn'); click('#btn'); return 'early';` })).content[0].text);
+    assert.equal(unawaited.ok, true);
+    assert.equal(await count(), n0 + 2, 'both clicks ran, in order, before the result');
+    // Over the step limit, calls already queued never run.
+    const n1 = await count();
+    const limited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (let i = 0; i < 6; i++) click('#btn'); await sleep(1500);`, maxSteps: 2 })).content[0].text);
+    assert.equal(limited.error.code, 'STEP_LIMIT');
+    await sleep(500);
+    assert.equal(await count(), n1 + 2, 'nothing ran after the limit');
     // The run limits hold.
     const many = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (;;) await url();`, maxSteps: 5 })).content[0].text);
     assert.equal(many.error.code, 'STEP_LIMIT');
@@ -238,6 +255,24 @@ test('browser_run stops at once when the human stops the agent, even if the scri
   assert.equal(await h.eval<string>(page, `document.getElementById('count').dataset.count`), after, 'no click after the stop');
   assert.ok(Number(after) > 2, `the script ran before the stop (${after} clicks)`);
   await h.humanAction(ext, 'close', s.spaceId);
+});
+
+test('browser_run stops on a take-over even while the script is sleeping or busy', async () => {
+  const s = await A.call('spaces_create', { name: 'script takeover', url: `${SITE}/?script-takeover=1` });
+  await A.call('browser_wait', { tabId: s.tabId, load: true });
+  for (const body of [`await sleep(10000); await click('#btn');`, `for (;;) {}`]) {
+    const t0 = Date.now();
+    const run = A.callRaw('browser_run', { tabId: s.tabId, timeoutMs: 20_000, script: body });
+    await sleep(800);
+    await h.humanAction(ext, 'takeover', s.spaceId);
+    const r = await run;
+    assert.ok(r.isError, body);
+    assert.match(r.content[0].text, /^USER_IN_CONTROL/, body);
+    assert.ok(Date.now() - t0 < 4000, `stopped at once (${Date.now() - t0} ms): ${body}`);
+    await h.humanAction(ext, 'giveback', s.spaceId);
+    await A.call('space_wait_for_control', { spaceId: s.spaceId, timeoutMs: 5000 });
+  }
+  await A.call('spaces_close', { spaceId: s.spaceId });
 });
 
 test('network results mask credentials (headers, cookies, tokens, passwords)', async () => {

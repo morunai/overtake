@@ -231,7 +231,36 @@ export class Engine {
     this.#gone.delete(tabId);
   }
 
+  #listeners = new Set<(e: AgentEvent) => void>();
+
+  /** Observe broker events (after the engine has applied them). Returns an unsubscribe. */
+  subscribe(fn: (e: AgentEvent) => void): () => void {
+    this.#listeners.add(fn);
+    return () => this.#listeners.delete(fn);
+  }
+
+  /** Why this agent can no longer drive the Space, from the latest known state; null while it
+   *  can (a pause only queues commands). */
+  controlLost(spaceId: number): OvertakeError | null {
+    const s = this.#spaces.get(spaceId);
+    if (!s) return new OvertakeError(ErrorCode.SPACE_CLOSED, `Space ${spaceId} was closed.`);
+    if (s.control === 'AGENT_PAUSED' && s.owner === this.client.agentKey) return null;
+    if (s.owner !== this.client.agentKey || s.control !== 'AGENT_CONTROL') return this.#lostControl(s);
+    return null;
+  }
+
   #onEvent(e: AgentEvent) {
+    this.#applyEvent(e);
+    for (const fn of this.#listeners) {
+      try {
+        fn(e);
+      } catch {
+        /* a listener must not break event handling */
+      }
+    }
+  }
+
+  #applyEvent(e: AgentEvent) {
     switch (e.type) {
       case 'control':
         this.#spaces.set(e.space.spaceId, e.space);

@@ -7,7 +7,7 @@ import { parentPort } from 'node:worker_threads';
 import vm from 'node:vm';
 
 type Start = { type: 'start'; code: string; filename: string; args: unknown };
-type Reply = { type: 'reply'; id: number; ok: boolean; value?: unknown; error?: { code: string; message: string } };
+type Reply = { type: 'reply'; id: number; ok: boolean; value?: unknown; error?: { code: string; message: string; step?: number; op?: string; line?: number } };
 
 const port = parentPort!;
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void; line?: number }>();
@@ -96,13 +96,22 @@ function start(m: Start) {
 }
 
 function fail(e: unknown) {
-  const err = e as { name?: string; message?: string; code?: string; stack?: string; line?: number };
+  // The step, op and line travel with the error itself, so rethrowing an older error still
+  // points at the call that raised it.
+  const err = (e ?? {}) as { name?: string; message?: string; code?: unknown; stack?: string; line?: number; step?: number; op?: string };
+  let message: string;
+  try {
+    message = typeof err.message === 'string' ? err.message : String(e);
+  } catch {
+    message = 'Script error';
+  }
   port.postMessage({
     type: 'fail',
     error: {
-      code: err?.code || (err?.name === 'SyntaxError' ? 'SCRIPT_SYNTAX_ERROR' : 'SCRIPT_ERROR'),
-      message: err?.message ?? String(e),
-      line: err?.line ?? lineOf(err?.stack),
+      code: typeof err.code === 'string' && err.code ? err.code : err.name === 'SyntaxError' ? 'SCRIPT_SYNTAX_ERROR' : 'SCRIPT_ERROR',
+      message,
+      line: typeof err.line === 'number' ? err.line : lineOf(err.stack),
+      ...(typeof err.step === 'number' ? { step: err.step, op: err.op } : {}),
     },
   });
 }
@@ -115,9 +124,11 @@ port.on('message', (m: Start | Reply) => {
     pending.delete(m.id);
     if (m.ok) p.resolve(m.value);
     else {
-      const e = new Error(m.error!.message) as Error & { code: string; line?: number };
+      const e = new Error(m.error!.message) as Error & { code: string; line?: number; step?: number; op?: string };
       e.code = m.error!.code;
       e.line = p.line;
+      e.step = m.error!.step;
+      e.op = m.error!.op;
       p.reject(e);
     }
   }
