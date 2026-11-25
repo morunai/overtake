@@ -20,6 +20,8 @@ const INSTRUCTIONS = `Overtake drives the user's real Google Chrome through agen
 Rules:
 - Work inside a Space you own. Create one per user goal (spaces_create) and keep using its spaceId; it starts with one tab.
 - Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages.
+- Pages often keep changing after load. To wait for an element, pass waitFor to browser_navigate or use browser_wait with a selector; do not guess with fixed delays.
+- SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
 - Pass snapshot: true to browser_click, browser_type, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
@@ -185,9 +187,21 @@ server.registerTool('browser_tabs', {
 }));
 
 server.registerTool('browser_navigate', {
-  description: 'Navigate a tab and wait for load.',
-  inputSchema: { tabId, url: z.string(), waitUntil: z.enum(['load', 'commit', 'none']).default('load'), timeoutMs: z.number().int().max(120_000).default(30_000), ...snapshotOpts },
-}, wrap(async (a: { tabId: number; url: string; waitUntil: 'load' | 'commit' | 'none'; timeoutMs: number } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.navigate(a.tabId, a.url, a), a, t0); }));
+  description: 'Navigate a tab and wait for load. Apps often keep changing after load (redirects, client rendering): pass waitFor with a selector to also wait until that element is visible.',
+  inputSchema: {
+    tabId, url: z.string(), waitUntil: z.enum(['load', 'commit', 'none']).default('load'), timeoutMs: z.number().int().max(120_000).default(30_000),
+    waitFor: z.string().optional().describe('Selector or "text=..." that must be visible before this returns, e.g. "#add-card-btn". Fails with TIMEOUT if it does not appear within timeoutMs.'),
+    ...snapshotOpts,
+  },
+}, wrap(async (a: { tabId: number; url: string; waitUntil: 'load' | 'commit' | 'none'; timeoutMs: number; waitFor?: string } & SnapshotOpts) => {
+  const t0 = Date.now();
+  let r: Record<string, unknown> = await engine.navigate(a.tabId, a.url, a);
+  if (a.waitFor) {
+    await engine.wait(a.tabId, { selector: a.waitFor, state: 'visible', timeoutMs: Math.max(1000, a.timeoutMs - (Date.now() - t0)) });
+    r = { ...r, ...(await engine.pageInfo(a.tabId)), found: a.waitFor };
+  }
+  return afterAction(a.tabId, r, a, t0);
+}));
 
 server.registerTool('browser_wait', {
   description: 'Wait until all given conditions hold: selector state, page text, URL substring, JS predicate, network idle, or load complete. Use delayMs for a plain pause (do not use page timers for delays). Fails immediately with USER_IN_CONTROL if the human takes over.',

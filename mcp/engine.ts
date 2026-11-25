@@ -95,6 +95,12 @@ function softFail<T>(fallback: T) {
   };
 }
 
+/** CDP errors meaning the page's JS context went away under the call (a navigation or reload). */
+const CONTEXT_GONE = /Execution context was destroyed|Cannot find context with specified id|Inspected target navigated or closed/i;
+function contextGone(e: unknown) {
+  return e instanceof OvertakeError && !HARD_STOP.has(e.code) && CONTEXT_GONE.test(e.message);
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -185,6 +191,8 @@ export class Engine {
   #mutex = new KeyedMutex();
   #controlWaiters = new Set<() => void>();
   #tabSpace = new Map<number, number>();
+  /** Why a tab left its Space, from the extension's close events (see rememberGone there). */
+  #gone = new Map<number, { code: string; message: string }>();
 
   constructor(client: BrokerClient) {
     this.client = client;
@@ -222,9 +230,17 @@ export class Engine {
         return;
       case 'space-closed':
         this.#spaces.delete(e.spaceId);
+        for (const [tabId, spaceId] of this.#tabSpace) {
+          if (spaceId !== e.spaceId) continue;
+          this.#tabSpace.delete(tabId);
+          if (!this.#gone.has(tabId)) this.#gone.set(tabId, { code: ErrorCode.SPACE_CLOSED, message: e.reason || `Space ${e.spaceId} was closed.` });
+        }
         for (const w of this.#controlWaiters) w();
         return;
       case 'tab-closed':
+        this.#tabSpace.delete(e.tabId);
+        if (!this.#gone.has(e.tabId)) this.#gone.set(e.tabId, { code: e.code || ErrorCode.TAB_CLOSED, message: e.reason || `Tab ${e.tabId} was closed.` });
+      // falls through
       case 'debugger-attached':
       case 'debugger-detached': {
         const t = this.#tabs.get(e.tabId);
@@ -413,7 +429,11 @@ export class Engine {
       for (const tab of s.tabs) this.#tabSpace.set(tab.tabId, s.spaceId);
     }
     const id = this.#tabSpace.get(tabId);
-    if (id === undefined) throw new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in a Space.`);
+    if (id === undefined) {
+      const g = this.#gone.get(tabId);
+      if (g) throw new OvertakeError(g.code, `${g.message} Tab ${tabId} is gone; check spaces_list or create a new Space if the user wants you to continue.`);
+      throw new OvertakeError(ErrorCode.TAB_NOT_IN_SPACE, `Tab ${tabId} is not in a Space.`);
+    }
     return id;
   }
 
@@ -547,10 +567,18 @@ export class Engine {
   }
 
   async pageInfo(tabId: number) {
-    const r = await this.cdp<{ result: { value: { url: string; title: string; readyState: string } } }>(tabId, 'Runtime.evaluate', {
-      expression: '({url: location.href, title: document.title, readyState: document.readyState})', returnByValue: true,
-    });
-    return r.result.value;
+    // Read-only, so safe to retry when a redirect replaces the document mid-call.
+    for (let i = 0; ; i++) {
+      try {
+        const r = await this.cdp<{ result: { value: { url: string; title: string; readyState: string } } }>(tabId, 'Runtime.evaluate', {
+          expression: '({url: location.href, title: document.title, readyState: document.readyState})', returnByValue: true,
+        });
+        return r.result.value;
+      } catch (e) {
+        if (i >= 5 || !contextGone(e)) throw e;
+        await sleep(200);
+      }
+    }
   }
 
   async wait(tabId: number, cond: { delayMs?: number; selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
@@ -690,7 +718,13 @@ export class Engine {
     }
     const { kind, sel } = parseSelector(target);
     const finder = `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)})`;
-    const r = await this.cdp<{ result: { type: string; subtype?: string; objectId?: string; value?: { count: number } }; exceptionDetails?: Json }>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false });
+    const find = () => this.cdp<{ result: { type: string; subtype?: string; objectId?: string; value?: { count: number } }; exceptionDetails?: Json }>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false });
+    // Finding is read-only: if the document was just replaced, look again in the new one.
+    const r = await find().catch(async (e) => {
+      if (!contextGone(e)) throw e;
+      await sleep(300);
+      return find();
+    });
     if (r.exceptionDetails) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${target}`);
     if (r.result.subtype !== 'node' || !r.result.objectId) {
       const cnt = await this.cdp<{ result: { value: { count: number } } }>(tabId, 'Runtime.callFunctionOn', { objectId: r.result.objectId, functionDeclaration: 'function(){return this}', returnByValue: true }).catch(() => null);
@@ -1003,13 +1037,36 @@ export class Engine {
         }
       }
       if (opts.timeoutMs) params.timeout = opts.timeoutMs;
-      const r = await this.cdp<{ result: { type: string; value?: unknown; description?: string; unserializableValue?: string }; exceptionDetails?: { text: string; exception?: { description?: string } } }>(tabId, 'Runtime.evaluate', params, sessionId, (opts.timeoutMs ?? 30_000) + 5000);
+      type EvalResult = { result: { type: string; value?: unknown; description?: string; unserializableValue?: string }; exceptionDetails?: { text: string; exception?: { description?: string } } };
+      let r: EvalResult;
+      try {
+        r = await this.cdp<EvalResult>(tabId, 'Runtime.evaluate', params, sessionId, (opts.timeoutMs ?? 30_000) + 5000);
+      } catch (e) {
+        // Not retried: the script may already have run in part (or caused the navigation).
+        if (contextGone(e)) throw await this.#navigatedError(tabId);
+        throw e;
+      }
       if (r.exceptionDetails) {
         return { ok: false, exception: r.exceptionDetails.exception?.description || r.exceptionDetails.text };
       }
       const v = r.result;
       return { ok: true, type: v.type, value: v.value !== undefined ? v.value : v.unserializableValue ?? v.description };
     });
+  }
+
+  /** The page navigated under a script. Wait briefly for the new document, then say where it is. */
+  async #navigatedError(tabId: number): Promise<OvertakeError> {
+    let info: { url: string; title: string; readyState: string } | null = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      info = await this.pageInfo(tabId).catch(softFail(null));
+      if (info && info.readyState !== 'loading') break;
+      await sleep(200);
+    }
+    const where = info ? `It is now at ${info.url} (readyState ${info.readyState}).` : 'The new page did not answer yet.';
+    return new OvertakeError(ErrorCode.PAGE_NAVIGATED,
+      `The page navigated while the script ran, so its result was lost; the script may have run in part. ${where} Wait for what you need with browser_wait (selector, text or urlIncludes), then evaluate again.`,
+      info ?? undefined);
   }
 
   // -------------------------------------------------------------------------
