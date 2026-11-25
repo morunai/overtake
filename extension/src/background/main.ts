@@ -274,9 +274,27 @@ const COMMAND_DEADLINE_MS = 45_000;
  *  calls cannot be cancelled, but they must never wedge a Space). */
 /** browser_run runs that have ended (agentKey:runId): their queued commands must not run. */
 const endedRuns = new Set<string>();
+/** Commands per run still queued or running; a run's marker is kept while any remain. */
+const runOutstanding = new Map<string, number>();
+function endRun(runKey: string) {
+  endedRuns.add(runKey);
+  // Keep the set small, but never drop a marker that queued work can still look up.
+  for (const k of endedRuns) {
+    if (endedRuns.size <= 1000) break;
+    if (!runOutstanding.get(k)) endedRuns.delete(k);
+  }
+}
 
 function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promise<T>, opts: { tabId?: number; pausedTimeoutMs?: number; deadlineMs?: number; runKey?: string } = {}): Promise<T> {
-  return executorFor(s).submit(
+  const runKey = opts.runKey;
+  if (runKey !== undefined) runOutstanding.set(runKey, (runOutstanding.get(runKey) ?? 0) + 1);
+  const done = () => {
+    if (runKey === undefined) return;
+    const n = (runOutstanding.get(runKey) ?? 1) - 1;
+    if (n > 0) runOutstanding.set(runKey, n);
+    else runOutstanding.delete(runKey);
+  };
+  const p = executorFor(s).submit(
     agentKey,
     async () => {
       if (opts.runKey !== undefined && endedRuns.has(opts.runKey)) {
@@ -306,6 +324,8 @@ function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promis
     },
     { label, pausedTimeoutMs: opts.pausedTimeoutMs },
   );
+  p.then(done, done);
+  return p;
 }
 
 function setBusy(s: Space, busy: boolean, label?: string) {
@@ -719,8 +739,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
   switch (op) {
     case 'run.cancel': {
       if (typeof args.runId !== 'string') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'runId must be a string.');
-      endedRuns.add(`${agentKey}:${args.runId}`);
-      if (endedRuns.size > 1000) endedRuns.delete(endedRuns.values().next().value!);
+      endRun(`${agentKey}:${args.runId}`);
       return { cancelled: true };
     }
     case 'hello':
