@@ -69,5 +69,6 @@ Results (`bench/agent.ts --only overtake`, 1 run each, main vs this change):
 
 On 5 questions the agent did not choose `browser_run` (stepping was simpler), so nothing changed.
 On 20 it explored the first question step by step, then ran the rest from one script: 2.6x faster
-and 3.6x cheaper, with every checkpoint. One run each; the direction is clear, the exact factor
+and 3.6x cheaper, with every checkpoint. A rerun on the final code (after review fixes) gave the
+same: 44.8 s, 10 turns, $0.256, 25/25. One run each; the direction is clear, the exact factor
 is not.
