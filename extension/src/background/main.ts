@@ -432,6 +432,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   let dropped = false;
   let crossFrame = false;
   let sourceChecked = false;
+  let nativeWaited = false;
   let last = { x: 0, y: 0 };
   if (label) {
     s.statusText = label;
@@ -454,8 +455,16 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
     for (let step of steps) {
       if (step.drag === 'pointer' && dragData) continue; // the page took it as a native drag
       if (step.drag === 'native') {
-        // The drag may start on the last move: give Chrome's event a moment to arrive.
-        for (let i = 0; i < 10 && !dragData; i++) await new Promise((r) => setTimeout(r, 15));
+        // The drag may start on the last move: give Chrome's event a moment to arrive, once,
+        // still answering to the human meanwhile.
+        if (!nativeWaited) {
+          nativeWaited = true;
+          for (let i = 0; i < 10 && !dragData; i++) {
+            const g = gate(s.ctl, agentKey);
+            if (!g.run) throw new OvertakeError(g.wait ? ErrorCode.USER_IN_CONTROL : g.code, g.wait ? 'The human paused the agent mid-action.' : g.message, { dispatched });
+            await new Promise((r) => setTimeout(r, 15));
+          }
+        }
         if (!dragData) continue;
         if (crossFrame) continue; // already cancelled
         step = { ...step, params: { ...step.params, data: dragData } };

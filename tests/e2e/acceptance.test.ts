@@ -594,6 +594,10 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const d3 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer three' });
   assert.equal(d3.kind, 'pointer');
   assert.equal(await ev(`document.getElementById('pointer').dataset.order`), 'p2,p3,p1');
+  // A pointer drag does not wait out the native steps it skips.
+  const t0 = Date.now();
+  await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer two' });
+  assert.ok(Date.now() - t0 < 1500, `pointer drag took ${Date.now() - t0} ms`);
   // Nothing is left held down or intercepted: a click works, and the agent cannot turn
   // drag interception on itself (it would swallow the human's drags).
   await A.call('browser_click', { tabId: space.tabId, target: '#after' });
