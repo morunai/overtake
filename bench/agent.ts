@@ -2,7 +2,7 @@
 // Overtake MCP server (isolated: pinned snapshot + throwaway Chrome/OVERTAKE_HOME) and once with
 // the CLI browser via Bash.
 //
-//   node bench/agent.ts [--runs 1] [--only overtake|cli] [--budget 2] [--model M]
+//   node bench/agent.ts [--runs 1] [--only overtake|cli] [--questions 5] [--budget 2] [--model M]
 //
 // Measures end-to-end wall time, model vs tool time (from arrival times of stream-json lines),
 // turns, tool calls, tokens and cost; checkpoints come from the quiz server as in run.ts.
@@ -24,6 +24,7 @@ const ONLY = opt('only', '');
 const BUDGET = opt('budget', '2');
 const MODEL = opt('model', '');
 const PORT = Number(opt('port', '8769'));
+const QUESTIONS = Number(opt('questions', '5'));
 const SITE = `http://127.0.0.1:${PORT}`;
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 const OUT = resolve(opt('out', join(import.meta.dirname, 'results', `agent-${stamp}`)));
@@ -39,7 +40,7 @@ function prompt(tool: 'overtake' | 'cli', run: string, spaceName: string) {
     : `Use the ${CLI_BIN} CLI through Bash for all browser work (load its skill first and follow it).`;
   return `${how}
 Task: open ${SITE}/r/${run}/ in a new browser space named "${spaceName}" (only create and use that one space; do not touch any other space).
-Open "WEB-101 Practice Test 01", start Practice mode (the button that mentions "Reveal the answer"), and answer all 5 questions correctly: each question asks for a sum; pick the option with the correct value, click "Show answer", then go to the next question. If the page shows "Paused while you were away", click Resume.
+Open "WEB-101 Practice Test 01", start Practice mode (the button that mentions "Reveal the answer"), and answer all ${QUESTIONS} questions correctly: each question asks for a sum; pick the option with the correct value, click "Show answer", then go to the next question. If the page shows "Paused while you were away", click Resume.
 On the results page, type the name ${NAME} and click "Submit score". When the page confirms it was saved, close the space and reply with the final score only.`;
 }
 
@@ -102,13 +103,13 @@ function analyse(lines: Line[]) {
 const quiz = (await startQuizServer(PORT)) as unknown as { close: () => void };
 const tools = (ONLY ? [ONLY] : ['overtake', 'cli']) as ('overtake' | 'cli')[];
 let env: OvertakeEnv | null = null;
-writeFileSync(join(OUT, 'config.json'), JSON.stringify({ stamp, runs: RUNS, tools, budget: BUDGET, model: MODEL || '(default)', claude: execSync('claude --version').toString().trim(), cliVersion: tools.includes('cli') ? execSync(`${CLI_BIN} --version 2>&1`).toString().trim().split('\n')[0] : null }, null, 2));
+writeFileSync(join(OUT, 'config.json'), JSON.stringify({ stamp, runs: RUNS, questions: QUESTIONS, tools, budget: BUDGET, model: MODEL || '(default)', claude: execSync('claude --version').toString().trim(), cliVersion: tools.includes('cli') ? execSync(`${CLI_BIN} --version 2>&1`).toString().trim().split('\n')[0] : null }, null, 2));
 try {
   if (tools.includes('overtake')) { env = new OvertakeEnv(); await env.start(); }
   for (let run = FIRST; run <= RUNS; run++) {
     for (const tool of run % 2 ? tools : [...tools].reverse()) {
       const quizRun = `agent-${tool}-${run}-${stamp.slice(11).replace(/-/g, '')}`;
-      await fetch(`${SITE}/api/runs`, { method: 'POST', body: JSON.stringify({ id: quizRun, pause: false, questions: 5, seed: 2000 + run }) });
+      await fetch(`${SITE}/api/runs`, { method: 'POST', body: JSON.stringify({ id: quizRun, pause: false, questions: QUESTIONS, seed: 2000 + run }) });
       const spaceName = `rr-bench agent ${tool} r${run} ${stamp}`;
       let cfgPath: string | null = null;
       if (tool === 'overtake') { cfgPath = join(OUT, `mcp-${tool}.json`); writeFileSync(cfgPath, JSON.stringify(env!.mcpConfig(`rr-agent-r${run}`))); }

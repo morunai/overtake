@@ -272,10 +272,34 @@ const COMMAND_DEADLINE_MS = 45_000;
 /** Run an agent command for a space through its serialized, gated queue. A command
  *  that exceeds its deadline fails with TIMEOUT and frees the queue (chrome.debugger
  *  calls cannot be cancelled, but they must never wedge a Space). */
-function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promise<T>, opts: { tabId?: number; pausedTimeoutMs?: number; deadlineMs?: number } = {}): Promise<T> {
-  return executorFor(s).submit(
+/** browser_run runs that have ended (agentKey:runId): their queued commands must not run. */
+const endedRuns = new Set<string>();
+/** Commands per run still queued or running; a run's marker is kept while any remain. */
+const runOutstanding = new Map<string, number>();
+function endRun(runKey: string) {
+  endedRuns.add(runKey);
+  // Keep the set small, but never drop a marker that queued work can still look up.
+  for (const k of endedRuns) {
+    if (endedRuns.size <= 1000) break;
+    if (!runOutstanding.get(k)) endedRuns.delete(k);
+  }
+}
+
+function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promise<T>, opts: { tabId?: number; pausedTimeoutMs?: number; deadlineMs?: number; runKey?: string } = {}): Promise<T> {
+  const runKey = opts.runKey;
+  if (runKey !== undefined) runOutstanding.set(runKey, (runOutstanding.get(runKey) ?? 0) + 1);
+  const done = () => {
+    if (runKey === undefined) return;
+    const n = (runOutstanding.get(runKey) ?? 1) - 1;
+    if (n > 0) runOutstanding.set(runKey, n);
+    else runOutstanding.delete(runKey);
+  };
+  const p = executorFor(s).submit(
     agentKey,
     async () => {
+      if (opts.runKey !== undefined && endedRuns.has(opts.runKey)) {
+        throw new OvertakeError(ErrorCode.STOPPED, `${label} was queued by a script run that has ended, so it did not run.`);
+      }
       // Re-validate at execution time: the tab may have closed or left the space while queued.
       if (opts.tabId !== undefined) {
         const cur = spaceOfTab(opts.tabId);
@@ -300,6 +324,8 @@ function runGated<T>(s: Space, agentKey: string, label: string, fn: () => Promis
     },
     { label, pausedTimeoutMs: opts.pausedTimeoutMs },
   );
+  p.then(done, done);
+  return p;
 }
 
 function setBusy(s: Space, busy: boolean, label?: string) {
@@ -706,13 +732,22 @@ async function releaseInterception(s: Space) {
 }
 
 async function handleRequest(agentKey: string, op: Operation, args: Record<string, unknown>): Promise<unknown> {
+  // Commands made for a browser_run carry its runId. Once the run ends (run.cancel), any of
+  // them still queued, for example behind a pause, is refused instead of running late.
+  const runKey = typeof args.runId === 'string' ? `${agentKey}:${args.runId}` : undefined;
+  const gated = <T>(s: Space, key: string, label: string, fn: () => Promise<T>, opts: Parameters<typeof runGated>[4] = {}) => runGated(s, key, label, fn, { ...opts, runKey });
   switch (op) {
+    case 'run.cancel': {
+      if (typeof args.runId !== 'string') throw new OvertakeError(ErrorCode.BAD_REQUEST, 'runId must be a string.');
+      endRun(`${agentKey}:${args.runId}`);
+      return { cancelled: true };
+    }
     case 'hello':
       return { extensionVersion: chrome.runtime.getManifest().version, agentKey };
 
     case 'capabilities': {
       const { space, tabId } = managedTab(agentKey, args.tabId);
-      return runGated(space, agentKey, 'probing capabilities', () => probeCapabilities(tabId), { tabId });
+      return gated(space, agentKey, 'probing capabilities', () => probeCapabilities(tabId), { tabId });
     }
 
     case 'spaces.list':
@@ -836,7 +871,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
     case 'tabs.create': {
       const s = getSpace(args.spaceId);
       requireOwner(s, agentKey);
-      return runGated(s, agentKey, 'opening a tab', async () => {
+      return gated(s, agentKey, 'opening a tab', async () => {
         if (s.windowId === null) throw new OvertakeError(ErrorCode.SPACE_CLOSED, 'Space has no window.');
         const tab = await chrome.tabs.create({ windowId: s.windowId, url: typeof args.url === 'string' ? args.url : 'about:blank', active: args.active !== false });
         pendingAgentTabs.add(tab.id!);
@@ -854,7 +889,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
     case 'tabs.close': {
       const { space, tabId } = managedTab(agentKey, args.tabId);
       if (space.tabs.get(tabId)!.openedBy !== 'agent') throw new OvertakeError(ErrorCode.TAB_PROTECTED, `Tab ${tabId} was opened by the user and is protected.`);
-      return runGated(space, agentKey, 'closing a tab', async () => {
+      return gated(space, agentKey, 'closing a tab', async () => {
         agentClosingTabs.add(tabId);
         await dbg.detach(tabId);
         await chrome.tabs.remove(tabId);
@@ -864,7 +899,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
 
     case 'tabs.activate': {
       const { space, tabId } = managedTab(agentKey, args.tabId);
-      return runGated(space, agentKey, 'switching tab', async () => {
+      return gated(space, agentKey, 'switching tab', async () => {
         await chrome.tabs.update(tabId, { active: true });
         return { active: true };
       }, { tabId });
@@ -876,7 +911,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
       const { space, tabId } = managedTab(agentKey, args.tabId);
       const url = args.url;
       if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'tabs.navigate only accepts http(s) URLs.');
-      return runGated(space, agentKey, 'navigating', async () => {
+      return gated(space, agentKey, 'navigating', async () => {
         await chrome.tabs.update(tabId, { url });
         return { navigating: true };
       }, { tabId });
@@ -888,7 +923,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
       const space = spaceOfTab(tabId);
       if (!space) throw notInSpace(tabId);
       requireOwner(space, agentKey);
-      return runGated(space, agentKey, 'adopting a tab', async () => {
+      return gated(space, agentKey, 'adopting a tab', async () => {
         space.tabs.get(tabId)!.managed = true;
         persist();
         pushUi();
@@ -910,7 +945,7 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         await dbg.ensureAttached(tabId);
         return dbg.send(tabId, method, params, sessionId);
       }
-      return runGated(space, agentKey, method, async () => {
+      return gated(space, agentKey, method, async () => {
         await dbg.ensureAttached(tabId);
         if (policy.input) {
           await runInputBurst(space, agentKey, tabId, [{ method: method as InputStep['method'], params, sessionId }]);
@@ -933,14 +968,14 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
         if (!pol.input) throw new OvertakeError(ErrorCode.BAD_REQUEST, `${st.method} is not an input method.`);
       }
       const label = typeof args.label === 'string' ? args.label.slice(0, 80) : undefined;
-      return runGated(space, agentKey, label || 'input', () => runInputBurst(space, agentKey, tabId, steps, label), { tabId });
+      return gated(space, agentKey, label || 'input', () => runInputBurst(space, agentKey, tabId, steps, label), { tabId });
     }
 
     case 'screenshot': {
       const { space, tabId } = managedTab(agentKey, args.tabId);
       const params = (args.params as Record<string, unknown> | undefined) || {};
       const includeOverlay = args.includeOverlay === true;
-      return runGated(space, agentKey, 'screenshot', async () => {
+      return gated(space, agentKey, 'screenshot', async () => {
         await dbg.ensureAttached(tabId);
         const hide = !includeOverlay && shieldActive(space.ctl);
         if (hide) await sendTopAcked(tabId, { type: 'overtake:hidden', hidden: true });

@@ -3,7 +3,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createServer as createHttpsServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
@@ -141,6 +141,200 @@ test('an action with snapshot: true returns the page after it, with working refs
   assert.match(w.content[1].text, new RegExp(`clicks: ${n + 2}`));
   const p = await A.callRaw('browser_press', { tabId: space.tabId, keys: 'Shift', snapshot: true, snapshotScope: 'full_page' });
   assert.match(p.content[1].text, /button "Click me" @\d+/);
+});
+
+test('browser_run runs a whole flow from one script with real input', async () => {
+  const n = await count();
+  const r = await A.callRaw('browser_run', {
+    tabId: space.tabId,
+    args: { times: 3, name: 'Ada' },
+    script: `
+      await fill('#name', args.name);
+      for (let i = 0; i < args.times; i++) await click('#btn');
+      await wait({ text: 'clicks: ' + (${n} + args.times) });
+      const value = await evaluate(() => document.getElementById('name').value);
+      assert(value === 'Ada', 'name was typed');
+      log('typed', value);
+      return { value, url: await url() };
+    `,
+  });
+  assert.ok(!r.isError, r.content[0].text);
+  assert.equal(r.content.length, 1, 'no snapshot unless asked or failed');
+  const out = JSON.parse(r.content[0].text);
+  assert.equal(out.ok, true);
+  assert.equal(out.result.value, 'Ada');
+  assert.equal(out.steps, 7);
+  assert.deepEqual(out.logs, ['typed Ada']);
+  assert.equal(await count(), n + 3, 'all three clicks landed');
+  // Each click went through the real-input path (the page saw trusted events).
+  assert.equal(await h.eval<boolean>(human, `window.__lastPointer?.trusted`), true);
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('name').value = ''` });
+});
+
+test('browser_select chooses native <select> options by value or label, with checks and events', async () => {
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `(() => {
+    const box = document.createElement('div'); box.id = 'sel-box';
+    box.innerHTML = '<select id="team"><option value="">Choose...</option><option value="s">Sales</option><option value="e">Engineering</option><option value="x" disabled>Closed</option><option value="x2">Closed</option></select>'
+      + '<fieldset disabled><select id="off"><option>a</option><option>b</option></select></fieldset>'
+      + '<select id="tags" multiple><option>red</option><option>green</option><option>blue</option></select><div id="fake">Pick one</div>';
+    document.body.prepend(box);
+    window.__changes = [];
+    box.addEventListener('change', (e) => window.__changes.push(e.target.id + '=' + [...e.target.selectedOptions].map((o) => o.value).join(',')));
+  })()` });
+  const r = await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Engineering' });
+  assert.deepEqual(r.selected, [{ value: 'e', label: 'Engineering' }], 'matched by label');
+  await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 's' });
+  const multi = await A.call('browser_select', { tabId: space.tabId, target: '#tags', values: ['red', 'blue'] });
+  assert.deepEqual(multi.selected.map((o: { value: string }) => o.value), ['red', 'blue']);
+  assert.deepEqual(await A.call('browser_evaluate', { tabId: space.tabId, expression: 'window.__changes' }).then((x: { value: string[] }) => x.value), ['team=e', 'team=s', 'tags=red,blue'], 'the page saw change events');
+  // Re-choosing the current option fires no events, like a user.
+  const same = await A.call('browser_select', { tabId: space.tabId, target: '#tags', values: ['red', 'blue'] });
+  assert.equal(same.changed, false);
+  assert.equal(await A.call('browser_evaluate', { tabId: space.tabId, expression: 'window.__changes.length' }).then((x: { value: number }) => x.value), 3);
+  // A disabled option does not hide an enabled one with the same label.
+  assert.equal((await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Closed' })).selected[0].value, 'x2');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#off', values: 'b', force: true }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /disabled/.test(e.message), 'disabled by its fieldset');
+  // A snapshot ref works too.
+  const snap: string = (await A.callRaw('browser_snapshot', { tabId: space.tabId })).content[0].text;
+  const ref = /combobox[^\n]*?(@\d+)/.exec(snap)![1];
+  assert.equal((await A.call('browser_select', { tabId: space.tabId, target: ref, values: 'Engineering' })).selected[0].value, 'e');
+  // Clear errors.
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Marketing' }), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /Sales \(s\)/.test(e.message));
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'x' }), (e) => code(e) === 'ELEMENT_NOT_FOUND', 'disabled options are not chosen');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: ['s', 'e'] }), (e) => code(e) === 'BAD_REQUEST');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#fake', values: 'a' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /custom dropdown/.test(e.message));
+  // And from a script.
+  const run = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `const r = await select('#team', 'Sales'); return r.selected[0].value;` })).content[0].text);
+  assert.equal(run.result, 's');
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('sel-box').remove()` });
+});
+
+test('browser_run from a file: errors carry the step, the line and a snapshot; caught errors continue', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overtake-run-'));
+  try {
+    const file = join(dir, 'flow.js');
+    writeFileSync(file, [
+      `let caught = null;`,
+      `try { await click('#missing-optional', { force: true }); } catch (e) { caught = e.code; }`,
+      `await click('#btn');`,
+      `await click('#does-not-exist');`,
+      `return 'unreachable';`,
+    ].join('\n'));
+    const r = await A.callRaw('browser_run', { tabId: space.tabId, file });
+    assert.ok(!r.isError, r.content[0].text);
+    const out = JSON.parse(r.content[0].text);
+    assert.equal(out.ok, false);
+    assert.equal(out.error.code, 'ELEMENT_NOT_FOUND');
+    assert.equal(out.error.line, 4, 'line of the failing call in the file');
+    assert.equal(out.error.step, 3);
+    assert.equal(out.error.op, 'click');
+    assert.equal(out.trail.length, 3);
+    assert.equal(r.content.length, 2, 'a failed run comes with a snapshot');
+    assert.match(r.content[1].text, /button "Click me" @\d+/);
+    // Re-running the same file after a fix needs no re-sent script.
+    writeFileSync(file, `await click('#btn'); return await evaluate('document.title');`);
+    const again = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, file })).content[0].text);
+    assert.equal(again.ok, true);
+    assert.equal(typeof again.result, 'string');
+    // browser_evaluate takes a file too.
+    const ev = join(dir, 'probe.js');
+    writeFileSync(ev, `document.querySelectorAll('button').length`);
+    const e = await A.call('browser_evaluate', { tabId: space.tabId, file: ev });
+    assert.ok(e.ok && e.value > 0);
+    await assert.rejects(A.call('browser_evaluate', { tabId: space.tabId, file: 'relative.js' }), (x) => code(x) === 'BAD_REQUEST');
+    await assert.rejects(A.call('browser_run', { tabId: space.tabId, file: join(dir, 'x.txt') }), (x) => code(x) === 'BAD_REQUEST');
+    // Syntax errors point at the line.
+    const bad = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `await click('#btn');\nconst = 1;` })).content[0].text);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.error.code, 'SCRIPT_SYNTAX_ERROR');
+    assert.equal(bad.error.line, 2, 'syntax errors point at the line');
+    // Rethrowing an older error keeps its own step and line.
+    const kept = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `let first;\ntry { await click('#nope-1', { force: true }); } catch (e) { first = e; }\ntry { await click('#nope-2', { force: true }); } catch {}\nthrow first;` })).content[0].text);
+    assert.equal(kept.error.code, 'ELEMENT_NOT_FOUND');
+    assert.equal(kept.error.step, 1);
+    assert.equal(kept.error.line, 2);
+    // Calls the script did not await still run before success is reported.
+    const n0 = await count();
+    const unawaited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn'); click('#btn'); return 'early';` })).content[0].text);
+    assert.equal(unawaited.ok, true);
+    assert.equal(await count(), n0 + 2, 'both clicks ran, in order, before the result');
+    const n2 = await count();
+    const chained = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn').then(() => click('#btn')); return 1;` })).content[0].text);
+    assert.equal(chained.ok, true);
+    assert.equal(await count(), n2 + 2, 'a chained call started after the return still runs');
+    const badArgs = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, timeoutMs: 5000, script: `let code; try { await click('#btn', { bad: () => 1 }); } catch (e) { code = e.code; } return code;` })).content[0].text);
+    assert.equal(badArgs.ok, true);
+    assert.equal(badArgs.result, 'BAD_REQUEST', 'uncloneable arguments fail that call only');
+    const failedLater = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#nope-3', { force: true }); return 'early';` })).content[0].text);
+    assert.equal(failedLater.ok, false, 'an unawaited call that fails fails the run');
+    assert.equal(failedLater.error.code, 'ELEMENT_NOT_FOUND');
+    // Over the step limit, calls already queued never run.
+    const n1 = await count();
+    const limited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (let i = 0; i < 6; i++) click('#btn'); await sleep(1500);`, maxSteps: 2 })).content[0].text);
+    assert.equal(limited.error.code, 'STEP_LIMIT');
+    await sleep(500);
+    assert.equal(await count(), n1 + 2, 'nothing ran after the limit');
+    // The run limits hold.
+    const many = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (;;) await url();`, maxSteps: 5 })).content[0].text);
+    assert.equal(many.error.code, 'STEP_LIMIT');
+    const slow = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (;;) {}`, timeoutMs: 1000 })).content[0].text);
+    assert.equal(slow.error.code, 'TIMEOUT', 'even a busy loop is stopped');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('browser_run stops at once when the human stops the agent, even if the script catches errors', async () => {
+  const s = await A.call('spaces_create', { name: 'script stop', url: `${SITE}/?script-stop=1` });
+  await A.call('browser_wait', { tabId: s.tabId, load: true });
+  const page = await h.humanSession('?script-stop=1');
+  const run = A.callRaw('browser_run', {
+    tabId: s.tabId,
+    timeoutMs: 20_000,
+    script: `for (let i = 0; i < 200; i++) { try { await click('#btn'); await sleep(50); } catch (e) { log('caught', e.code); } }`,
+  });
+  await sleep(1500);
+  await h.humanAction(ext, 'stop', s.spaceId);
+  const r = await run;
+  assert.ok(r.isError, 'a hard stop is a tool error');
+  assert.match(r.content[0].text, /^STOPPED: .*browser_run stopped at step \d+/);
+  const after = await h.eval<string>(page, `document.getElementById('count').dataset.count`);
+  await sleep(800);
+  assert.equal(await h.eval<string>(page, `document.getElementById('count').dataset.count`), after, 'no click after the stop');
+  assert.ok(Number(after) > 2, `the script ran before the stop (${after} clicks)`);
+  await h.humanAction(ext, 'close', s.spaceId);
+});
+
+test('browser_run stops on a take-over even while the script is sleeping or busy', async () => {
+  const s = await A.call('spaces_create', { name: 'script takeover', url: `${SITE}/?script-takeover=1` });
+  await A.call('browser_wait', { tabId: s.tabId, load: true });
+  for (const body of [`await sleep(10000); await click('#btn');`, `for (;;) {}`]) {
+    const t0 = Date.now();
+    const run = A.callRaw('browser_run', { tabId: s.tabId, timeoutMs: 20_000, script: body });
+    await sleep(800);
+    await h.humanAction(ext, 'takeover', s.spaceId);
+    const r = await run;
+    assert.ok(r.isError, body);
+    assert.match(r.content[0].text, /^USER_IN_CONTROL/, body);
+    assert.ok(Date.now() - t0 < 4000, `stopped at once (${Date.now() - t0} ms): ${body}`);
+    await h.humanAction(ext, 'giveback', s.spaceId);
+    await A.call('space_wait_for_control', { spaceId: s.spaceId, timeoutMs: 5000 });
+  }
+  // A click queued behind a pause, when the run times out, never runs after Resume.
+  const page = await h.humanSession('?script-takeover=1');
+  const clicks = () => h.eval<string>(page, `document.getElementById('count').dataset.count`).then(Number);
+  const c0 = await clicks();
+  await h.humanAction(ext, 'pause', s.spaceId);
+  const r = JSON.parse((await A.callRaw('browser_run', { tabId: s.tabId, timeoutMs: 1500, script: `await click('#btn');` })).content[0].text);
+  assert.equal(r.error.code, 'TIMEOUT');
+  // The same when the script fails early with a click still queued behind the pause.
+  const early = JSON.parse((await A.callRaw('browser_run', { tabId: s.tabId, script: `click('#btn'); await new Promise((r) => r()); throw new Error('early');` })).content[0].text);
+  assert.equal(early.ok, false);
+  assert.match(early.error.message, /early/);
+  await h.humanAction(ext, 'resume', s.spaceId);
+  await sleep(1000);
+  assert.equal(await clicks(), c0, 'the timed-out click did not run after Resume');
+  await A.call('spaces_close', { spaceId: s.spaceId });
 });
 
 test('network results mask credentials (headers, cookies, tokens, passwords)', async () => {

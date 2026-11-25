@@ -6,7 +6,7 @@
 import { writeFile, mkdir, stat, copyFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { BrokerClient } from './broker-client.ts';
+import { BrokerClient, requestScope } from './broker-client.ts';
 import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
@@ -88,6 +88,9 @@ let refCounter = 0;
 
 /** Refusals that mean "stop now", as opposed to transient page states worth retrying. */
 const HARD_STOP = new Set<string>([ErrorCode.USER_IN_CONTROL, ErrorCode.STOPPED, ErrorCode.NOT_OWNER, ErrorCode.SPACE_CLOSED, ErrorCode.TAB_CLOSED, ErrorCode.SPACE_NOT_FOUND, ErrorCode.TAB_NOT_IN_SPACE, ErrorCode.EXTENSION_NOT_CONNECTED, ErrorCode.AGENT_PAUSED_TIMEOUT]);
+export function isHardStop(code: string) {
+  return HARD_STOP.has(code);
+}
 function softFail<T>(fallback: T) {
   return (e: unknown): T => {
     if (e instanceof OvertakeError && HARD_STOP.has(e.code)) throw e;
@@ -228,7 +231,41 @@ export class Engine {
     this.#gone.delete(tabId);
   }
 
+  #listeners = new Set<(e: AgentEvent) => void>();
+
+  /** Observe broker events (after the engine has applied them). Returns an unsubscribe. */
+  subscribe(fn: (e: AgentEvent) => void): () => void {
+    this.#listeners.add(fn);
+    return () => this.#listeners.delete(fn);
+  }
+
+  /** Why this agent can no longer drive the Space, from the latest known state; null while it
+   *  can (a pause only queues commands). */
+  controlLost(spaceId: number): OvertakeError | null {
+    const s = this.#spaces.get(spaceId);
+    if (!s) return new OvertakeError(ErrorCode.SPACE_CLOSED, `Space ${spaceId} was closed.`);
+    if (s.control === 'AGENT_PAUSED' && s.owner === this.client.agentKey) return null;
+    if (s.owner !== this.client.agentKey || s.control !== 'AGENT_CONTROL') return this.#lostControl(s);
+    return null;
+  }
+
+  /** True while the human has paused this agent in the Space (its commands queue). */
+  isPaused(spaceId: number) {
+    return this.#spaces.get(spaceId)?.control === 'AGENT_PAUSED';
+  }
+
   #onEvent(e: AgentEvent) {
+    this.#applyEvent(e);
+    for (const fn of this.#listeners) {
+      try {
+        fn(e);
+      } catch {
+        /* a listener must not break event handling */
+      }
+    }
+  }
+
+  #applyEvent(e: AgentEvent) {
     switch (e.type) {
       case 'control':
         this.#spaces.set(e.space.spaceId, e.space);
@@ -420,14 +457,15 @@ export class Engine {
     const t = this.#tab(tabId);
     if (t.enabled) return t;
     if (!t.enabling) {
-      t.enabling = (async () => {
+      // Shared by every caller on this tab, so it runs outside any one run's scope.
+      t.enabling = requestScope.exit(() => (async () => {
         await this.cdp(tabId, 'Page.enable');
         await this.cdp(tabId, 'Page.setLifecycleEventsEnabled', { enabled: true }).catch(() => {});
         await this.cdp(tabId, 'Runtime.enable');
         await this.cdp(tabId, 'Network.enable', { maxPostDataSize: 65536 });
         await this.cdp(tabId, 'Log.enable').catch(() => {});
         t.enabled = true;
-      })().finally(() => {
+      })()).finally(() => {
         t.enabling = null;
       });
     }
@@ -926,6 +964,66 @@ export class Engine {
       const popups = await this.#popups(tabId, before).catch(() => []);
       lap('popups');
       return { clicked: r.desc, at: pt, ...receipt, ...(popups.length ? { popups } : {}), timingMs: tm };
+    });
+  }
+
+  /** Choose option(s) in a native <select>, matched by value, then by visible label. The element
+   *  must pass the same visibility and top-hit checks as a click, and the cursor moves there;
+   *  the choice itself is set in the page with input and change events, because the native
+   *  option popup is drawn outside the page and does not take CDP input reliably. */
+  async select(tabId: number, target: string, values: string | string[], opts: { label?: string; force?: boolean } = {}) {
+    return this.action(tabId, async (t) => {
+      const r = await this.#resolve(t, target);
+      if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'select needs an element (@ref or selector), not coordinates.');
+      const pt = await this.#pointFor(t, r.node, opts.force);
+      await this.client.request('input.batch', { tabId, steps: this.#jump(t, pt), label: opts.label || `select in ${r.desc}`.slice(0, 60) });
+      const sid = r.node.sessionId;
+      let objectId = sid ? undefined : r.node.objectId;
+      if (!objectId) {
+        const res = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: r.node.backendNodeId }, sid).catch(() => null);
+        if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
+        objectId = res.object.objectId;
+      }
+      const want = (Array.isArray(values) ? values : [values]).map(String);
+      type Out = { error?: string; tag?: string; missing?: string[]; available?: string[]; changed?: boolean; selected?: { value: string; label: string }[] };
+      const res = await this.cdp<{ result: { value: Out } }>(tabId, 'Runtime.callFunctionOn', {
+        objectId,
+        returnByValue: true,
+        arguments: [{ value: want }],
+        functionDeclaration: `function(want){
+          if (this.localName !== 'select') return { error: 'not-select', tag: this.localName };
+          if (this.matches(':disabled')) return { error: 'disabled' }; // also a disabled fieldset
+          if (want.length > 1 && !this.multiple) return { error: 'single' };
+          const opts = [...this.options];
+          const usable = opts.filter((o) => !o.matches(':disabled')); // includes disabled optgroups
+          const label = (o) => (o.label || o.textContent || '').trim();
+          const picked = [], missing = [];
+          for (const w of want) {
+            const o = usable.find((x) => x.value === w) || usable.find((x) => label(x) === w.trim()) || usable.find((x) => label(x).toLowerCase() === w.trim().toLowerCase());
+            if (!o) missing.push(w);
+            else picked.push(o);
+          }
+          if (missing.length) return { error: 'missing', missing, available: usable.slice(0, 40).map((o) => o.value === label(o) ? o.value : label(o) + ' (' + o.value + ')') };
+          this.focus();
+          const before = opts.map((o) => o.selected);
+          for (const o of opts) o.selected = picked.includes(o);
+          // Like a user re-picking the current choice: no events when nothing changed.
+          const changed = opts.some((o, i) => o.selected !== before[i]);
+          if (changed) {
+            this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            this.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return { changed, selected: [...this.selectedOptions].map((o) => ({ value: o.value, label: label(o) })) };
+        }`,
+      }, sid);
+      void this.cdp(tabId, 'Runtime.releaseObject', { objectId }, sid).catch(() => {});
+      if (r.node.objectId && r.node.objectId !== objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.node.objectId }).catch(() => {});
+      const v = res.result.value;
+      if (v.error === 'not-select') throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `${r.desc} is a <${v.tag}>, not a <select>. For a custom dropdown, click it, then click the option.`);
+      if (v.error === 'disabled') throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `${r.desc} is disabled.`);
+      if (v.error === 'single') throw new OvertakeError(ErrorCode.BAD_REQUEST, `${r.desc} takes one value (it is not a multiple select).`);
+      if (v.error === 'missing') throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `No enabled option matches ${v.missing!.map((m) => JSON.stringify(m)).join(', ')} in ${r.desc}. Options: ${v.available!.join(', ')}.`);
+      return { selectedIn: r.desc, selected: v.selected, changed: v.changed, at: pt };
     });
   }
 

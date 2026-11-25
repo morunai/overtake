@@ -126,8 +126,9 @@ It prints the `claude mcp add` command for that instance.
 | Spaces and control | `spaces_list` `spaces_create` `spaces_close` `spaces_switch` `spaces_rename` `space_claim` `space_release` `space_handoff` `space_resume` `space_wait_for_control` `space_status` `space_mark_error` |
 | Tabs and navigation | `browser_tabs` `browser_navigate` `browser_wait` |
 | Observation | `browser_snapshot` `browser_screenshot` `browser_evaluate` `browser_network` `browser_console` `browser_events` `browser_frames` |
-| Input | `browser_click` `browser_hover` `browser_type` `browser_press` `browser_scroll` `browser_drag` `browser_dialog` |
+| Input | `browser_click` `browser_hover` `browser_type` `browser_select` `browser_press` `browser_scroll` `browser_drag` `browser_dialog` |
 | Files and popups | `browser_upload` `browser_downloads` (popups opened by a click join the agent's Space) |
+| Scripts | `browser_run` (a whole flow from one script file; each call uses the same real input and checks) |
 | Advanced | `browser_intercept` `browser_emulate` `browser_trace` `browser_debug` `browser_cdp` `browser_capabilities` |
 
 The server ships instructions that tell the agent how to behave: one Space per goal, snapshot
@@ -190,6 +191,9 @@ results and the harness are in [`bench/REPORT.md`](bench/REPORT.md).
 - **`browser_evaluate` is not filtered.** It runs JavaScript with the page's own access, so it
   can read anything the page can (including non-HttpOnly cookies and local storage). Output
   filtering cannot make that safe; use the isolated profile for sites you do not trust.
+- **Scripts stop when you take over.** `browser_run` ends a script the moment you take over, press
+  Stop, or close the Space (Pause only holds it), and commands it had queued never run. It runs in
+  a worker with only the browser API in scope; that scopes it, it is not a sandbox.
 - **Your tabs stay yours.** Agents cannot touch tabs outside their Spaces, and tabs you open in
   a Space are kept when it closes.
 
