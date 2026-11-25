@@ -634,6 +634,16 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
   const lzx = await ev(`(() => { const r = document.getElementById('lateZone').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
   await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lzx.x},${lzx.y}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
   assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'dragend']);
+  // The same when the iframe moves under the drop point just before the drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?move=1` });
+  const bc = await ev(`(() => { const r = document.getElementById('bin').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${bc.x},${bc.y}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'dragend']);
+  // A drop zone of the page drawn over a cross-site iframe is a normal drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?cover=1` });
+  const dc = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: '#cover' });
+  assert.equal(dc.kind, 'html5');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'cover:n2', 'dragend']);
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?late=1` });
   // Raw drag events sent to a cross-site iframe's own session (frame coordinates) are marked
   // and admitted too.

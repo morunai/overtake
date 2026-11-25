@@ -406,11 +406,11 @@ function markDrag(params: Record<string, unknown>, secret: string): Record<strin
   return { ...params, data: { ...data, items: [...items, { mimeType: DRAG_MARK, data: secret }] } };
 }
 
-/** Whether a native drop at this point would land on a frame owner element. Drag events go
+/** Whether a native drag event at this point would land on a frame owner element. Drag events go
  *  to the top page's process, and the hit test goes through same-process frames to their
  *  content, so a frame element here is a cross-site iframe the drop cannot reach. Run during
  *  the burst, when the shield overlay is inert and not hit. */
-async function dropOverRemoteFrame(tabId: number, x: number, y: number): Promise<boolean> {
+async function overRemoteFrame(tabId: number, x: number, y: number): Promise<boolean> {
   try {
     const hit = (await dbg.send(tabId, 'DOM.getNodeForLocation', { x: Math.round(x), y: Math.round(y) })) as { backendNodeId: number };
     const d = (await dbg.send(tabId, 'DOM.describeNode', { backendNodeId: hit.backendNodeId })) as { node: { nodeName: string } };
@@ -431,6 +431,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   let dragData: unknown = null;
   let dropped = false;
   let crossFrame = false;
+  let sourceChecked = false;
   let last = { x: 0, y: 0 };
   if (label) {
     s.statusText = label;
@@ -456,14 +457,15 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         // The drag may start on the last move: give Chrome's event a moment to arrive.
         for (let i = 0; i < 10 && !dragData; i++) await new Promise((r) => setTimeout(r, 15));
         if (!dragData) continue;
+        if (crossFrame) continue; // already cancelled
         step = { ...step, params: { ...step.params, data: dragData } };
-      }
-      if (step.drag === 'native' && (step.params as { type?: string }).type === 'drop') {
-        const p = step.params as { x: number; y: number };
-        if (await dropOverRemoteFrame(tabId, p.x, p.y)) {
-          // Cancel at the press origin: a drag event sent over the remote frame goes nowhere.
-          crossFrame = true;
-          step = { ...step, params: { ...step.params, type: 'dragCancel', x: pressed?.x ?? p.x, y: pressed?.y ?? p.y } };
+        // A drag started inside a cross-site iframe cannot be completed from the top page.
+        if (!sourceChecked) {
+          sourceChecked = true;
+          if (pressed && (await overRemoteFrame(tabId, pressed.x, pressed.y))) {
+            crossFrame = true;
+            step = { ...step, params: { ...step.params, type: 'dragCancel', x: pressed.x, y: pressed.y } };
+          }
         }
       }
       if (step.method === 'Input.dispatchDragEvent') step = { ...step, params: markDrag(step.params, secret) };
@@ -494,6 +496,15 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
       const isDrop = step.method === 'Input.dispatchDragEvent' && (step.params as { type?: string }).type === 'drop';
       const permit = permitFor(step, pressed !== null);
       if (shield) await (isDrop ? sendAllFramesAcked(tabId, { type: 'overtake:permit', permit }) : sendTopAcked(tabId, { type: 'overtake:permit', permit }));
+      if (isDrop && step.drag === 'native') {
+        // Checked right before dispatch: an iframe may have moved under the point meanwhile.
+        const p = step.params as { x: number; y: number };
+        if (await overRemoteFrame(tabId, p.x, p.y)) {
+          // Cancel at the press origin: a drag event sent over the remote frame goes nowhere.
+          crossFrame = true;
+          step = { ...step, params: { ...step.params, type: 'dragCancel', x: pressed?.x ?? p.x, y: pressed?.y ?? p.y } };
+        }
+      }
       await setNativeIgnore(tabId, false);
       try {
         await dbg.send(tabId, step.method, step.params, step.sessionId);

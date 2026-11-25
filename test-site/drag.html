@@ -111,6 +111,33 @@
     held = null;
   });
   pointer.dataset.order = order(pointer);
+
+  // ?cover=1: a drop zone of this page drawn over the cross-site iframe.
+  if (location.search.includes('cover=1')) {
+    const xf = document.getElementById('xframe');
+    const cover = document.createElement('div');
+    cover.id = 'cover';
+    cover.textContent = 'Cover';
+    cover.style.cssText = `position:absolute;left:${xf.offsetLeft + 40}px;top:${xf.offsetTop + 30}px;width:120px;height:60px;background:#fca5a5;z-index:1`;
+    cover.addEventListener('dragover', (e) => e.preventDefault());
+    cover.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dragLog.push('cover:' + e.dataTransfer.getData('text/plain'));
+    });
+    document.body.append(cover);
+  }
+  // ?move=1: the cross-site iframe moves over the drop zone 20 ms after a dragover at its
+  // centre (where the test drops).
+  if (location.search.includes('move=1')) {
+    bin.addEventListener('dragover', (e) => {
+      const c = bin.getBoundingClientRect();
+      if (Math.abs(e.clientX - (c.x + c.width / 2)) > 2 || Math.abs(e.clientY - (c.y + c.height / 2)) > 2) return;
+      setTimeout(() => {
+        const r = bin.getBoundingClientRect();
+        document.getElementById('xframe').style.cssText = `position:fixed;left:${r.x}px;top:${r.y}px;width:${r.width}px;height:${r.height}px;border:0;z-index:2`;
+      }, 20);
+    });
+  }
 </script>
 </body>
 </html>
