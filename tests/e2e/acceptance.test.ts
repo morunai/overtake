@@ -171,6 +171,36 @@ test('browser_run runs a whole flow from one script with real input', async () =
   await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('name').value = ''` });
 });
 
+test('browser_select chooses native <select> options by value or label, with checks and events', async () => {
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `(() => {
+    const box = document.createElement('div'); box.id = 'sel-box';
+    box.innerHTML = '<select id="team"><option value="">Choose...</option><option value="s">Sales</option><option value="e">Engineering</option><option value="x" disabled>Closed</option></select>'
+      + '<select id="tags" multiple><option>red</option><option>green</option><option>blue</option></select><div id="fake">Pick one</div>';
+    document.body.prepend(box);
+    window.__changes = [];
+    box.addEventListener('change', (e) => window.__changes.push(e.target.id + '=' + [...e.target.selectedOptions].map((o) => o.value).join(',')));
+  })()` });
+  const r = await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Engineering' });
+  assert.deepEqual(r.selected, [{ value: 'e', label: 'Engineering' }], 'matched by label');
+  await A.call('browser_select', { tabId: space.tabId, target: '#team', values: 's' });
+  const multi = await A.call('browser_select', { tabId: space.tabId, target: '#tags', values: ['red', 'blue'] });
+  assert.deepEqual(multi.selected.map((o: { value: string }) => o.value), ['red', 'blue']);
+  assert.deepEqual(await A.call('browser_evaluate', { tabId: space.tabId, expression: 'window.__changes' }).then((x: { value: string[] }) => x.value), ['team=e', 'team=s', 'tags=red,blue'], 'the page saw change events');
+  // A snapshot ref works too.
+  const snap: string = (await A.callRaw('browser_snapshot', { tabId: space.tabId })).content[0].text;
+  const ref = /combobox[^\n]*?(@\d+)/.exec(snap)![1];
+  assert.equal((await A.call('browser_select', { tabId: space.tabId, target: ref, values: 'Engineering' })).selected[0].value, 'e');
+  // Clear errors.
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'Marketing' }), (e: Error) => code(e) === 'ELEMENT_NOT_FOUND' && /Sales \(s\)/.test(e.message));
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: 'x' }), (e) => code(e) === 'ELEMENT_NOT_FOUND', 'disabled options are not chosen');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#team', values: ['s', 'e'] }), (e) => code(e) === 'BAD_REQUEST');
+  await assert.rejects(A.call('browser_select', { tabId: space.tabId, target: '#fake', values: 'a' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /custom dropdown/.test(e.message));
+  // And from a script.
+  const run = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `const r = await select('#team', 'Sales'); return r.selected[0].value;` })).content[0].text);
+  assert.equal(run.result, 's');
+  await A.call('browser_evaluate', { tabId: space.tabId, expression: `document.getElementById('sel-box').remove()` });
+});
+
 test('browser_run from a file: errors carry the step, the line and a snapshot; caught errors continue', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'overtake-run-'));
   try {

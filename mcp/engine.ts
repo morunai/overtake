@@ -967,6 +967,60 @@ export class Engine {
     });
   }
 
+  /** Choose option(s) in a native <select>, matched by value, then by visible label. The element
+   *  must pass the same visibility and top-hit checks as a click, and the cursor moves there;
+   *  the choice itself is set in the page with input and change events, because the native
+   *  option popup is drawn outside the page and does not take CDP input reliably. */
+  async select(tabId: number, target: string, values: string | string[], opts: { label?: string; force?: boolean } = {}) {
+    return this.action(tabId, async (t) => {
+      const r = await this.#resolve(t, target);
+      if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'select needs an element (@ref or selector), not coordinates.');
+      const pt = await this.#pointFor(t, r.node, opts.force);
+      await this.client.request('input.batch', { tabId, steps: this.#jump(t, pt), label: opts.label || `select in ${r.desc}`.slice(0, 60) });
+      const sid = r.node.sessionId;
+      let objectId = sid ? undefined : r.node.objectId;
+      if (!objectId) {
+        const res = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: r.node.backendNodeId }, sid).catch(() => null);
+        if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
+        objectId = res.object.objectId;
+      }
+      const want = (Array.isArray(values) ? values : [values]).map(String);
+      type Out = { error?: string; tag?: string; missing?: string[]; available?: string[]; selected?: { value: string; label: string }[] };
+      const res = await this.cdp<{ result: { value: Out } }>(tabId, 'Runtime.callFunctionOn', {
+        objectId,
+        returnByValue: true,
+        arguments: [{ value: want }],
+        functionDeclaration: `function(want){
+          if (this.localName !== 'select') return { error: 'not-select', tag: this.localName };
+          if (this.disabled) return { error: 'disabled' };
+          if (want.length > 1 && !this.multiple) return { error: 'single' };
+          const opts = [...this.options];
+          const label = (o) => (o.label || o.textContent || '').trim();
+          const picked = [], missing = [];
+          for (const w of want) {
+            const o = opts.find((x) => x.value === w) || opts.find((x) => label(x) === w.trim()) || opts.find((x) => label(x).toLowerCase() === w.trim().toLowerCase());
+            if (!o || o.disabled || (o.parentElement && o.parentElement.localName === 'optgroup' && o.parentElement.disabled)) missing.push(w);
+            else picked.push(o);
+          }
+          if (missing.length) return { error: 'missing', missing, available: opts.filter((o) => !o.disabled).slice(0, 40).map((o) => o.value === label(o) ? o.value : label(o) + ' (' + o.value + ')') };
+          this.focus();
+          for (const o of opts) o.selected = picked.includes(o);
+          this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          this.dispatchEvent(new Event('change', { bubbles: true }));
+          return { selected: [...this.selectedOptions].map((o) => ({ value: o.value, label: label(o) })) };
+        }`,
+      }, sid);
+      void this.cdp(tabId, 'Runtime.releaseObject', { objectId }, sid).catch(() => {});
+      if (r.node.objectId && r.node.objectId !== objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.node.objectId }).catch(() => {});
+      const v = res.result.value;
+      if (v.error === 'not-select') throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `${r.desc} is a <${v.tag}>, not a <select>. For a custom dropdown, click it, then click the option.`);
+      if (v.error === 'disabled') throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `${r.desc} is disabled.`);
+      if (v.error === 'single') throw new OvertakeError(ErrorCode.BAD_REQUEST, `${r.desc} takes one value (it is not a multiple select).`);
+      if (v.error === 'missing') throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `No enabled option matches ${v.missing!.map((m) => JSON.stringify(m)).join(', ')} in ${r.desc}. Options: ${v.available!.join(', ')}.`);
+      return { selectedIn: r.desc, selected: v.selected, at: pt };
+    });
+  }
+
   async hover(tabId: number, target: string, label?: string) {
     return this.action(tabId, async (t) => {
       const r = await this.#resolve(t, target);

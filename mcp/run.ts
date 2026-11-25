@@ -158,6 +158,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
     click: (target: string, opts: Opts) => acting(() => engine.click(tabId, target, { label: 'script: click', ...opts })),
     type: (target: string | null, text: string, opts: Opts) => acting(() => engine.type(tabId, { ...opts, target: target ?? undefined, text: String(text) })),
     fill: (target: string, text: string, opts: Opts) => acting(() => engine.type(tabId, { ...opts, target, text: String(text), clear: true })),
+    select: (target: string, values: string | string[], opts: Opts) => acting(() => engine.select(tabId, target, values, opts ?? {})),
     press: (keys: string, opts: Opts) => acting(() => engine.press(tabId, keys, Number(opts?.repeat ?? 1))),
     hover: (target: string, opts: Opts) => acting(() => engine.hover(tabId, target, opts?.label as string | undefined)),
     scroll: (opts: Opts) => acting(() => engine.scroll(tabId, { dx: 0, dy: 600, ...opts })),

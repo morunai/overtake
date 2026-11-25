@@ -85,6 +85,7 @@ function start(m: Start) {
     click: (target: string, opts?: object) => call('click', target, opts),
     type: (target: string | null, text: string, opts?: object) => call('type', target, text, opts),
     fill: (target: string, text: string, opts?: object) => call('fill', target, text, opts),
+    select: (target: string, values: string | string[], opts?: object) => call('select', target, values, opts),
     press: (keys: string, opts?: object) => call('press', keys, opts),
     hover: (target: string, opts?: object) => call('hover', target, opts),
     scroll: (opts?: object) => call('scroll', opts),

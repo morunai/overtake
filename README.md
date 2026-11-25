@@ -126,7 +126,7 @@ It prints the `claude mcp add` command for that instance.
 | Spaces and control | `spaces_list` `spaces_create` `spaces_close` `spaces_switch` `spaces_rename` `space_claim` `space_release` `space_handoff` `space_resume` `space_wait_for_control` `space_status` `space_mark_error` |
 | Tabs and navigation | `browser_tabs` `browser_navigate` `browser_wait` |
 | Observation | `browser_snapshot` `browser_screenshot` `browser_evaluate` `browser_network` `browser_console` `browser_events` `browser_frames` |
-| Input | `browser_click` `browser_hover` `browser_type` `browser_press` `browser_scroll` `browser_drag` `browser_dialog` |
+| Input | `browser_click` `browser_hover` `browser_type` `browser_select` `browser_press` `browser_scroll` `browser_drag` `browser_dialog` |
 | Files and popups | `browser_upload` `browser_downloads` (popups opened by a click join the agent's Space) |
 | Scripts | `browser_run` (a whole flow from one script file; each call uses the same real input and checks) |
 | Advanced | `browser_intercept` `browser_emulate` `browser_trace` `browser_debug` `browser_cdp` `browser_capabilities` |

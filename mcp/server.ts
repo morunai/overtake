@@ -24,7 +24,8 @@ Rules:
 - Pages often keep changing after load. To wait for an element, pass waitFor to browser_navigate or use browser_wait with a selector; do not guess with fixed delays.
 - SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
 - For many steps or repeated flows (test suites, filling many forms, checking many pages), write a script file once and run it with browser_run instead of one tool call per step. Re-run the same file after fixing it.
-- Pass snapshot: true to browser_click, browser_type, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
+- Use browser_select for native <select> dropdowns, not browser_evaluate.
+- Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
 - A CERT_ERROR (untrusted certificate, Chrome's "Privacy error" page) cannot be bypassed from the extension: hand off so the user clicks "Proceed" once, then navigate again.
@@ -252,7 +253,7 @@ server.registerTool('browser_run', {
   description: [
     'Run a whole flow from one script in this tab, so you are in the loop only at the start and the end. Write the script to a file once (file), then re-run it after fixes; or pass a short one inline (script).',
     'The script is the body of an async function. Each call uses the same real input and checks as the tools:',
-    'click(target, {button, clickCount, force, humanlike, label}), type(target|null, text, {clear, submit, slowly}), fill(target, text), press(keys, {repeat}), hover(target), scroll({target, dx, dy}), drag(from, to), upload(target, files), dialog(accept, promptText),',
+    'click(target, {button, clickCount, force, humanlike, label}), type(target|null, text, {clear, submit, slowly}), fill(target, text), select(target, valueOrLabel | [values]), press(keys, {repeat}), hover(target), scroll({target, dx, dy}), drag(from, to), upload(target, files), dialog(accept, promptText),',
     'navigate(url, {waitFor, waitUntil, timeoutMs}), wait(selector | ms | {selector, state, text, urlIncludes, function, networkIdleMs, load, timeoutMs}), sleep(ms), snapshot({scope}) -> text with @refs, url(), evaluate(expressionOrFunction, ...args) -> value in the page,',
     'assert(condition, message), log(...values), console.log, args (your input). Targets are the same as the tools: @refs, CSS, "text=...", "xpath=...".',
     'Errors are thrown into the script (e.code, e.message) and may be caught. Uncaught ones fail the run with the step, the script line and a snapshot of the page.',
@@ -328,6 +329,11 @@ server.registerTool('browser_click', {
 
 server.registerTool('browser_hover', { description: 'Move the mouse over an element.', inputSchema: { tabId, target, label: z.string().max(60).optional() } },
   wrap(async (a: { tabId: number; target: string; label?: string }) => engine.hover(a.tabId, a.target, a.label)));
+
+server.registerTool('browser_select', {
+  description: 'Choose option(s) in a native <select> by value or visible label (several for a multiple select). Checks the element like a click (visible, on top). For a custom dropdown built from other elements, click it and then click the option instead.',
+  inputSchema: { tabId, target, values: z.union([z.string(), z.array(z.string()).min(1).max(100)]).describe('Option value or visible label, or a list for a multiple select.'), force: z.boolean().default(false), label: z.string().max(60).optional(), ...snapshotOpts },
+}, wrap(async (a: { tabId: number; target: string; values: string | string[]; force: boolean; label?: string } & SnapshotOpts) => { const t0 = Date.now(); return afterAction(a.tabId, await engine.select(a.tabId, a.target, a.values, a), a, t0); }));
 
 server.registerTool('browser_type', {
   description: 'Type text. With target, clicks it first. clear replaces existing text; submit presses Enter; slowly sends per-key events instead of a single insertText.',
