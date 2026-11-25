@@ -1130,8 +1130,10 @@ export class Engine {
         steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'drop', x: pb.x, y: pb.y }, delayMs: 40, drag: 'native' });
       }
       t.cursor = pb;
-      const r = await this.client.request<{ nativeDrag?: boolean }>('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
-      if (r.nativeDrag && crossSite) {
+      // The extension also checks the drop point right before the drop (an iframe may have
+      // appeared there during the drag) and cancels instead: crossFrame.
+      const r = await this.client.request<{ nativeDrag?: boolean; crossFrame?: boolean }>('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
+      if (r.nativeDrag && (crossSite || r.crossFrame)) {
         throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The page started a native HTML5 drag, and native drags into or out of a cross-site iframe cannot be completed from here; the drag was cancelled. Try the page\'s own alternative (a menu, buttons or keyboard reordering), or browser_evaluate.');
       }
       return { dragged: { from: pa, to: pb }, kind: r.nativeDrag ? 'html5' : 'pointer' };

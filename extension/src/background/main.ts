@@ -406,16 +406,31 @@ function markDrag(params: Record<string, unknown>, secret: string): Record<strin
   return { ...params, data: { ...data, items: [...items, { mimeType: DRAG_MARK, data: secret }] } };
 }
 
+/** Whether a native drop at this point would land on a frame owner element. Drag events go
+ *  to the top page's process, and the hit test goes through same-process frames to their
+ *  content, so a frame element here is a cross-site iframe the drop cannot reach. Run during
+ *  the burst, when the shield overlay is inert and not hit. */
+async function dropOverRemoteFrame(tabId: number, x: number, y: number): Promise<boolean> {
+  try {
+    const hit = (await dbg.send(tabId, 'DOM.getNodeForLocation', { x: Math.round(x), y: Math.round(y) })) as { backendNodeId: number };
+    const d = (await dbg.send(tabId, 'DOM.describeNode', { backendNodeId: hit.backendNodeId })) as { node: { nodeName: string } };
+    return d.node.nodeName === 'IFRAME' || d.node.nodeName === 'FRAME';
+  } catch {
+    return false;
+  }
+}
+
 /** Native drags the page started during a drag burst (Input.dragIntercepted), by tab. */
 const dragWatch = new Map<number, (data: unknown) => void>();
 
-async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: InputStep[], label?: string): Promise<{ dispatched: number; nativeDrag?: boolean }> {
+async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: InputStep[], label?: string): Promise<{ dispatched: number; nativeDrag?: boolean; crossFrame?: boolean }> {
   await dbg.ensureAttached(tabId);
   // A drag burst intercepts native HTML5 drags only for its own duration: left on, the
   // interception would swallow the human's drags in this tab.
   const dragBurst = steps.some((st) => st.drag);
   let dragData: unknown = null;
   let dropped = false;
+  let crossFrame = false;
   let last = { x: 0, y: 0 };
   if (label) {
     s.statusText = label;
@@ -442,6 +457,14 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         for (let i = 0; i < 10 && !dragData; i++) await new Promise((r) => setTimeout(r, 15));
         if (!dragData) continue;
         step = { ...step, params: { ...step.params, data: dragData } };
+      }
+      if (step.drag === 'native' && (step.params as { type?: string }).type === 'drop') {
+        const p = step.params as { x: number; y: number };
+        if (await dropOverRemoteFrame(tabId, p.x, p.y)) {
+          // Cancel at the press origin: a drag event sent over the remote frame goes nowhere.
+          crossFrame = true;
+          step = { ...step, params: { ...step.params, type: 'dragCancel', x: pressed?.x ?? p.x, y: pressed?.y ?? p.y } };
+        }
       }
       if (step.method === 'Input.dispatchDragEvent') step = { ...step, params: markDrag(step.params, secret) };
       if (step.delayMs) await new Promise((r) => setTimeout(r, Math.min(step.delayMs!, 2000)));
@@ -485,7 +508,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
     // Never leave a native drag or a held button in the page after an aborted burst.
     if (dragData && !dropped) {
       await setNativeIgnore(tabId, false).catch(() => {});
-      await dbg.send(tabId, 'Input.dispatchDragEvent', { type: 'dragCancel', x: last.x, y: last.y, data: dragData }).catch(() => {});
+      await dbg.send(tabId, 'Input.dispatchDragEvent', { type: 'dragCancel', x: pressed?.x ?? last.x, y: pressed?.y ?? last.y, data: dragData }).catch(() => {});
     }
     if (pressed) {
       await setNativeIgnore(tabId, false).catch(() => {});
@@ -500,7 +523,7 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
       await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: false }).catch(() => {});
     }
   }
-  return dragBurst ? { dispatched, nativeDrag: !!dragData } : { dispatched };
+  return dragBurst ? { dispatched, nativeDrag: !!dragData, ...(crossFrame ? { crossFrame } : {}) } : { dispatched };
 }
 
 // ---------------------------------------------------------------------------

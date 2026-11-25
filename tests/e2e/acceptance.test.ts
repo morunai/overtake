@@ -628,6 +628,13 @@ test('browser_drag completes native HTML5 drags and still does pointer drags', a
     assert.equal((await A.call('browser_evaluate', { tabId: space.tabId, frameId: x.frameId, expression: 'JSON.stringify(frameLog)' })).value, '["fdragstart","fdragend"]');
     assert.equal(await ev(`document.getElementById('bin').dataset.dropped ?? null`), null);
   }
+  // A cross-site iframe that appears under the drop point during the drag: checked right
+  // before the drop, so it is cancelled and reported too.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?latex=1` });
+  const lzx = await ev(`(() => { const r = document.getElementById('lateZone').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`) as { x: number; y: number };
+  await assert.rejects(A.call('browser_drag', { tabId: space.tabId, from: 'text=Native two', to: `${lzx.x},${lzx.y}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n2', 'dragend']);
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?late=1` });
   // Raw drag events sent to a cross-site iframe's own session (frame coordinates) are marked
   // and admitted too.
   let xf: { frameId: string; sessionId?: string } | undefined;
