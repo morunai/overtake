@@ -242,7 +242,8 @@ const VISIBLE_TEXT_JS = `
     walk(document);
     return out;
   };
-  const visibleText = (root) => root.nodeType === 9 ? (root.body?.innerText || '') : [...root.children].filter(shown).map((c) => c.innerText ?? '').join('\\n');
+  const visibleText = (root) => root.nodeType === 9 ? (root.body?.innerText || '')
+    : [...root.childNodes].map((n) => n.nodeType === 3 ? (shown(root.host) ? n.data : '') : n.nodeType === 1 && shown(n) ? (n.innerText ?? '') : '').join('\\n');
   const count = (text) => {
     let n = 0;
     for (const r of roots()) {
@@ -707,12 +708,14 @@ export class Engine {
         ${VISIBLE_TEXT_JS}
         const has = (node) => {
           // The matching text itself must be rendered: innerText leaves out hidden descendants.
-          if (node.nodeType === 3) return node.data.includes(text) && shown(node.parentElement);
+          if (node.nodeType === 3) return node.data.includes(text) && shown(node.parentElement ?? node.parentNode?.host);
           return node.nodeType === 1 && shown(node) && (node.innerText ?? '').includes(text);
         };
         const entry = { seen: false, low: 0 };
         const observers = [];
-        const stop = () => { for (const o of observers) o.disconnect(); observers.length = 0; clearTimeout(entry.ttl); };
+        // Matching disconnects the observers; the ttl still removes the entry if unwatchText
+        // never comes (a take-over, a disconnect).
+        const stop = () => { for (const o of observers) o.disconnect(); observers.length = 0; };
         const onMutations = (list) => {
           for (const m of list) {
             if ((m.type === 'characterData' && has(m.target)) || [...m.addedNodes].some(has)) { entry.seen = true; stop(); return; }
@@ -731,7 +734,7 @@ export class Engine {
           }
           return entry.seen;
         };
-        entry.stop = () => { stop(); delete w[id]; };
+        entry.stop = () => { stop(); clearTimeout(entry.ttl); delete w[id]; };
         entry.low = count(text);
         entry.ttl = setTimeout(entry.stop, ${Math.max(1000, Math.round(ttlMs))});
         w[id] = entry; })()`;

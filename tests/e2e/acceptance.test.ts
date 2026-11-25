@@ -735,6 +735,7 @@ test('waitForText waits for text the action makes appear; receipts list requests
   await timesOut(click('#mixed', { waitForText: 'Mixed hidden', waitTimeoutMs: 600 }));
   await timesOut(click('#vishidden', { waitForText: 'Invisible text', waitTimeoutMs: 600 }));
   assert.equal((await click('#shadowreveal', { waitForText: 'Shadow reveal' })).appeared, 'Shadow reveal');
+  assert.equal((await click('#bareshadow', { waitForText: 'Bare shadow success' })).appeared, 'Bare shadow success');
   // A shadow root attached by the action, and an iframe whose document the action replaces.
   assert.equal((await click('#lateshadow', { waitForText: 'Late shadow' })).appeared, 'Late shadow');
   assert.equal((await click('#srcdoc', { waitForText: 'Srcdoc done' })).appeared, 'Srcdoc done');
