@@ -369,10 +369,16 @@ const MOUSE_TYPES: Record<string, string[]> = {
 };
 
 /** The DOM events one input step will cause, so the in-page shield admits exactly those. */
-function permitFor(step: InputStep): Permit {
+function permitFor(step: InputStep, held: boolean): Permit {
   const p = step.params as Record<string, unknown>;
   if (step.method === 'Input.dispatchMouseEvent' && typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
-    return { types: MOUSE_TYPES[String(p.type)] || [], x: p.x, y: p.y };
+    // A move with the agent's button held can start a native drag: Chrome fires dragstart
+    // at the press origin, not at this point.
+    const loose = (held || (typeof p.buttons === 'number' && p.buttons > 0)) && p.type === 'mouseMoved' ? ['dragstart'] : undefined;
+    return { types: MOUSE_TYPES[String(p.type)] || [], x: p.x, y: p.y, ...(loose ? { loose } : {}) };
+  }
+  if (step.method === 'Input.dispatchDragEvent' && typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
+    return { types: ['dragenter', 'dragover', 'dragleave', 'drop'], x: p.x, y: p.y, loose: ['dragend'] };
   }
   if (step.method === 'Input.dispatchKeyEvent') {
     return { types: ['keydown', 'keyup', 'keypress', 'beforeinput', 'input', 'paste', 'cut'], key: typeof p.key === 'string' ? p.key : undefined };
@@ -381,8 +387,26 @@ function permitFor(step: InputStep): Permit {
   return { types: ['*'] };
 }
 
-async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: InputStep[], label?: string): Promise<{ dispatched: number }> {
+/** Native drags the page started during a drag burst (Input.dragIntercepted), by tab. */
+const dragWatch = new Map<number, (data: unknown) => void>();
+
+async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: InputStep[], label?: string): Promise<{ dispatched: number; nativeDrag?: boolean }> {
   await dbg.ensureAttached(tabId);
+  // A drag burst intercepts native HTML5 drags only for its own duration: left on, the
+  // interception would swallow the human's drags in this tab.
+  const dragBurst = steps.some((st) => st.drag);
+  let dragData: unknown = null;
+  let dropped = false;
+  let last = { x: 0, y: 0 };
+  if (dragBurst) {
+    dragWatch.set(tabId, (data) => (dragData ??= data));
+    try {
+      await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: true });
+    } catch (e) {
+      dragWatch.delete(tabId);
+      throw e;
+    }
+  }
   if (label) {
     s.statusText = label;
     pushOverlay(s);
@@ -394,7 +418,14 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   await setNativeIgnore(tabId, true);
   if (shield) await sendAllFramesAcked(tabId, { type: 'overtake:pass', pass: true });
   try {
-    for (const step of steps) {
+    for (let step of steps) {
+      if (step.drag === 'pointer' && dragData) continue; // the page took it as a native drag
+      if (step.drag === 'native') {
+        // The drag may start on the last move: give Chrome's event a moment to arrive.
+        for (let i = 0; i < 10 && !dragData; i++) await new Promise((r) => setTimeout(r, 15));
+        if (!dragData) continue;
+        step = { ...step, params: { ...step.params, data: dragData } };
+      }
       if (step.delayMs) await new Promise((r) => setTimeout(r, Math.min(step.delayMs!, 2000)));
       const d = gate(s.ctl, agentKey);
       if (!d.run) {
@@ -408,8 +439,15 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         if (p.type === 'mousePressed') pressed = { x: p.x, y: p.y, button: p.button || 'left' };
         if (p.type === 'mouseReleased') pressed = null;
       }
+      if (step.method === 'Input.dispatchDragEvent') {
+        const p = step.params as { type: string; x: number; y: number };
+        if (typeof p.x === 'number' && typeof p.y === 'number' && !step.sessionId) {
+          sendTop(tabId, { type: 'overtake:cursor', x: p.x, y: p.y, kind: 'mouseMoved', label });
+          last = { x: p.x, y: p.y };
+        }
+      }
       // Tell the top frame exactly which trusted events this step will produce.
-      if (shield) await sendTopAcked(tabId, { type: 'overtake:permit', permit: permitFor(step) });
+      if (shield) await sendTopAcked(tabId, { type: 'overtake:permit', permit: permitFor(step, pressed !== null) });
       await setNativeIgnore(tabId, false);
       try {
         await dbg.send(tabId, step.method, step.params, step.sessionId);
@@ -417,9 +455,14 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
         await setNativeIgnore(tabId, true).catch(() => {});
       }
       dispatched++;
+      if (step.method === 'Input.dispatchDragEvent' && (step.params as { type?: string }).type === 'drop') dropped = true;
     }
   } catch (e) {
-    // Never leave a button held down in the page after an aborted burst.
+    // Never leave a native drag or a held button in the page after an aborted burst.
+    if (dragData && !dropped) {
+      await setNativeIgnore(tabId, false).catch(() => {});
+      await dbg.send(tabId, 'Input.dispatchDragEvent', { type: 'dragCancel', x: last.x, y: last.y, data: dragData }).catch(() => {});
+    }
     if (pressed) {
       await setNativeIgnore(tabId, false).catch(() => {});
       await dbg.send(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: pressed.x, y: pressed.y, button: pressed.button, clickCount: 1 }).catch(() => {});
@@ -428,8 +471,12 @@ async function runInputBurst(s: Space, agentKey: string, tabId: number, steps: I
   } finally {
     if (shield) await sendAllFramesAcked(tabId, { type: 'overtake:pass', pass: false }).catch(() => 0);
     await setNativeIgnore(tabId, false).catch(() => {});
+    if (dragBurst) {
+      dragWatch.delete(tabId);
+      await dbg.send(tabId, 'Input.setInterceptDrags', { enabled: false }).catch(() => {});
+    }
   }
-  return { dispatched };
+  return dragBurst ? { dispatched, nativeDrag: !!dragData } : { dispatched };
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +685,7 @@ chrome.windows.onRemoved.addListener((windowId) => {
 // Debugger events
 
 function onCdpEvent(tabId: number, sessionId: string | undefined, method: string, params: unknown) {
+  if (method === 'Input.dragIntercepted' && !sessionId) dragWatch.get(tabId)?.((params as { data?: unknown })?.data);
   const s = spaceOfTab(tabId);
   if (!s?.ctl.owner) return;
   emit(s.ctl.owner, { type: 'cdp', tabId, sessionId, method, params });
@@ -966,6 +1014,10 @@ async function handleRequest(agentKey: string, op: Operation, args: Record<strin
       for (const st of steps) {
         const pol = checkCdpMethod(st?.method, st?.params ?? {});
         if (!pol.input) throw new OvertakeError(ErrorCode.BAD_REQUEST, `${st.method} is not an input method.`);
+        if (st.drag !== undefined) {
+          const ok = (st.drag === 'pointer' && st.method === 'Input.dispatchMouseEvent') || (st.drag === 'native' && st.method === 'Input.dispatchDragEvent');
+          if (!ok || st.sessionId) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'drag steps are mouse events (pointer) or drag events (native) in the top frame.');
+        }
       }
       const label = typeof args.label === 'string' ? args.label.slice(0, 80) : undefined;
       return gated(space, agentKey, label || 'input', () => runInputBurst(space, agentKey, tabId, steps, label), { tabId });

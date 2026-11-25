@@ -55,10 +55,11 @@ import { agentIdentity, AGENT_LOGO } from '../ui/identity.ts';
   // match the permit for the step being dispatched (type + coordinates or key)
   // pass. Subframes cannot see the top frame's permit and pass during bursts;
   // Chrome's own input gate covers them outside the per-step dispatch window.
-  let permit: { types: string[]; x?: number; y?: number; key?: string; until: number } | null = null;
+  let permit: { types: string[]; x?: number; y?: number; key?: string; loose?: string[]; until: number } | null = null;
 
   function permitted(e: Event): boolean {
     if (!permit || Date.now() > permit.until) return false;
+    if (permit.loose?.includes(e.type)) return true;
     if (!permit.types.includes('*') && !permit.types.includes(e.type)) return false;
     if (permit.x !== undefined && 'clientX' in e) {
       const me = e as MouseEvent;

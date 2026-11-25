@@ -22,6 +22,9 @@ export interface Permit {
   x?: number; // mouse: viewport coordinates of the agent event
   y?: number;
   key?: string; // keyboard: KeyboardEvent.key
+  /** Types admitted without the coordinate check: the native drag events Chrome fires away
+   *  from the step's point (dragstart at the press origin, dragend on the source). */
+  loose?: string[];
 }
 
 export type OverlayMessage =

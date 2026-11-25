@@ -577,6 +577,47 @@ test('typing, keys, scroll and drag use real input', async () => {
   assert.equal(d.dragged.to.x, 400);
 });
 
+test('browser_drag completes native HTML5 drags and still does pointer drags', async () => {
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html` });
+  const ev = (e: string) => A.call('browser_evaluate', { tabId: space.tabId, expression: e }).then((r: { value: unknown }) => r.value);
+  // A draggable item dropped on a drop zone: the zone reads the page's own drag data.
+  const d1 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#bin' });
+  assert.equal(d1.kind, 'html5');
+  assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n1');
+  assert.deepEqual(await ev('dragLog'), ['dragstart:n1', 'bin:n1', 'dragend']);
+  assert.equal(await ev('clicks'), 0, 'a drag is not a click');
+  // Sortable list reorders through dragover and drop on other items.
+  const d2 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: 'text=Native three' });
+  assert.equal(d2.kind, 'html5');
+  assert.equal(await ev(`document.getElementById('native').dataset.order`), 'n2,n3,n1');
+  // Pointer-event lists still use the pointer path.
+  const d3 = await A.call('browser_drag', { tabId: space.tabId, from: 'text=Pointer one', to: 'text=Pointer three' });
+  assert.equal(d3.kind, 'pointer');
+  assert.equal(await ev(`document.getElementById('pointer').dataset.order`), 'p2,p3,p1');
+  // Nothing is left held down or intercepted: a click works, and the agent cannot turn
+  // drag interception on itself (it would swallow the human's drags).
+  await A.call('browser_click', { tabId: space.tabId, target: '#after' });
+  assert.equal(await ev(`document.getElementById('after').dataset.n`), '1');
+  await assert.rejects(A.call('browser_cdp', { tabId: space.tabId, method: 'Input.setInterceptDrags', params: { enabled: true } }), (e) => code(e) === 'CDP_METHOD_DENIED');
+  // Works from a script too.
+  const r = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `return (await drag('text=Native two', '#bin')).kind;` })).content[0].text);
+  assert.equal(r.result, 'html5');
+  assert.equal(await ev(`document.getElementById('bin').dataset.dropped`), 'n2');
+  // A take-over in the middle of a native drag cancels it: the page gets dragend, no drop.
+  await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/drag.html?takeover=1` });
+  const page = await h.humanSession('drag.html?takeover=1');
+  const drag = A.callRaw('browser_drag', { tabId: space.tabId, from: 'text=Native one', to: '#bin' });
+  for (let i = 0; i < 200 && !(await h.eval<string[]>(page, 'dragLog')).length; i++) await sleep(10);
+  await h.humanAction(ext, 'takeover', space.spaceId);
+  const r2 = await drag;
+  assert.ok(r2.isError);
+  assert.match(r2.content[0].text, /^USER_IN_CONTROL/);
+  assert.deepEqual(await h.eval(page, 'dragLog'), ['dragstart:n1', 'dragend']);
+  assert.equal(await h.eval(page, `document.getElementById('bin').dataset.dropped ?? null`), null);
+  await h.humanAction(ext, 'giveback', space.spaceId);
+  await A.call('space_wait_for_control', { spaceId: space.spaceId, timeoutMs: 5000 });
+});
+
 test('console, exceptions, interception, emulation, tracing, debugging', async () => {
   await A.call('browser_navigate', { tabId: space.tabId, url: `${SITE}/?nav=3` });
   await A.call('browser_click', { tabId: space.tabId, target: '#boom' });

@@ -1109,14 +1109,21 @@ export class Engine {
       const pa = a.point ?? (await this.#pointFor(t, a.node!, true));
       const b = await this.#resolve(t, to);
       const pb = b.point ?? (await this.#pointFor(t, b.node!, true));
-      const steps = this.#path(t, pa);
-      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pa.x, y: pa.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      const steps: InputStep[] = this.#path(t, pa);
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x: pa.x, y: pa.y, button: 'left', clickCount: 1, buttons: 1 }, delayMs: 40 });
       const n = 12;
-      for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x: pa.x + ((pb.x - pa.x) * i) / n, y: pa.y + ((pb.y - pa.y) * i) / n, button: 'left', buttons: 1 }, delayMs: 18 });
-      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40 });
+      const at = (i: number) => ({ x: pa.x + ((pb.x - pa.x) * i) / n, y: pa.y + ((pb.y - pa.y) * i) / n });
+      // Pointer moves first. If the page starts a native HTML5 drag on one of them, the
+      // extension intercepts it, skips the remaining pointer steps and runs the native ones
+      // (drag events with the page's own drag data) instead; otherwise those are skipped.
+      for (let i = 1; i <= n; i++) steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', ...at(i), button: 'left', buttons: 1 }, delayMs: 18, drag: 'pointer' });
+      steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', clickCount: 1 }, delayMs: 40, drag: 'pointer' });
+      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragEnter', ...at(1) }, drag: 'native' });
+      for (let i = 2; i <= n; i++) steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'dragOver', ...at(i) }, delayMs: 18, drag: 'native' });
+      steps.push({ method: 'Input.dispatchDragEvent', params: { type: 'drop', x: pb.x, y: pb.y }, delayMs: 40, drag: 'native' });
       t.cursor = pb;
-      await this.client.request('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
-      return { dragged: { from: pa, to: pb } };
+      const r = await this.client.request<{ nativeDrag?: boolean }>('input.batch', { tabId, steps, label: label || `drag ${a.desc} → ${b.desc}`.slice(0, 60) });
+      return { dragged: { from: pa, to: pb }, kind: r.nativeDrag ? 'html5' : 'pointer' };
     });
   }
 

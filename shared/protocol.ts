@@ -211,6 +211,10 @@ export interface InputStep {
   sessionId?: string;
   /** Delay before this step, ms (used for natural cursor motion). */
   delayMs?: number;
+  /** Drag steps (browser_drag). The burst intercepts native HTML5 drags: once the page starts
+   *  one, 'pointer' steps are skipped and 'native' steps (Input.dispatchDragEvent, without
+   *  data) run with the intercepted drag data. Without a native drag, 'native' steps are skipped. */
+  drag?: 'pointer' | 'native';
 }
 
 export const INPUT_METHODS = new Set<string>([

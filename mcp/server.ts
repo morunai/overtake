@@ -350,7 +350,7 @@ server.registerTool('browser_scroll', {
   inputSchema: { tabId, target: target.optional(), dx: z.number().default(0), dy: z.number().default(600), label: z.string().max(60).optional() },
 }, wrap(async (a: { tabId: number; target?: string; dx: number; dy: number; label?: string }) => engine.scroll(a.tabId, a)));
 
-server.registerTool('browser_drag', { description: 'Drag with real mouse input from one target to another (pointer-event drags; native HTML5 drag-and-drop may not respond).', inputSchema: { tabId, from: target, to: target, label: z.string().max(60).optional() } },
+server.registerTool('browser_drag', { description: 'Drag with real mouse input from one target to another. Works for pointer-event drags and native HTML5 drag and drop (draggable elements, SortableJS, react-dnd): when the page starts a native drag, it is completed with real drag events carrying the page\'s own drag data. Returns kind: "pointer" or "html5".', inputSchema: { tabId, from: target, to: target, label: z.string().max(60).optional() } },
   wrap(async (a: { tabId: number; from: string; to: string; label?: string }) => engine.drag(a.tabId, a.from, a.to, a.label)));
 
 server.registerTool('browser_upload', {

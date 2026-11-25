@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Drag Test Page</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; }
+  ul { list-style: none; padding: 0; width: 220px; display: inline-block; vertical-align: top; margin-right: 40px; }
+  li { padding: 10px; margin: 4px 0; background: #dbeafe; border-radius: 6px; user-select: none; }
+  li.over { outline: 2px dashed #2563eb; }
+  #bin { display: inline-block; width: 200px; height: 140px; background: #fde68a; border-radius: 8px; padding: 10px; vertical-align: top; }
+  #bin.over { outline: 3px dashed #b45309; }
+  #pointer li { background: #dcfce7; touch-action: none; }
+</style>
+</head>
+<body>
+<h1>Drag Test Page</h1>
+<!-- Native HTML5 drag and drop, like SortableJS or react-dnd's HTML5 backend. -->
+<ul id="native" aria-label="Native list">
+  <li draggable="true" data-id="n1">Native one</li>
+  <li draggable="true" data-id="n2">Native two</li>
+  <li draggable="true" data-id="n3">Native three</li>
+</ul>
+<div id="bin" aria-label="Drop zone">Drop here</div>
+<button id="after" onclick="this.dataset.n = (+this.dataset.n || 0) + 1">After</button>
+<!-- Pointer-event dragging, like dnd-kit. -->
+<ul id="pointer" aria-label="Pointer list">
+  <li data-id="p1">Pointer one</li>
+  <li data-id="p2">Pointer two</li>
+  <li data-id="p3">Pointer three</li>
+</ul>
+<script>
+  window.dragLog = [];
+  window.clicks = 0;
+  document.addEventListener('click', () => clicks++);
+  const order = (ul) => [...ul.children].map((li) => li.dataset.id).join(',');
+  const native = document.getElementById('native');
+  const bin = document.getElementById('bin');
+  let dragged = null;
+  native.addEventListener('dragstart', (e) => {
+    dragged = e.target.closest('li');
+    e.dataTransfer.setData('text/plain', dragged.dataset.id);
+    e.dataTransfer.effectAllowed = 'move';
+    dragLog.push('dragstart:' + dragged.dataset.id);
+  });
+  native.addEventListener('dragover', (e) => {
+    const li = e.target.closest('li');
+    if (!li || !dragged || li === dragged) return;
+    e.preventDefault();
+    li.classList.add('over');
+  });
+  native.addEventListener('dragleave', (e) => e.target.closest('li')?.classList.remove('over'));
+  native.addEventListener('drop', (e) => {
+    const li = e.target.closest('li');
+    if (!li || !dragged || li === dragged) return;
+    e.preventDefault();
+    li.classList.remove('over');
+    const after = [...native.children].indexOf(dragged) < [...native.children].indexOf(li);
+    li.parentNode.insertBefore(dragged, after ? li.nextSibling : li);
+    dragLog.push('drop:' + e.dataTransfer.getData('text/plain') + '>' + li.dataset.id);
+    native.dataset.order = order(native);
+  });
+  native.addEventListener('dragend', () => {
+    dragLog.push('dragend');
+    dragged = null;
+  });
+  bin.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    bin.classList.add('over');
+  });
+  bin.addEventListener('dragleave', () => bin.classList.remove('over'));
+  bin.addEventListener('drop', (e) => {
+    e.preventDefault();
+    bin.classList.remove('over');
+    const id = e.dataTransfer.getData('text/plain');
+    bin.dataset.dropped = id;
+    bin.textContent = 'Dropped ' + id;
+    dragLog.push('bin:' + id);
+  });
+  native.dataset.order = order(native);
+
+  // Pointer-based sortable: move the item while the pointer is down.
+  const pointer = document.getElementById('pointer');
+  let held = null;
+  pointer.addEventListener('pointerdown', (e) => {
+    held = e.target.closest('li');
+    if (held) pointer.setPointerCapture(e.pointerId);
+  });
+  pointer.addEventListener('pointermove', (e) => {
+    if (!held) return;
+    const over = document.elementsFromPoint(e.clientX, e.clientY).find((el) => el.parentNode === pointer && el !== held);
+    if (!over) return;
+    const after = [...pointer.children].indexOf(held) < [...pointer.children].indexOf(over);
+    pointer.insertBefore(held, after ? over.nextSibling : over);
+  });
+  pointer.addEventListener('pointerup', () => {
+    if (held) pointer.dataset.order = order(pointer);
+    held = null;
+  });
+  pointer.dataset.order = order(pointer);
+</script>
+</body>
+</html>
