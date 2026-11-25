@@ -13,6 +13,25 @@ const port = parentPort!;
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void; line?: number }>();
 let seq = 0;
 let filename = 'script.js';
+// Success is reported only once the script has returned and no call is pending, after the
+// event loop turns once: a .then() chain on an unawaited call may start another call.
+let scriptDone = false;
+let result: unknown;
+let reported = false;
+function maybeDone() {
+  if (!scriptDone || reported || pending.size) return;
+  setImmediate(() => {
+    if (reported || pending.size) return;
+    reported = true;
+    port.postMessage({ type: 'done', value: jsonSafe(result) });
+  });
+}
+// A call the script did not await that fails, with nothing handling it, fails the run.
+process.on('unhandledRejection', (e) => {
+  if (reported) return;
+  reported = true;
+  fail(e);
+});
 
 /** Line in the script file of the innermost stack frame from it. */
 function lineOf(stack: string | undefined): number | undefined {
@@ -90,8 +109,16 @@ function start(m: Start) {
     return;
   }
   promise.then(
-    (v) => port.postMessage({ type: 'done', value: jsonSafe(v) }),
-    (e) => fail(e),
+    (v) => {
+      scriptDone = true;
+      result = v;
+      maybeDone();
+    },
+    (e) => {
+      if (reported) return;
+      reported = true;
+      fail(e);
+    },
   );
 }
 
@@ -122,6 +149,7 @@ port.on('message', (m: Start | Reply) => {
     const p = pending.get(m.id);
     if (!p) return;
     pending.delete(m.id);
+    setImmediate(maybeDone); // after the script's own handlers for this reply have run
     if (m.ok) p.resolve(m.value);
     else {
       const e = new Error(m.error!.message) as Error & { code: string; line?: number; step?: number; op?: string };

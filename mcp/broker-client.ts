@@ -8,6 +8,11 @@ import { EventEmitter } from 'node:events';
 import { paths, readToken } from '../bridge/paths.ts';
 import { OvertakeError, ErrorCode, PROTOCOL_VERSION } from '../shared/protocol.ts';
 import type { AgentEvent, Operation, ResponseMessage } from '../shared/protocol.ts';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+/** Per-call context for requests: browser_run sets notAfter, its deadline, so the extension
+ *  refuses commands that are still queued (for example behind a pause) once it has passed. */
+export const requestScope = new AsyncLocalStorage<{ notAfter?: number }>();
 
 export interface BrokerClientOptions {
   socketPath?: string;
@@ -112,6 +117,8 @@ export class BrokerClient extends EventEmitter {
   }
 
   async request<T = unknown>(op: Operation, args: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    const scope = requestScope.getStore();
+    if (scope?.notAfter !== undefined && args.notAfter === undefined) args = { ...args, notAfter: scope.notAfter };
     if (this.#closed) throw new OvertakeError(ErrorCode.EXTENSION_NOT_CONNECTED, 'Client closed.');
     await this.connect();
     const sock = this.#sock;

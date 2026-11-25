@@ -249,6 +249,11 @@ export class Engine {
     return null;
   }
 
+  /** True while the human has paused this agent in the Space (its commands queue). */
+  isPaused(spaceId: number) {
+    return this.#spaces.get(spaceId)?.control === 'AGENT_PAUSED';
+  }
+
   #onEvent(e: AgentEvent) {
     this.#applyEvent(e);
     for (const fn of this.#listeners) {

@@ -276,8 +276,10 @@ server.registerTool('browser_run', {
     throw new OvertakeError(r.hardStop.code, `${r.hardStop.message} browser_run stopped${where ? ` at ${where}` : ''}; the steps before it ran.`);
   }
   const { hardStop: _h, lastActionAt, ...receipt } = r;
-  // A failed run always comes with the page, so the script can be fixed without another call.
-  return afterAction(a.tabId, receipt, { ...a, snapshot: a.snapshot || !r.ok }, lastActionAt);
+  // A failed run always comes with the page, so the script can be fixed without another call;
+  // not while paused, where a snapshot would queue behind the pause.
+  const paused = engine.isPaused(await engine.spaceOf(a.tabId));
+  return afterAction(a.tabId, paused ? { ...receipt, note: 'The human paused the agent, so no snapshot was taken; your next command will wait for Resume.' } : receipt, { ...a, snapshot: a.snapshot || !r.ok }, lastActionAt);
 }));
 
 server.registerTool('browser_network', {

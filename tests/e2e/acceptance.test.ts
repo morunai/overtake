@@ -220,6 +220,13 @@ test('browser_run from a file: errors carry the step, the line and a snapshot; c
     const unawaited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn'); click('#btn'); return 'early';` })).content[0].text);
     assert.equal(unawaited.ok, true);
     assert.equal(await count(), n0 + 2, 'both clicks ran, in order, before the result');
+    const n2 = await count();
+    const chained = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#btn').then(() => click('#btn')); return 1;` })).content[0].text);
+    assert.equal(chained.ok, true);
+    assert.equal(await count(), n2 + 2, 'a chained call started after the return still runs');
+    const failedLater = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `click('#nope-3', { force: true }); return 'early';` })).content[0].text);
+    assert.equal(failedLater.ok, false, 'an unawaited call that fails fails the run');
+    assert.equal(failedLater.error.code, 'ELEMENT_NOT_FOUND');
     // Over the step limit, calls already queued never run.
     const n1 = await count();
     const limited = JSON.parse((await A.callRaw('browser_run', { tabId: space.tabId, script: `for (let i = 0; i < 6; i++) click('#btn'); await sleep(1500);`, maxSteps: 2 })).content[0].text);
@@ -272,6 +279,16 @@ test('browser_run stops on a take-over even while the script is sleeping or busy
     await h.humanAction(ext, 'giveback', s.spaceId);
     await A.call('space_wait_for_control', { spaceId: s.spaceId, timeoutMs: 5000 });
   }
+  // A click queued behind a pause, when the run times out, never runs after Resume.
+  const page = await h.humanSession('?script-takeover=1');
+  const clicks = () => h.eval<string>(page, `document.getElementById('count').dataset.count`).then(Number);
+  const c0 = await clicks();
+  await h.humanAction(ext, 'pause', s.spaceId);
+  const r = JSON.parse((await A.callRaw('browser_run', { tabId: s.tabId, timeoutMs: 1500, script: `await click('#btn');` })).content[0].text);
+  assert.equal(r.error.code, 'TIMEOUT');
+  await h.humanAction(ext, 'resume', s.spaceId);
+  await sleep(1000);
+  assert.equal(await clicks(), c0, 'the timed-out click did not run after Resume');
   await A.call('spaces_close', { spaceId: s.spaceId });
 });
 

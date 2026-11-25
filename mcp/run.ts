@@ -17,7 +17,7 @@ import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { extname, isAbsolute, basename } from 'node:path';
 import { OvertakeError, ErrorCode, toWireError } from '../shared/protocol.ts';
 import { isHardStop, type Engine } from './engine.ts';
-import type { BrokerClient } from './broker-client.ts';
+import { requestScope, type BrokerClient } from './broker-client.ts';
 
 const SCRIPT_EXT = new Set(['.js', '.mjs', '.cjs']);
 const MAX_SCRIPT_BYTES = 1024 * 1024;
@@ -106,10 +106,35 @@ type Where = { step?: number; op?: string; line?: number };
 export async function runScript(engine: Engine, client: BrokerClient, o: RunOptions): Promise<RunOutcome> {
   const { tabId } = o;
   const spaceId = await engine.spaceOf(tabId);
-  await engine.listSpaces(); // fresh control state for the stop checks below
-  const before = engine.controlLost(spaceId);
-  if (before) throw before;
   const t0 = Date.now();
+  // Subscribe before refreshing state, so a take-over that arrives while the list is in
+  // flight is not lost if the list reply is older than it.
+  let pendingStop: { code: string; message: string } | null = null;
+  let onStop = (code: string, message: string) => { pendingStop ??= { code, message }; };
+  const unsubscribe = engine.subscribe((e) => {
+    if (e.type === 'extension' && !e.connected) return onStop(ErrorCode.EXTENSION_NOT_CONNECTED, 'The Overtake extension disconnected.');
+    if (e.type === 'space-closed' && e.spaceId === spaceId) return onStop(ErrorCode.SPACE_CLOSED, e.reason || `Space ${spaceId} was closed.`);
+    if (e.type === 'control' && e.space.spaceId === spaceId) {
+      const lost = engine.controlLost(spaceId);
+      if (lost) onStop(lost.code, lost.message);
+    }
+  });
+  try {
+    await engine.listSpaces();
+  } catch (e) {
+    unsubscribe();
+    throw e;
+  }
+  const stopped = pendingStop as { code: string; message: string } | null;
+  const before = stopped ? new OvertakeError(stopped.code, stopped.message) : engine.controlLost(spaceId);
+  if (before) {
+    unsubscribe();
+    throw before;
+  }
+  // Requests made for this run carry its deadline; the extension refuses ones still queued
+  // after it. On any end of the run the deadline moves to now, so later sub-steps of an
+  // action in flight are refused too.
+  const scope = { notAfter: t0 + o.timeoutMs };
   const logs: string[] = [];
   const trail: Step[] = [];
   let steps = 0;
@@ -162,7 +187,6 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
   const worker = new Worker(new URL('./run-worker.ts', import.meta.url), { resourceLimits: { maxOldGenerationSizeMb: 256 } });
   status('Running a script', true);
 
-  let unsubscribe = () => {};
   const outcome = await new Promise<RunOutcome>((resolve) => {
     let ended = false;
     let active: (Where & { started: number }) | null = null;
@@ -174,6 +198,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
       if (ended) return;
       ended = true;
       queue.length = 0; // calls not started yet never run
+      scope.notAfter = Math.min(scope.notAfter, Date.now());
       clearTimeout(timer);
       unsubscribe();
       void worker.terminate().catch(() => {});
@@ -186,15 +211,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
     const timer = setTimeout(() => fail({ code: ErrorCode.TIMEOUT, message: `The script did not finish within ${o.timeoutMs} ms.`, ...(active ?? { step: steps }) }), o.timeoutMs);
 
     // Control changes stop the run at once, even while the script sleeps or computes.
-    unsubscribe = engine.subscribe((e) => {
-      if (ended) return;
-      if (e.type === 'extension' && !e.connected) return hardStop(ErrorCode.EXTENSION_NOT_CONNECTED, 'The Overtake extension disconnected.');
-      if (e.type === 'space-closed' && e.spaceId === spaceId) return hardStop(ErrorCode.SPACE_CLOSED, e.reason || `Space ${spaceId} was closed.`);
-      if (e.type === 'control' && e.space.spaceId === spaceId) {
-        const lost = engine.controlLost(spaceId);
-        if (lost) hardStop(lost.code, lost.message);
-      }
-    });
+    onStop = (code, message) => hardStop(code, message);
 
     const runOne = async (m: Call) => {
       const n = ++steps;
@@ -208,7 +225,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
       try {
         const fn = Object.hasOwn(ops, m.op) ? ops[m.op] : undefined;
         if (!fn) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Unknown script call ${m.op}.`);
-        const value = await fn(...args);
+        const value = await requestScope.run(scope, () => fn(...args));
         trail.push({ n, op: m.op, detail, line: m.line, ms: Date.now() - s0, ok: true });
         if (!ended) worker.postMessage({ type: 'reply', id: m.id, ok: true, value });
       } catch (e) {
