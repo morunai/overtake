@@ -233,7 +233,7 @@ test('a frame the page cannot reach and its nested frame are each searched once'
   await A.call('browser_wait', { tabId, text: 'inner: 1' });
 });
 
-test('element screenshots stay inside the frame, and pinch zoom still gives CSS pixels', async () => {
+test('element screenshots stay inside the frame, and a pinch-zoomed viewport capture keeps the zoom', async () => {
   await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?wide=1` });
   await A.call('browser_wait', { tabId, selector: '#wide' });
   const shot = await A.callRaw('browser_screenshot', { tabId, target: '#wide' });
@@ -245,8 +245,10 @@ test('element screenshots stay inside the frame, and pinch zoom still gives CSS 
     const r = await A.callRaw('browser_screenshot', { tabId });
     const meta = JSON.parse(r.content.find((c) => c.type === 'text').text);
     const size = pngSize(r.content.find((c) => c.type === 'image').data);
-    assert.equal(meta.scale, 1);
-    assert.ok(Math.abs(size.width - meta.viewport.width) <= 2 && Math.abs(size.height - meta.viewport.height) <= 2, `${JSON.stringify(size)} vs ${JSON.stringify(meta.viewport)}`);
+    // Left as it is (a clip would reset the zoom); scale says how to convert.
+    assert.equal(meta.scale, 2);
+    assert.ok(Math.abs(size.width - 2 * meta.viewport.width) <= 30, `${JSON.stringify(size)} vs ${JSON.stringify(meta.viewport)}`);
+    assert.equal((await A.call('browser_evaluate', { tabId, expression: 'visualViewport.scale' })).value, 2);
   } finally {
     await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 1 } });
   }
@@ -380,6 +382,22 @@ test('frame controls work in a Space opened on a loaded page, and in an iframe i
     await A.call('browser_click', { tabId: fresh.tabId, target: deep });
     const runs = await A.call('browser_evaluate', { tabId: fresh.tabId, expression: `document.getElementById('feature').contentWindow.runs` });
     assert.equal(runs.value, 1);
+  } finally {
+    await A.call('spaces_close', { spaceId: fresh.spaceId });
+  }
+});
+
+test('clear replaces text in a field of an iframe inside a closed shadow root', async () => {
+  const fresh = await A.call('spaces_create', { name: 'iframes closed type', url: `${SITE}/iframe-app.html?closedframe=1` });
+  try {
+    await A.call('browser_wait', { tabId: fresh.tabId, selector: 'text=Run deep query' });
+    const snap = await A.call('browser_snapshot', { tabId: fresh.tabId });
+    const box = [...snap.matchAll(/textbox "Search log groups" (@\d+)/g)].map((m) => m[1]);
+    // The closed-shadow frame comes first in the page.
+    let r = await A.call('browser_type', { tabId: fresh.tabId, target: box[0], text: 'old' });
+    assert.equal(r.value, 'old');
+    r = await A.call('browser_type', { tabId: fresh.tabId, text: 'new', clear: true });
+    assert.equal(r.value, 'new');
   } finally {
     await A.call('spaces_close', { spaceId: fresh.spaceId });
   }

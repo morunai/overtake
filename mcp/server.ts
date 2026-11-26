@@ -264,7 +264,7 @@ server.registerTool('browser_snapshot', {
 }));
 
 server.registerTool('browser_screenshot', {
-  description: 'Screenshot via CDP Page.captureScreenshot: viewport (default), fullPage, or one element. For visual checks; to read data use browser_evaluate or browser_run. The image is in CSS pixels, the units click coordinates use (pass hiDpi for device pixels; scale in the result is image pixels per CSS pixel). The Overtake overlay is hidden from the capture unless includeOverlay. Optionally saves to an absolute path.',
+  description: 'Screenshot via CDP Page.captureScreenshot: viewport (default), fullPage, or one element. For visual checks; to read data use browser_evaluate or browser_run. The image is in CSS pixels, the units click coordinates use (pass hiDpi for device pixels; a pinch-zoomed viewport is captured as it is; scale in the result is image pixels per CSS pixel). The Overtake overlay is hidden from the capture unless includeOverlay. Optionally saves to an absolute path.',
   inputSchema: {
     tabId, fullPage: z.boolean().default(false), target: target.optional(), format: z.enum(['png', 'jpeg', 'webp']).default('png'), quality: z.number().int().min(1).max(100).optional(),
     path: z.string().optional().describe('Absolute file path to save the image. With a path, the image is not also returned inline unless inline is true (saves context).'),

@@ -298,7 +298,9 @@ const FOCUSED_OP = (function focused(op: string) {
       const d = e.ownerDocument;
       const field = e.localName === 'input' || e.localName === 'textarea';
       const editable = field || (e as HTMLElement).isContentEditable;
-      if (!editable || e === d.body && !(e as HTMLElement).isContentEditable) return { result: op === 'clear' ? false : null };
+      // Not a text field: focus may be past a closed shadow root this document cannot follow
+      // (an iframe inside it, say), so let the caller ask the other documents too.
+      if (!editable || e === d.body && !(e as HTMLElement).isContentEditable) return { remote: true, result: op === 'clear' ? false : null };
       if (op === 'clear') {
         if (field) (e as HTMLInputElement).select();
         else {
@@ -1823,6 +1825,7 @@ export class Engine {
     }, sid).catch(() => null);
     const top = (await run())?.result.value;
     if (!top?.remote) return top?.result ?? null;
+    const fallback = top.result ?? null;
     // Focus is in a frame the page cannot reach: a same-process one of another origin, or one
     // in a cross-site frame's session. Ask each such document that has focus; ancestors of the
     // focused frame have focus too, and answer remote.
@@ -1833,7 +1836,7 @@ export class Engine {
       const v = r?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
       if (v && !v.away && !v.remote) return v.result ?? null;
     }
-    return null;
+    return fallback;
   }
 
   async press(tabId: number, keys: string, repeat = 1) {
@@ -1958,7 +1961,10 @@ export class Engine {
       // apply); one without, at the window's device pixels (pinch zoom applies).
       const clipped = !!clip;
       const native = clipped ? dpr : factor;
-      const cssScale = !opts.hiDpi && Math.abs(native - 1) > 0.01;
+      // A viewport capture under pinch zoom stays as it is: adding a clip would make Chrome
+      // reset the zoom, changing what the user sees. Its scale then says how to convert.
+      const pinched = !clipped && Math.abs(pinch - 1) > 0.01;
+      const cssScale = !opts.hiDpi && !pinched && Math.abs(native - 1) > 0.01;
       if (cssScale && !clip) clip = { x: m.cssVisualViewport.pageX, y: m.cssVisualViewport.pageY, width: m.cssVisualViewport.clientWidth, height: m.cssVisualViewport.clientHeight };
       if (clip) params.clip = { ...clip, scale: cssScale ? 1 / dpr : 1 };
       const r = await this.client.request<{ data: string }>('screenshot', { tabId, params, includeOverlay: !!opts.includeOverlay }, 60_000);

@@ -150,7 +150,8 @@ cross-site ones. `browser_wait` checks every frame, and snapshots follow nested 
 capped in length, or `null` when focus is not on a text field.
 
 Screenshots are in CSS pixels, the same units as click coordinates, also on HiDPI screens
-(`hiDpi: true` gives device pixels). `browser_evaluate` awaits a returned Promise, so an async
+(`hiDpi: true` gives device pixels). A viewport capture of a pinch-zoomed page is left as it is,
+so the zoom is not reset, and its `scale` says how to convert. `browser_evaluate` awaits a returned Promise, so an async
 IIFE returns its value.
 
 The server ships instructions that tell the agent how to behave: one Space per goal, snapshot
