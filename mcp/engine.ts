@@ -181,7 +181,7 @@ const FRAME_DOCS = (function frameDocs() {
  *  single match, or { count } when there are none or several. Visible matches in the top
  *  document come first, then visible ones in iframes, then hidden ones anywhere. With `all`,
  *  returns every match in every document. */
-const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, docs: Document[]) {
+const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, docs: Document[], visibleOnly = false) {
       const deepAll = (root: Document | ShadowRoot, css: string): Element[] => {
         const out = [...root.querySelectorAll(css)];
         for (const e of root.querySelectorAll('*')) if (e.shadowRoot) out.push(...deepAll(e.shadowRoot, css));
@@ -227,7 +227,7 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
       if (topVis.length) return topVis.length === 1 ? topVis[0] : { count: topVis.length };
       const inFrames = docs.slice(1).flatMap(inDoc);
       const frameVis = inFrames.filter(shown);
-      const pick = frameVis.length ? frameVis : [...top, ...inFrames];
+      const pick = frameVis.length ? frameVis : visibleOnly ? [] : [...top, ...inFrames];
       if (pick.length === 1) return pick[0];
       return { count: pick.length };
     }).toString();
@@ -257,8 +257,8 @@ function frameGone(e: unknown) {
 }
 
 /** Page-side expression: the single match for a selector as a node, or "count:N". */
-function finderExpr(sel: string, kind: string, ownDocOnly = false) {
-  return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, ${ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`}); return r && r.nodeType ? r : 'count:' + r.count; })()`;
+function finderExpr(sel: string, kind: string, ownDocOnly = false, visibleOnly = false) {
+  return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, ${ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`}, ${visibleOnly}); return r && r.nodeType ? r : 'count:' + r.count; })()`;
 }
 
 /** A document the top document's script cannot reach, to search on its own. */
@@ -1183,37 +1183,58 @@ export class Engine {
       return { node: r, desc: `@${id} ${r.role}${r.name ? ` "${r.name}"` : ''}` };
     }
     const { kind, sel } = parseSelector(target);
-    const finder = finderExpr(sel, kind);
     type Found = { result: { type: string; subtype?: string; objectId?: string; value?: string }; exceptionDetails?: Json };
-    const find = (sid?: string) => this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false }, sid);
     const countOf = (r: Found) => Number(/^count:(\d+)$/.exec(r.result.value ?? '')?.[1] ?? 0);
     const tooMany = (count: number) => new OvertakeError(ErrorCode.ELEMENT_AMBIGUOUS, `${target} matched ${count} elements; make it unique (or use a snapshot @ref).`);
-    // Finding is read-only: if the document was just replaced, look again in the new one.
-    const r = await find().catch(async (e) => {
-      if (!contextGone(e)) throw e;
-      await sleep(300);
-      return find();
-    });
-    if (r.exceptionDetails) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${target}`);
-    if (r.result.subtype === 'node' && r.result.objectId) {
-      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: r.result.objectId });
-      return { node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: r.result.objectId }, desc: target };
+    // Visible matches first, everywhere: the page and the frames it reaches, then each document
+    // it cannot reach (whose enclosing iframes must be visible too). Hidden matches count only
+    // when nothing visible matches, so a hidden copy of a widget does not get in the way.
+    for (const visibleOnly of [true, false]) {
+      const finder = finderExpr(sel, kind, false, visibleOnly);
+      const find = () => this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false });
+      // Finding is read-only: if the document was just replaced, look again in the new one.
+      const r = await find().catch(async (e) => {
+        if (!contextGone(e)) throw e;
+        await sleep(300);
+        return find();
+      });
+      if (r.exceptionDetails) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${target}`);
+      if (r.result.subtype === 'node' && r.result.objectId) {
+        const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: r.result.objectId });
+        return { node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: r.result.objectId }, desc: target };
+      }
+      if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
+      if (countOf(r)) throw tooMany(countOf(r));
+      const found = await this.#findInOtherDocs(t, sel, kind, visibleOnly, tooMany);
+      if (found) return { node: found.node, desc: found.node.sessionId ? `${target} (in cross-site iframe ${receiptUrl(found.url)})` : target };
     }
-    if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
-    if (countOf(r)) throw tooMany(countOf(r));
-    // Nothing in the page or its same-origin iframes. Look in documents the page cannot reach,
-    // each on its own (so none is counted twice): same-process frames of another origin on the
-    // same site (their nodes and coordinates work like the page's), then the documents of each
-    // cross-site iframe, which run in their own process, offset by the iframe in the page.
-    const own = finderExpr(sel, kind, true);
+    throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `${target} matched no element.`);
+  }
+
+  /** Search the documents the page cannot reach, each on its own (so none is counted twice):
+   *  same-process frames of another origin on the same site (their nodes and coordinates work
+   *  like the page's), then the documents of each cross-site iframe, which run in their own
+   *  process, offset by the iframe in the page. With visibleOnly, a match counts only if it and
+   *  every iframe around it are visible. Throws when several match. */
+  async #findInOtherDocs(t: TabState, sel: string, kind: string, visibleOnly: boolean, tooMany: (n: number) => Error): Promise<{ node: RefTarget & { objectId?: string }; url: string } | null> {
+    const tabId = t.tabId;
+    type Found = { result: { type: string; subtype?: string; objectId?: string; value?: string }; exceptionDetails?: Json };
+    const countOf = (r: Found) => Number(/^count:(\d+)$/.exec(r.result.value ?? '')?.[1] ?? 0);
+    const own = finderExpr(sel, kind, true, visibleOnly);
     const hits: { node: RefTarget & { objectId?: string }; url: string }[] = [];
     let more = 0;
     const owners = new Map<string, number | null>();
+    const release = () => { for (const h of hits) if (h.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: h.node.objectId }).catch(() => {}); };
     for (const o of this.#otherDocs(t)) {
       const fr = await this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: o.guard ? `(${REACHABLE_FROM_TOP}) ? 'count:0' : ${own}` : own, returnByValue: false, ...(o.contextId ? { contextId: o.contextId } : {}) }, o.sid).catch(() => null);
       if (!fr || fr.exceptionDetails) continue;
+      const shown = async () => !visibleOnly || this.#ownersShown(t, await this.#frameOwners(t, o.frameId, o.sid));
       if (fr.result.subtype !== 'node' || !fr.result.objectId) {
-        more += countOf(fr);
+        if (countOf(fr) && (await shown())) more += countOf(fr);
+        continue;
+      }
+      if (!(await shown())) {
+        void this.cdp(tabId, 'Runtime.releaseObject', { objectId: fr.result.objectId }, o.sid).catch(() => {});
         continue;
       }
       const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }, o.sid).catch(() => null);
@@ -1228,16 +1249,16 @@ export class Engine {
       hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: o.sid, ownerBackendNodeId: owner, frameId: o.frameId }, url: o.url || '' });
     }
     if (hits.length + more > 1) {
-      for (const h of hits) if (h.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: h.node.objectId }).catch(() => {});
+      release();
       throw tooMany(hits.length + more);
     }
-    if (hits.length && !hits[0].node.sessionId) return { node: hits[0].node, desc: target };
-    if (hits.length) {
+    if (!hits.length) return null;
+    const h = hits[0];
+    if (h.node.sessionId && !h.url) {
       // The target's url can be empty before its first navigation is reported: ask the frame.
-      const url = hits[0].url || (await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true }, hits[0].node.sessionId).catch(() => null))?.result.value || '';
-      return { node: hits[0].node, desc: `${target} (in cross-site iframe ${receiptUrl(url)})` };
+      h.url = (await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true }, h.node.sessionId).catch(() => null))?.result.value || '';
     }
-    throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `${target} matched no element.`);
+    return h;
   }
 
   /** Documents the top document cannot script, each to be searched on its own: same-process
@@ -1290,6 +1311,13 @@ export class Engine {
           try { fe = el.ownerDocument.defaultView.frameElement; } catch {}
           if (!fe) break;
           if (!fe.checkVisibility({ visibilityProperty: true })) return { ok: false, reason: 'the iframe it is in is hidden' };
+          // Points map through the iframe's box; a rotated or skewed iframe would need its full
+          // transform, so the click cannot be checked there.
+          for (let n = fe, j = 0; n && j < 200; j++) {
+            const tf = n.nodeType === 1 ? getComputedStyle(n).transform : 'none';
+            if (tf && tf !== 'none') { const m = new DOMMatrix(tf); if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6) return { ok: false, reason: 'it is inside a rotated or skewed iframe, where the click cannot be checked against covering elements (pass force:true to click it anyway)' }; }
+            n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+          }
           const fr = fe.getBoundingClientRect();
           const kx = fr.width / (fe.offsetWidth || fr.width || 1), ky = fr.height / (fe.offsetHeight || fr.height || 1);
           x = fr.left + (fe.clientLeft + x) * kx;
@@ -1326,6 +1354,13 @@ export class Engine {
       if (fid) {
         let px = v.cx, py = v.cy;
         for (const o of await this.#frameOwners(t, fid, sid)) {
+          // The check maps points through each iframe's box; a rotated or skewed iframe would
+          // need its full transform, so the click is not verified there: refuse unless forced.
+          const bm = await this.cdp<{ model: { content: number[] } }>(tabId, 'DOM.getBoxModel', { backendNodeId: o.id }, o.sid).catch(() => null);
+          const q = bm?.model.content;
+          if (q && (Math.abs(q[1] - q[3]) > 0.5 || Math.abs(q[0] - q[6]) > 0.5)) {
+            throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The element is inside a rotated or skewed iframe, where the click cannot be checked against covering elements. Pass force:true to click it anyway.');
+          }
           const ob = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: o.id }, o.sid).catch(() => null);
           if (!ob) break;
           const lv = await this.cdp<{ result: { value?: { ok: boolean; hidden?: boolean; top?: string; x: number; y: number } } }>(tabId, 'Runtime.callFunctionOn', {

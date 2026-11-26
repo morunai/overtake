@@ -329,3 +329,18 @@ test('every frame level is checked, scaled frames map per axis, and top-page mat
   const r = await A.call('browser_click', { tabId, target: 'text=Top button' });
   assert.ok(r.timingMs.resolve < 150, JSON.stringify(r.timingMs));
 });
+
+test('rotated frames are not clicked unchecked; hidden copies do not get in the way', async () => {
+  for (const id of ['feature', 'remote', 'alt']) {
+    await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&rotate=${id}` });
+    const label = id === 'feature' ? 'Run query' : id === 'remote' ? 'Run remote query' : 'Run alt query';
+    await A.call('browser_wait', { tabId, selector: `text=${label}`, timeoutMs: 15_000 });
+    await assert.rejects(A.call('browser_click', { tabId, target: `text=${label}` }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /rotated or skewed/.test(e.message), id);
+    await A.call('browser_click', { tabId, target: `text=${label}`, force: true });
+  }
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&dupes=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query' });
+  await A.call('browser_click', { tabId, target: 'text=Run query' });
+  assert.equal(await inFeature('runs'), 1);
+  await A.call('browser_click', { tabId, target: 'text=Run alt query' });
+});

@@ -36,6 +36,21 @@
   if (q.get('deepremote')) document.getElementById('feature').src = '/iframe-app-inner.html?nestremote=1';
   if (q.get('altnest')) document.getElementById('alt').src += `&nestport=${q.get('altnest')}${q.get('covernest') ? '&covernest=1' : ''}`;
   if (q.get('squash')) document.getElementById('feature').style.cssText += ';transform:scale(1, 0.5);transform-origin:0 0';
+  if (q.get('rotate')) document.getElementById(q.get('rotate')).style.cssText += ';transform:rotate(15deg)';
+  // ?dupes=1: a hidden copy of the feature's Run button in the page, and a hidden frame of
+  // another origin with a copy of the alt frame's button.
+  if (q.get('dupes')) {
+    const b = document.createElement('button');
+    b.textContent = 'Run query';
+    b.style.display = 'none';
+    document.body.append(b);
+    if (q.get('alt')) {
+      const f = document.createElement('iframe');
+      f.src = `http://127.0.0.1:${q.get('alt')}/iframe-app-inner.html?alt=1`;
+      f.style.display = 'none';
+      document.body.append(f);
+    }
+  }
   if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
   if (q.get('shadow')) {
     const host = document.createElement('div');
