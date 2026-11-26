@@ -20,6 +20,8 @@
   <label><input type="checkbox" id="nested"><span id="nestedText">Nested label</span></label>
   <shadow-status id="sstatus"></shadow-status>
   <nested-status id="nstatus"></nested-status>
+  <div id="texts"><root-text></root-text><p>Mixed <x-word></x-word> now</p><block-text></block-text></div>
+  <button id="tdone" onclick="document.getElementById('texts').remove()">Clear texts</button>
   <button id="ndone" onclick="document.getElementById('nstatus').remove()">Finish nested</button>
   <button id="sdone">Finish shadow</button>
 </main>
@@ -38,6 +40,16 @@
   });
   customElements.define('inner-status', class extends HTMLElement {
     constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>query</span>'; }
+  });
+  // Text directly in a shadow root, shadow text between light text, blocks and line breaks.
+  customElements.define('root-text', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = 'Root loading'; }
+  });
+  customElements.define('x-word', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>loading</span>'; }
+  });
+  customElements.define('block-text', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<div>Block</div><div>waiting</div><span>Break<br>pending</span>'; }
   });
   document.getElementById('sdone').onclick = () => { document.getElementById('sstatus').shadowRoot.innerHTML = '<span>Shadow ready</span>'; };
   // Replaced on click by a checked copy, as some frameworks re-render.

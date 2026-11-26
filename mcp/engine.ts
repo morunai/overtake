@@ -1001,26 +1001,41 @@ export class Engine {
           // A document's visible text, with the text of its open shadow roots (innerText leaves
           // those out) under visible hosts.
           const docText = `(d) => {
-            let out = d.body?.innerText || '';
-            // Shadow content in composed order (nested shadow roots, slotted nodes in their
-            // slots): each text node that is rendered (has boxes) and not visibility:hidden.
-            // display: contents wrappers have no boxes of their own, but their text does.
+            // Without shadow roots, innerText is the rendered text. With them (innerText leaves
+            // shadow content out), walk the composed tree in order: nested shadow roots, slots
+            // with their assigned nodes; a line break around blocks and at <br>; text that is
+            // rendered (has boxes) and not visibility:hidden.
+            const all = d.querySelectorAll('*');
+            let hosts = false;
+            for (const el of all) if (el.shadowRoot) { hosts = true; break; }
+            if (!hosts) return d.body?.innerText || '';
+            const win = d.defaultView;
             const r = d.createRange();
+            let out = '';
+            let budget = 50000;
             const add = (n, depth) => {
-              if (depth > 60) return;
+              if (depth > 200 || --budget < 0) return;
               if (n.nodeType === 3) {
-                const p = n.parentElement;
-                if (!p || d.defaultView.getComputedStyle(p).visibility === 'hidden') return;
+                const p = n.parentElement || (n.parentNode && n.parentNode.host);
+                if (!p || win.getComputedStyle(p).visibility === 'hidden') return;
                 r.selectNodeContents(n);
                 if (r.getClientRects().length) out += n.data;
                 return;
               }
-              if (n.nodeType !== 1 && n.nodeType !== 11) return;
-              if (n.localName === 'slot') { const a = n.assignedNodes({ flatten: true }); for (const k of (a.length ? a : n.childNodes)) add(k, depth + 1); return; }
-              const kids = n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes;
-              for (const k of kids) add(k, depth + 1);
+              if (n.nodeType === 11) { for (const k of n.childNodes) add(k, depth + 1); return; }
+              if (n.nodeType !== 1) return;
+              const tag = n.localName;
+              if (tag === 'script' || tag === 'style' || tag === 'template' || tag === 'noscript') return;
+              if (tag === 'br') { out += '\\n'; return; }
+              if (tag === 'slot') { const a = n.assignedNodes({ flatten: true }); for (const k of (a.length ? a : n.childNodes)) add(k, depth + 1); return; }
+              const disp = win.getComputedStyle(n).display;
+              if (disp === 'none') return;
+              const block = !disp.startsWith('inline') && disp !== 'contents';
+              if (block) out += '\\n';
+              for (const k of (n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)) add(k, depth + 1);
+              if (block) out += '\\n';
             };
-            for (const el of d.querySelectorAll('*')) if (el.shadowRoot) { out += '\\n'; add(el, 0); }
+            if (d.body) add(d.body, 0);
             return out;
           }`;
           // Whitespace compared as rendered: runs collapse to one space, on both sides.
@@ -2415,16 +2430,16 @@ export class Engine {
   async frames(tabId: number) {
     return this.action(tabId, async (t) => {
       const tree = await this.cdp<{ frameTree: { frame: { id: string; url: string; name?: string }; childFrames?: unknown[] } }>(tabId, 'Page.getFrameTree');
-      const out: { frameId: string; url: string; name?: string; depth: number; outOfProcess: boolean; sessionId?: string }[] = [];
-      const walk = (ft: { frame: { id: string; url: string; name?: string }; childFrames?: unknown[] }, depth: number) => {
+      const out: { frameId: string; url: string; name?: string; depth: number; outOfProcess: boolean; sessionId?: string; parentFrameId?: string }[] = [];
+      const walk = (ft: { frame: { id: string; url: string; name?: string; parentId?: string }; childFrames?: unknown[] }, depth: number) => {
         const child = [...t.children.entries()].find(([, v]) => v.targetId === ft.frame.id);
         // Masked like browser_network: a frame URL can carry tokens.
-        out.push({ frameId: ft.frame.id, url: redactUrl(ft.frame.url), name: ft.frame.name, depth, outOfProcess: !!child, sessionId: child?.[0] });
+        out.push({ frameId: ft.frame.id, url: redactUrl(ft.frame.url), name: ft.frame.name, depth, outOfProcess: !!child, sessionId: child?.[0], parentFrameId: ft.frame.parentId });
         for (const c of (ft.childFrames || []) as typeof ft[]) walk(c, depth + 1);
       };
       walk(tree.frameTree, 0);
       // OOPIFs appear in the main frame tree only as placeholders on some versions; list sessions too.
-      for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: redactUrl(v.url), depth: 1, outOfProcess: true, sessionId: sid });
+      for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: redactUrl(v.url), depth: 1, outOfProcess: true, sessionId: sid, parentFrameId: v.parentFrameId });
       // The <iframe> element of each frame, as a selector for the page around it ("name" is
       // Chrome's frame name, which can come from the element's id).
       for (const f of out as (typeof out[number] & { owner?: string; ownerElement?: string })[]) {
@@ -2461,11 +2476,13 @@ export class Engine {
         const key = `:${o.backendNodeId}`;
         let id = t.refIds.get(key);
         if (id === undefined) t.refIds.set(key, (id = ++refCounter));
-        t.refs.set(id, { backendNodeId: o.backendNodeId, role: 'iframe', name: sel?.result.value || '' });
+        // Keep a ref a snapshot already made (it knows its frame); a new one gets the frame the
+        // <iframe> element sits in.
+        if (!t.refs.has(id)) t.refs.set(id, { backendNodeId: o.backendNodeId, role: 'iframe', name: sel?.result.value || '', ...(f.parentFrameId && f.parentFrameId !== t.mainFrameId ? { frameId: f.parentFrameId } : {}) });
         f.owner = `@${id}`;
         if (sel?.result.value) f.ownerElement = sel.result.value;
       }
-      return { frames: out };
+      return { frames: out.map(({ parentFrameId: _p, ...f }) => f) };
     });
   }
 
