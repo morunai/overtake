@@ -31,6 +31,33 @@
   if (q.get('remotealt')) document.getElementById('remote').src += `&nestalt=${q.get('remotealt')}`;
   // ?wide=1: the feature frame holds an element larger than the frame.
   if (q.get('wide')) document.getElementById('feature').src = '/iframe-app-inner.html?wide=1';
+  // ?traps=1: a hidden iframe over a page button, page elements drawn over both frames, and a
+  // large element in a frame nested in a small frame.
+  if (q.get('traps')) {
+    window.underClicks = 0;
+    const under = document.createElement('button');
+    under.id = 'under';
+    under.textContent = 'Under';
+    under.style.cssText = 'position:absolute;left:20px;top:420px;width:200px;height:60px';
+    under.onclick = () => underClicks++;
+    const ghost = document.createElement('iframe');
+    ghost.id = 'ghostframe';
+    ghost.srcdoc = '<button id="ghost" style="width:180px;height:50px">Ghost</button>';
+    ghost.style.cssText = 'position:absolute;left:20px;top:420px;width:200px;height:60px;border:0;visibility:hidden';
+    document.body.append(under, ghost);
+    for (const id of ['feature', 'remote']) {
+      const f = document.getElementById(id);
+      const c = document.createElement('div');
+      c.className = 'cover';
+      c.style.cssText = `position:absolute;left:${f.offsetLeft}px;top:${f.offsetTop}px;width:${f.offsetWidth}px;height:${f.offsetHeight}px;background:rgba(255,0,0,.2)`;
+      document.body.append(c);
+    }
+    const outer = document.createElement('iframe');
+    outer.id = 'outer';
+    outer.style.cssText = 'position:absolute;left:300px;top:420px;width:200px;height:150px;border:0';
+    outer.srcdoc = '<body style="margin:0"><iframe id="inner" style="width:500px;height:500px;border:0" srcdoc="&lt;div id=big style=&quot;width:480px;height:480px;background:#fca5a5&quot;&gt;Big&lt;/div&gt;"></iframe></body>';
+    document.body.append(outer);
+  }
   // ?only=alt: just the frame of another origin.
   if (q.get('only') === 'alt') { document.getElementById('feature').remove(); document.getElementById('remote').remove(); }
 </script>

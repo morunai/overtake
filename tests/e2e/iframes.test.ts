@@ -247,3 +247,32 @@ test('element screenshots stay inside the frame, and pinch zoom still gives CSS 
     await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 1 } });
   }
 });
+
+test('hidden or covered iframes are not clicked through, and nested-frame screenshots stay inside', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?traps=1` });
+  await A.call('browser_wait', { tabId, selector: '#big', state: 'attached' });
+  // An element in a visibility:hidden iframe is hidden, and clicking it would hit the page.
+  await A.call('browser_wait', { tabId, selector: '#ghost', state: 'hidden' });
+  await assert.rejects(A.call('browser_wait', { tabId, selector: '#ghost', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await assert.rejects(A.call('browser_click', { tabId, target: '#ghost' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /iframe it is in is hidden/.test(e.message));
+  assert.equal((await A.call('browser_evaluate', { tabId, expression: 'underClicks' })).value, 0);
+  // Page elements drawn over a same-origin and a cross-site frame.
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /covered by div\.cover/.test(e.message));
+  await A.call('browser_wait', { tabId, selector: 'text=Run remote query', timeoutMs: 15_000 });
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run remote query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /covered by div/.test(e.message));
+  // A large element in a frame nested in a small frame: cut to the outer frame.
+  const shot = await A.callRaw('browser_screenshot', { tabId, target: '#big' });
+  const clip = JSON.parse(shot.content.find((c) => c.type === 'text').text).clip;
+  const box = (await A.call('browser_evaluate', { tabId, expression: `(() => { const r = document.getElementById('outer').getBoundingClientRect(); return [r.x + scrollX, r.y + scrollY, r.right + scrollX, r.bottom + scrollY]; })()` })).value;
+  assert.ok(clip.x >= box[0] - 1 && clip.y >= box[1] - 1 && clip.x + clip.width <= box[2] + 1 && clip.y + clip.height <= box[3] + 1, `${JSON.stringify(clip)} in ${box}`);
+  // hiDpi with a clip under pinch zoom: scale matches the image.
+  await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 2 } });
+  try {
+    const r = await A.callRaw('browser_screenshot', { tabId, fullPage: true, hiDpi: true });
+    const meta = JSON.parse(r.content.find((c) => c.type === 'text').text);
+    const size = pngSize(r.content.find((c) => c.type === 'image').data);
+    assert.ok(Math.abs(size.width - meta.scale * meta.clip.width) <= 2, `${size.width} vs ${meta.scale} * ${meta.clip.width}`);
+  } finally {
+    await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 1 } });
+  }
+});
