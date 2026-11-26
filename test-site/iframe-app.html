@@ -60,6 +60,16 @@
   }
   if (q.get('remotehidden')) document.getElementById('remote').style.visibility = 'hidden';
   if (q.get('closed')) document.getElementById('feature').src = '/iframe-app-inner.html?closed=1';
+  // ?closedframe=1: a same-origin iframe inside a closed shadow root.
+  if (q.get('closedframe')) {
+    const host = document.createElement('div');
+    host.id = 'closedFrameHost';
+    const f = document.createElement('iframe');
+    f.src = '/iframe-app-inner.html?closed=1&deep=1';
+    f.style.cssText = 'width:520px;height:300px;border:0';
+    host.attachShadow({ mode: 'closed' }).append(f);
+    document.body.prepend(host);
+  }
   if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
   if (q.get('shadow')) {
     const host = document.createElement('div');

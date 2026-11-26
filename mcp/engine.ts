@@ -249,7 +249,18 @@ const FRAME_SHOWN_JS = `((e) => {
 
 /** Page-side expression, run in a frame's own context: whether the top document reaches this
  *  frame's document (FRAME_DOCS covers it), that is, every frame up to the top is same-origin. */
-const REACHABLE_FROM_TOP = `(() => { let w = window; for (let i = 0; i < 30 && w !== top; i++) { if (!w.frameElement) return false; w = w.parent; } return w === top; })()`;
+const REACHABLE_FROM_TOP = `(() => {
+  let w = window;
+  for (let i = 0; i < 30 && w !== top; i++) {
+    const fe = w.frameElement;
+    if (!fe) return false;
+    // FRAME_DOCS cannot see into closed shadow roots either. (The root belongs to the parent's
+    // realm, so no instanceof.)
+    for (let r = fe.getRootNode(), j = 0; r && r.nodeType === 11 && r.host && j < 30; j++) { if (r.mode === 'closed') return false; r = r.host.getRootNode(); }
+    w = w.parent;
+  }
+  return w === top;
+})()`;
 
 /** Whether a CDP error means the frame or its context is gone (as opposed to slow or failing). */
 function frameGone(e: unknown) {
@@ -666,6 +677,9 @@ export class Engine {
       t.enabling = requestScope.exit(() => (async () => {
         await this.cdp(tabId, 'Page.enable');
         await this.cdp(tabId, 'Page.setLifecycleEventsEnabled', { enabled: true }).catch(() => {});
+        // The main frame, also for a page that loaded before we attached (no navigation event).
+        const tree = await this.cdp<{ frameTree: { frame: { id: string } } }>(tabId, 'Page.getFrameTree').catch(() => null);
+        if (tree && !t.mainFrameId) t.mainFrameId = tree.frameTree.frame.id;
         await this.cdp(tabId, 'Runtime.enable');
         await this.cdp(tabId, 'Network.enable', { maxPostDataSize: 65536 });
         await this.cdp(tabId, 'Log.enable').catch(() => {});
@@ -1262,6 +1276,16 @@ export class Engine {
     return h;
   }
 
+  /** The page's own (main frame) execution context, learning the main frame from the frame
+   *  tree when no navigation reported it (attached to a page that had already loaded). */
+  async #topContext(t: TabState): Promise<number | undefined> {
+    if (!t.mainFrameId) {
+      const tree = await this.cdp<{ frameTree: { frame: { id: string } } }>(t.tabId, 'Page.getFrameTree').catch(() => null);
+      if (tree) t.mainFrameId = tree.frameTree.frame.id;
+    }
+    return t.mainFrameId ? t.contexts.get(t.mainFrameId) : undefined;
+  }
+
   /** Documents the top document cannot script, each to be searched on its own: same-process
    *  frames of another origin (guard: skip those the top does reach), and every document of
    *  each cross-site frame's session (its default context when none is known yet). */
@@ -1418,27 +1442,31 @@ export class Engine {
       if (hitObj) {
         const hit = await this.cdp<{ node: { backendNodeId: number } }>(tabId, 'DOM.describeNode', { objectId: hitObj }).catch(() => null);
         let ok = !!hit && hit.node.backendNodeId === (sid ? node.ownerBackendNodeId : node.backendNodeId);
-        if (!ok && hit && !sid) {
-          // The element itself, or something inside it (or its label), is fine.
-          // In the page's own context, like the hit (objects cannot cross contexts).
-          const topCtx = t.mainFrameId ? t.contexts.get(t.mainFrameId) : undefined;
-          const w = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId, ...(topCtx ? { executionContextId: topCtx } : {}) }).catch(() => null);
-          if (w) {
+        if (!ok && hit) {
+          // Fine too: the hit is the element's label or inside the element, or it is around
+          // the element or one of the <iframe>s holding it (composed, across frames). The walk
+          // down stops at a closed shadow root's host, and the checks above already found the
+          // element on top inside it. Objects are compared in the page's own context.
+          const fid = node.frameId ?? (sid ? t.children.get(sid)?.targetId : undefined);
+          const owners = fid ? (await this.#frameOwners(t, fid, sid)).filter((o) => !o.sid) : [];
+          ok = owners.some((o) => o.id === hit.node.backendNodeId);
+          const topCtx = await this.#topContext(t);
+          for (const id of [...(sid ? [] : [node.backendNodeId]), ...owners.map((o) => o.id)]) {
+            if (ok) break;
+            const w = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: id, ...(topCtx ? { executionContextId: topCtx } : {}) }).catch(() => null);
+            if (!w) continue;
             const r = await this.cdp<{ result: { value?: boolean } }>(tabId, 'Runtime.callFunctionOn', {
               objectId: hitObj, returnByValue: true, arguments: [{ objectId: w.object.objectId }],
-              // Also a host around the element: the walk down cannot enter a closed shadow root,
-              // and the check above already found the element on top inside it.
-              functionDeclaration: 'function (t) { for (let n = this, i = 0; n && i < 500; i++) { if (n === t) return true; n = n.parentNode || n.host; } for (let n = t, i = 0; n && i < 500; i++) { if (n === this) return true; n = n.parentNode || n.host; } return this.localName === "label" && this.control === t; }',
+              functionDeclaration: `function (t) {
+                const up = (n) => { if (n.parentNode) return n.parentNode; if (n.host) return n.host; if (n.nodeType === 9) { try { return n.defaultView.frameElement; } catch { return null; } } return null; };
+                for (let n = this, i = 0; n && i < 1000; i++) { if (n === t) return true; n = up(n); }
+                for (let n = t, i = 0; n && i < 1000; i++) { if (n === this) return true; n = up(n); }
+                return this.localName === 'label' && this.control === t;
+              }`,
             }).catch(() => null);
             void this.cdp(tabId, 'Runtime.releaseObject', { objectId: w.object.objectId }).catch(() => {});
             ok = !!r?.result.value;
           }
-        }
-        if (!ok && hit) {
-          // Stopped at a frame the page cannot script: it must be one around the element.
-          const fid = node.frameId ?? (sid ? t.children.get(sid)?.targetId : undefined);
-          const owners = fid ? await this.#frameOwners(t, fid, sid) : [];
-          ok = owners.some((o) => !o.sid && o.id === hit.node.backendNodeId);
         }
         let topDesc = 'another element';
         if (!ok) {

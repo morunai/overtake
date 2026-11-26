@@ -366,3 +366,21 @@ test('a button in a closed shadow root inside a frame is clicked by its ref', as
   await A.call('browser_click', { tabId, target: ref });
   assert.equal(await inFeature('closedClicks'), 1);
 });
+
+test('frame controls work in a Space opened on a loaded page, and in an iframe inside a closed shadow root', async () => {
+  // Opened with its URL: no navigation event announces the main frame.
+  const fresh = await A.call('spaces_create', { name: 'iframes fresh', url: `${SITE}/iframe-app.html?closedframe=1` });
+  try {
+    await A.call('browser_wait', { tabId: fresh.tabId, selector: 'text=Run deep query' });
+    const snap = await A.call('browser_snapshot', { tabId: fresh.tabId });
+    const run = /button "Run query" (@\d+)/.exec(snap)?.[1];
+    const deep = /button "Run deep query" (@\d+)/.exec(snap)?.[1];
+    assert.ok(run && deep, snap);
+    await A.call('browser_click', { tabId: fresh.tabId, target: run });
+    await A.call('browser_click', { tabId: fresh.tabId, target: deep });
+    const runs = await A.call('browser_evaluate', { tabId: fresh.tabId, expression: `document.getElementById('feature').contentWindow.runs` });
+    assert.equal(runs.value, 1);
+  } finally {
+    await A.call('spaces_close', { spaceId: fresh.spaceId });
+  }
+});
