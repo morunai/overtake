@@ -1013,7 +1013,8 @@ export class Engine {
             };
             const hosts = [];
             hostsIn(d, hosts, 0);
-            if (!hosts.length) return { t: d.body?.innerText || '', partial: false };
+            const plain = d.body?.innerText || '';
+            if (!hosts.length) return { t: plain, partial: false };
             const win = d.defaultView;
             // Elements on the way to a host or a slot: walked; all others: innerText.
             const path = new Set();
@@ -1030,7 +1031,7 @@ export class Engine {
               r.selectNodeContents(n);
               if (!r.getClientRects().length) return '';
               const tt = win.getComputedStyle(p).textTransform;
-              return tt === 'uppercase' ? n.data.toUpperCase() : tt === 'lowercase' ? n.data.toLowerCase() : n.data;
+              return tt === 'uppercase' ? n.data.toUpperCase() : tt === 'lowercase' ? n.data.toLowerCase() : tt === 'capitalize' ? n.data.replace(/(^|\\s)(\\S)/g, (m, a, b) => a + b.toUpperCase()) : n.data;
             };
             const add = (n, depth) => {
               if (depth > 200 || --budget < 0) { partial = true; return; }
@@ -1041,10 +1042,13 @@ export class Engine {
               if (tag === 'script' || tag === 'style' || tag === 'template' || tag === 'noscript') return;
               const disp = win.getComputedStyle(n).display;
               if (disp === 'none') return;
+              if (tag === 'br') { out += '\\n'; return; }
               const block = !disp.startsWith('inline') && disp !== 'contents';
               if (!path.has(n) && tag !== 'slot') {
-                // No shadow content inside: the browser renders it.
-                out += block ? '\\n' + (n.innerText ?? '') + '\\n' : (n.innerText ?? '');
+                // No shadow content inside: the browser renders it (SVG and other non-HTML
+                // elements have no innerText: their text content).
+                const x = typeof n.innerText === 'string' ? n.innerText : (n.textContent || '');
+                out += block ? '\\n' + x + '\\n' : x;
                 return;
               }
               if (block) out += '\\n';
@@ -1053,7 +1057,9 @@ export class Engine {
               if (block) out += '\\n';
             };
             if (d.body) add(d.body, 0);
-            return { t: out, partial };
+            // With the page's own innerText too: whatever it shows still counts (a walk that
+            // misses something can never make text look gone that innerText still has).
+            return { t: plain + '\\n' + out, partial };
           }`;
           // Whitespace compared as rendered: runs collapse to one space, on both sides.
           // gone: a document whose text could only be read in part still counts as showing it.
