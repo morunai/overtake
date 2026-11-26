@@ -27,6 +27,12 @@
     document.body.append(f);
   }
   if (q.get('scaled')) document.getElementById('remote').style.transform = 'scale(0.5)';
+  // ?remotealt=PORT: the cross-site frame embeds a frame of its own site on another port.
+  if (q.get('remotealt')) document.getElementById('remote').src += `&nestalt=${q.get('remotealt')}`;
+  // ?wide=1: the feature frame holds an element larger than the frame.
+  if (q.get('wide')) document.getElementById('feature').src = '/iframe-app-inner.html?wide=1';
+  // ?only=alt: just the frame of another origin.
+  if (q.get('only') === 'alt') { document.getElementById('feature').remove(); document.getElementById('remote').remove(); }
 </script>
 </body>
 </html>

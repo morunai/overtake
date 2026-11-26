@@ -23,6 +23,22 @@
     document.getElementById('run').textContent = 'Run alt query';
     document.getElementById('search').setAttribute('aria-label', 'Alt search');
   }
+  const params = new URLSearchParams(location.search);
+  if (params.get('nestalt')) {
+    const f = document.createElement('iframe');
+    f.id = 'nestedalt';
+    f.title = 'Nested alt frame';
+    f.src = `http://localhost:${params.get('nestalt')}/iframe-app-inner.html?alt=1`;
+    f.style.cssText = 'width:480px;height:200px;border:0';
+    document.body.prepend(f);
+  }
+  if (params.get('wide')) {
+    const w = document.createElement('div');
+    w.id = 'wide';
+    w.style.cssText = 'width:900px;height:400px;background:#a7f3d0';
+    w.textContent = 'Wide';
+    document.body.prepend(w);
+  }
   window.runs = 0;
   document.getElementById('run').onclick = () => {
     runs++;

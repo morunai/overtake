@@ -189,3 +189,61 @@ test('frames of another origin on the same site, and a scaled cross-site frame',
   const box = (await A.call('browser_evaluate', { tabId, expression: `(() => { const r = document.getElementById('remote').getBoundingClientRect(); return [r.x, r.y, r.right, r.bottom]; })()` })).value;
   assert.ok(clip.x >= box[0] && clip.y >= box[1] && clip.x + clip.width <= box[2] + 1 && clip.y + clip.height <= box[3] + 1, `${JSON.stringify(clip)} in ${box}`);
 });
+
+test('a busy frame cannot prove absence; once it answers, waits go on', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run remote query', timeoutMs: 15_000 });
+  const f = await remoteFrame();
+  await A.call('browser_evaluate', { tabId, frameId: f.frameId, expression: 'setTimeout(() => { const end = Date.now() + 1500; while (Date.now() < end) {} }, 0); 1' });
+  // The busy frame does not answer in time: "hidden" is not proven from its silence.
+  await assert.rejects(A.call('browser_wait', { tabId, selector: 'text=Nope not here', state: 'hidden', timeoutMs: 400 }), (e: Error) => code(e) === 'TIMEOUT');
+  // Calls to a tab run in order, so the next ones wait for the frame, then succeed.
+  await A.call('browser_wait', { tabId, selector: '#top', timeoutMs: 5000 });
+  await A.call('browser_wait', { tabId, selector: 'text=Nope not here', state: 'hidden', timeoutMs: 5000 });
+});
+
+test('a frame of another origin inside a cross-site frame is searched, typed into and waited on', async (t) => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?remotealt=${ALT_PORT}` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query', state: 'attached', timeoutMs: 15_000 });
+  await A.call('browser_wait', { tabId, text: 'Run alt query' });
+  // Chrome sizes a frame nested in a cross-site frame only when the window paints; the test
+  // browser's window may be covered on screen and not painting. Then its elements are found but
+  // have no size, and clicking or typing there is checked only when it does paint.
+  const shown = await A.call('browser_wait', { tabId, selector: 'text=Run alt query', timeoutMs: 3000 }).then(() => true, () => false);
+  if (!shown) {
+    t.diagnostic('the nested frame has no size (window not painting); click and type not checked');
+    return;
+  }
+  await A.call('browser_click', { tabId, target: 'text=Run alt query' });
+  await A.call('browser_wait', { tabId, text: 'row 1 for all' });
+  let r = await A.call('browser_type', { tabId, target: 'text=Alt search', text: 'abc' });
+  assert.equal(r.value, 'abc');
+  r = await A.call('browser_type', { tabId, text: 'XYZ', clear: true });
+  assert.equal(r.value, 'XYZ');
+});
+
+test('a frame the page cannot reach and its nested frame are each searched once', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&only=alt` });
+  await A.call('browser_wait', { tabId, selector: '#inner' });
+  await A.call('browser_click', { tabId, target: '#inner' });
+  await A.call('browser_wait', { tabId, text: 'inner: 1' });
+});
+
+test('element screenshots stay inside the frame, and pinch zoom still gives CSS pixels', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?wide=1` });
+  await A.call('browser_wait', { tabId, selector: '#wide' });
+  const shot = await A.callRaw('browser_screenshot', { tabId, target: '#wide' });
+  const clip = JSON.parse(shot.content.find((c) => c.type === 'text').text).clip;
+  const box = (await A.call('browser_evaluate', { tabId, expression: `(() => { const r = document.getElementById('feature').getBoundingClientRect(); return [r.x, r.y, r.right, r.bottom]; })()` })).value;
+  assert.ok(clip.x >= box[0] - 1 && clip.y >= box[1] - 1 && clip.x + clip.width <= box[2] + 1 && clip.y + clip.height <= box[3] + 1, `${JSON.stringify(clip)} in ${box}`);
+  await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 2 } });
+  try {
+    const r = await A.callRaw('browser_screenshot', { tabId });
+    const meta = JSON.parse(r.content.find((c) => c.type === 'text').text);
+    const size = pngSize(r.content.find((c) => c.type === 'image').data);
+    assert.equal(meta.scale, 1);
+    assert.ok(Math.abs(size.width - meta.viewport.width) <= 2 && Math.abs(size.height - meta.viewport.height) <= 2, `${JSON.stringify(size)} vs ${JSON.stringify(meta.viewport)}`);
+  } finally {
+    await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 1 } });
+  }
+});

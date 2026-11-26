@@ -65,7 +65,8 @@ interface TabState {
   refs: Map<number, RefTarget>;
   cursor: { x: number; y: number } | null;
   children: Map<string, { targetId: string; type: string; url: string }>; // OOPIF sessions
-  contexts: Map<string, number>; // frameId -> default execution context id
+  contexts: Map<string, number>; // frameId -> default execution context id (main session)
+  childContexts: Map<string, Map<string, number>>; // per cross-site frame session: frameId -> context id
   shown: { url: string; title: string }; // the url and title the agent last saw in a result
   dialog: { type: string; message: string; defaultPrompt?: string; url: string } | null;
   paused: unknown | null;
@@ -226,9 +227,12 @@ function frameGone(e: unknown) {
 }
 
 /** Page-side expression: the single match for a selector as a node, or "count:N". */
-function finderExpr(sel: string, kind: string) {
-  return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, (${FRAME_DOCS})()); return r && r.nodeType ? r : 'count:' + r.count; })()`;
+function finderExpr(sel: string, kind: string, ownDocOnly = false) {
+  return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, ${ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`}); return r && r.nodeType ? r : 'count:' + r.count; })()`;
 }
+
+/** A document the top document's script cannot reach, to search on its own. */
+type OtherDoc = { sid?: string; contextId?: number; guard: boolean; targetId?: string; url?: string };
 
 /** Page-side: the focused element, followed into open shadow roots and same-origin iframes.
  *  Returns { remote: true } when focus is inside a frame this document cannot reach
@@ -372,7 +376,7 @@ export class Engine {
     if (!t) {
       t = {
         tabId, enabled: false, enabling: null, net: new Map(), console: [], events: [], refs: new Map(), cursor: null, children: new Map(),
-        contexts: new Map(), shown: { url: '', title: '' }, dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
+        contexts: new Map(), childContexts: new Map(), shown: { url: '', title: '' }, dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
       };
       this.#tabs.set(tabId, t);
     }
@@ -454,6 +458,7 @@ export class Engine {
           t.enabled = false;
           t.children.clear();
           t.contexts.clear();
+          t.childContexts.clear();
           if (e.type === 'tab-closed') this.#tabs.delete(e.tabId);
         }
         return;
@@ -528,15 +533,25 @@ export class Engine {
       case 'Runtime.executionContextCreated': {
         const c = p.context as Json;
         const aux = c.auxData as Json | undefined;
-        // Main session only: context ids are per session (cross-site frames have their own).
-        if (!sessionId && aux?.isDefault && typeof aux.frameId === 'string') t.contexts.set(aux.frameId, c.id as number);
+        // Context ids are per session (cross-site frames have their own).
+        if (aux?.isDefault && typeof aux.frameId === 'string') {
+          if (!sessionId) t.contexts.set(aux.frameId, c.id as number);
+          else {
+            if (!t.childContexts.has(sessionId)) t.childContexts.set(sessionId, new Map());
+            t.childContexts.get(sessionId)!.set(aux.frameId, c.id as number);
+          }
+        }
         break;
       }
       case 'Runtime.executionContextDestroyed':
-        if (!sessionId) for (const [f, id] of t.contexts) if (id === p.executionContextId) t.contexts.delete(f);
+        {
+          const m = sessionId ? t.childContexts.get(sessionId) : t.contexts;
+          if (m) for (const [f, id] of m) if (id === p.executionContextId) m.delete(f);
+        }
         break;
       case 'Runtime.executionContextsCleared':
         if (!sessionId) t.contexts.clear();
+        else t.childContexts.delete(sessionId);
         break;
       case 'Target.attachedToTarget': {
         const info = p.targetInfo as Json;
@@ -548,6 +563,7 @@ export class Engine {
       }
       case 'Target.detachedFromTarget':
         t.children.delete(p.sessionId as string);
+        t.childContexts.delete(p.sessionId as string);
         break;
       case 'Page.frameNavigated': {
         const frame = p.frame as Json;
@@ -924,48 +940,70 @@ export class Engine {
       // Selector and text are checked in every frame: the page with its same-origin iframes,
       // and each cross-site iframe through its own session. Each reports
       // { n: matches, vis: visible matches, text: whether the text is in it }.
-      let probe: string | null = null;
+      let probe: ((ownDocOnly: boolean) => string) | null = null;
       if (cond.selector || cond.text) {
-        let matches = '[]';
-        if (cond.selector) {
+        const { kind, sel } = cond.selector ? parseSelector(cond.selector) : { kind: '', sel: '' };
+        probe = (ownDocOnly) => {
+          const docs = ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`;
           // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
-          const { kind, sel } = parseSelector(cond.selector);
-          matches = `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)`;
-        }
-        const hasText = cond.text ? `docs.some((d) => (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}))` : 'false';
-        probe = `(() => { const docs = (${FRAME_DOCS})(); const a = ${matches}; return { n: a.length, vis: a.filter((e) => e.checkVisibility()).length, text: ${hasText} }; })()`;
+          const matches = cond.selector ? `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)` : '[]';
+          const hasText = cond.text ? `docs.some((d) => (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}))` : 'false';
+          return `(() => { const docs = ${docs}; const a = ${matches}; return { n: a.length, vis: a.filter((e) => e.checkVisibility()).length, text: ${hasText} }; })()`;
+        };
       }
       const state = cond.state || 'visible';
       const check = async (): Promise<boolean> => {
         if (probe) {
           const left = deadline - Date.now();
           type V = { n: number; vis: number; text: boolean };
-          type Probe = { result: { value?: V }; exceptionDetails?: unknown };
+          type Probe = { result: { value?: V | null }; exceptionDetails?: unknown };
           const absent: V = { n: 0, vis: 0, text: false };
-          // A probe that fails or times out is unknown, not "no match": otherwise a slow page
-          // would satisfy state "hidden". Only a frame that is gone counts as having nothing.
-          const ask = (sid?: string, contextId?: number, guard = false): Promise<Probe | V | null> => within(
-            this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe}` : probe, returnByValue: true, ...(contextId ? { contextId } : {}) }, sid, Math.max(left, 100))
-              .then((r) => (guard && !r.exceptionDetails && r.result.value == null ? absent : r))
-              .catch((e) => { softFail(null)(e); return sid || contextId ? (frameGone(e) ? absent : null) : null; }),
-            left, null);
-          const frames = [...t.children.entries()].filter(([, c]) => c.type === 'iframe').map(([sid]) => sid);
-          // Same-process frames the top document cannot reach (same site, other origin).
-          const ctxs = [...t.contexts.entries()].filter(([f]) => f !== t.mainFrameId).map(([, id]) => id);
-          const [top, ...rest] = await Promise.all([ask(), ...frames.map((sid) => ask(sid)), ...ctxs.map((id) => ask(undefined, id, true))]);
-          if (top && 'result' in top && top.exceptionDetails && cond.selector) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${cond.selector}`);
-          const all: V[] = [];
-          for (const r of [top, ...rest]) {
-            if (!r) return false;
-            if ('result' in r) {
-              if (!r.result.value) return false;
-              all.push(r.result.value);
-            } else all.push(r);
-          }
-          const n = all.reduce((s, v) => s + v.n, 0);
-          const vis = all.reduce((s, v) => s + v.vis, 0);
-          if (cond.selector && !(state === 'hidden' ? vis === 0 : state === 'attached' ? n > 0 : vis > 0)) return false;
-          if (cond.text && !all.some((v) => v.text)) return false;
+          // Selector and text are checked in every document: the page with the frames it
+          // reaches, then each document it cannot reach, on its own. A probe that fails or times
+          // out is unknown: it cannot prove absence (state "hidden"), but a match found elsewhere
+          // still counts. Only a frame that is gone counts as having nothing.
+          const ask = (o?: OtherDoc): Promise<{ v?: V; bad?: boolean }> => within(
+            this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: o?.guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe!(true)}` : probe!(!!o), returnByValue: true, ...(o?.contextId ? { contextId: o.contextId } : {}) }, o?.sid, Math.max(left, 100))
+              .then((r) => (r.exceptionDetails ? { bad: true } : r.result.value ? { v: r.result.value } : o?.guard ? { v: absent } : {}))
+              .catch((e) => { softFail(null)(e); return o && frameGone(e) ? { v: absent } : {}; }),
+            left, {});
+          // Decide as soon as the answers so far settle it: a match proven in one frame does not
+          // wait for a slow or unresponsive other one.
+          const docs = this.#otherDocs(t);
+          const answers: ({ v?: V; bad?: boolean } | undefined)[] = new Array(docs.length + 1);
+          const decide = (): boolean | undefined => {
+            const top = answers[0];
+            if (top?.bad && cond.selector) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${cond.selector}`);
+            const done = answers.filter((a) => a).length;
+            const pending = docs.length + 1 - done;
+            const known = answers.filter((a) => a?.v).map((a) => a!.v!);
+            const unknown = done - known.length > 0;
+            const n = known.reduce((sum, v) => sum + v.n, 0);
+            const vis = known.reduce((sum, v) => sum + v.vis, 0);
+            let selOk: boolean | undefined = true;
+            if (cond.selector) {
+              if (state === 'hidden') selOk = vis > 0 ? false : pending ? undefined : !unknown;
+              else selOk = (state === 'attached' ? n > 0 : vis > 0) ? true : pending ? undefined : false;
+            }
+            let textOk: boolean | undefined = true;
+            if (cond.text) textOk = known.some((v) => v.text) ? true : pending ? undefined : false;
+            if (selOk === false || textOk === false) return false;
+            return selOk && textOk ? true : undefined;
+          };
+          const ok = await new Promise<boolean>((resolve, reject) => {
+            let settled = false;
+            const settle = (f: () => boolean | undefined) => {
+              if (settled) return;
+              try {
+                const d = f();
+                if (d !== undefined) { settled = true; resolve(d); }
+              } catch (e) { settled = true; reject(e); }
+            };
+            [undefined, ...docs].forEach((o, i) => {
+              void ask(o).then((a) => { answers[i] = a; settle(decide); }, (e) => settle(() => { throw e; }));
+            });
+          });
+          if (!ok) return false;
         }
         const parts: string[] = [];
         if (cond.urlIncludes) parts.push(`location.href.includes(${JSON.stringify(cond.urlIncludes)})`);
@@ -1125,37 +1163,31 @@ export class Engine {
     }
     if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
     if (countOf(r)) throw tooMany(countOf(r));
-    // Nothing in the page or its same-origin iframes. Look in frames the page cannot reach:
-    // same-process ones of another origin on the same site (through their own execution
-    // context; their nodes and coordinates work like the page's), then cross-site iframes, which
-    // run in their own process and are offset by their iframe element in the page.
+    // Nothing in the page or its same-origin iframes. Look in documents the page cannot reach,
+    // each on its own (so none is counted twice): same-process frames of another origin on the
+    // same site (their nodes and coordinates work like the page's), then the documents of each
+    // cross-site iframe, which run in their own process, offset by the iframe in the page.
+    const own = finderExpr(sel, kind, true);
     const hits: { node: RefTarget & { objectId?: string }; url: string }[] = [];
     let more = 0;
-    for (const [fid, contextId] of t.contexts) {
-      if (fid === t.mainFrameId) continue;
-      const fr = await this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: `(${REACHABLE_FROM_TOP}) ? 'count:0' : ${finder}`, returnByValue: false, contextId }).catch(() => null);
+    const owners = new Map<string, number | null>();
+    for (const o of this.#otherDocs(t)) {
+      const fr = await this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: o.guard ? `(${REACHABLE_FROM_TOP}) ? 'count:0' : ${own}` : own, returnByValue: false, ...(o.contextId ? { contextId: o.contextId } : {}) }, o.sid).catch(() => null);
       if (!fr || fr.exceptionDetails) continue;
       if (fr.result.subtype !== 'node' || !fr.result.objectId) {
         more += countOf(fr);
         continue;
       }
-      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }).catch(() => null);
-      if (!d) continue;
-      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: fr.result.objectId }, url: '' });
-    }
-    for (const [sid, c] of t.children) {
-      if (c.type !== 'iframe') continue;
-      const fr = await find(sid).catch(() => null);
-      if (!fr || fr.exceptionDetails) continue;
-      if (fr.result.subtype !== 'node' || !fr.result.objectId) {
-        more += countOf(fr);
+      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }, o.sid).catch(() => null);
+      if (!o.sid) {
+        if (d) hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: fr.result.objectId }, url: '' });
         continue;
       }
-      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }, sid).catch(() => null);
-      void this.cdp(tabId, 'Runtime.releaseObject', { objectId: fr.result.objectId }, sid).catch(() => {});
-      const owner = await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: c.targetId }).catch(() => null);
+      void this.cdp(tabId, 'Runtime.releaseObject', { objectId: fr.result.objectId }, o.sid).catch(() => {});
+      if (!owners.has(o.sid)) owners.set(o.sid, (await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: o.targetId }).catch(() => null))?.backendNodeId ?? null);
+      const owner = owners.get(o.sid);
       if (!d || !owner) continue; // e.g. a cross-site frame nested in another one
-      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: sid, ownerBackendNodeId: owner.backendNodeId }, url: c.url });
+      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: o.sid, ownerBackendNodeId: owner }, url: o.url || '' });
     }
     if (hits.length + more > 1) {
       for (const h of hits) if (h.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: h.node.objectId }).catch(() => {});
@@ -1168,6 +1200,21 @@ export class Engine {
       return { node: hits[0].node, desc: `${target} (in cross-site iframe ${receiptUrl(url)})` };
     }
     throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `${target} matched no element.`);
+  }
+
+  /** Documents the top document cannot script, each to be searched on its own: same-process
+   *  frames of another origin (guard: skip those the top does reach), and every document of
+   *  each cross-site frame's session (its default context when none is known yet). */
+  #otherDocs(t: TabState): OtherDoc[] {
+    const out: OtherDoc[] = [];
+    for (const [fid, contextId] of t.contexts) if (fid !== t.mainFrameId) out.push({ contextId, guard: true });
+    for (const [sid, c] of t.children) {
+      if (c.type !== 'iframe') continue;
+      const ctxs = t.childContexts.get(sid);
+      if (ctxs?.size) for (const contextId of ctxs.values()) out.push({ sid, contextId, guard: false, targetId: c.targetId, url: c.url });
+      else out.push({ sid, guard: false, targetId: c.targetId, url: c.url });
+    }
+    return out;
   }
 
   /** Scroll into view, verify the element is the top hit target, return root-viewport coordinates. */
@@ -1211,6 +1258,21 @@ export class Engine {
     let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
     if (sid && node.ownerBackendNodeId !== undefined) [x, y] = await this.#frameToRoot(tabId, sid, node.ownerBackendNodeId, [x, y]);
     return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+  }
+
+  /** For an element inside a frame: its rect and the frame's viewport size, in the frame's own
+   *  coordinates ([left, top, right, bottom, innerWidth, innerHeight]); null in the top page. */
+  async #frameClip(tabId: number, node: RefTarget & { objectId?: string }): Promise<number[] | null> {
+    const sid = node.sessionId;
+    let objectId = sid ? undefined : node.objectId;
+    if (!objectId) objectId = (await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId }, sid).catch(() => null))?.object.objectId;
+    if (!objectId) return null;
+    const r = await this.cdp<{ result: { value?: number[] | null } }>(tabId, 'Runtime.callFunctionOn', {
+      objectId, returnByValue: true,
+      functionDeclaration: 'function () { const w = this.ownerDocument.defaultView; if (!w || w === w.top) return null; const r = this.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom, w.innerWidth, w.innerHeight]; }',
+    }, sid).catch(() => null);
+    if (objectId !== node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId }, sid).catch(() => {});
+    return r?.result.value ?? null;
   }
 
   /** Map points (x0, y0, x1, y1, ...) in a cross-site frame's viewport to the page's viewport,
@@ -1452,19 +1514,14 @@ export class Engine {
     }, sid).catch(() => null);
     const top = (await run())?.result.value;
     if (!top?.remote) return top?.result ?? null;
-    // Focus is in a frame the page cannot reach: a same-process one of another origin (its own
-    // context), or a cross-site one (its own session).
-    for (const [fid, contextId] of t.contexts) {
-      if (fid === t.mainFrameId) continue;
+    // Focus is in a frame the page cannot reach: a same-process one of another origin, or one
+    // in a cross-site frame's session. Ask each such document that has focus; ancestors of the
+    // focused frame have focus too, and answer remote.
+    for (const o of this.#otherDocs(t)) {
       const r = await this.cdp<R>(t.tabId, 'Runtime.evaluate', {
-        expression: `(() => { if (!document.hasFocus() || (${REACHABLE_FROM_TOP})) return { away: true }; return (${FOCUSED_OP})(${JSON.stringify(op)}); })()`, returnByValue: true, contextId,
-      }).catch(() => null);
+        expression: `(() => { if (!document.hasFocus()${o.guard ? ` || (${REACHABLE_FROM_TOP})` : ''}) return { away: true }; return (${FOCUSED_OP})(${JSON.stringify(op)}); })()`, returnByValue: true, ...(o.contextId ? { contextId: o.contextId } : {}),
+      }, o.sid).catch(() => null);
       const v = r?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
-      if (v && !v.away && !v.remote) return v.result ?? null;
-    }
-    for (const [sid, c] of t.children) {
-      if (c.type !== 'iframe') continue;
-      const v = (await run(sid, 'if (!document.hasFocus()) return { result: undefined, away: true };'))?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
       if (v && !v.away && !v.remote) return v.result ?? null;
     }
     return null;
@@ -1543,7 +1600,7 @@ export class Engine {
       const format = opts.format || 'png';
       const params: Json = { format, ...(format !== 'png' && opts.quality ? { quality: opts.quality } : {}) };
       let clip: { x: number; y: number; width: number; height: number } | null = null;
-      const m = await this.cdp<{ cssContentSize: { width: number; height: number }; cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number } }>(tabId, 'Page.getLayoutMetrics');
+      const m = await this.cdp<{ cssContentSize: { width: number; height: number }; cssVisualViewport: { pageX: number; pageY: number; clientWidth: number; clientHeight: number; scale?: number } }>(tabId, 'Page.getLayoutMetrics');
       if (opts.target) {
         const r = await this.#resolve(t, opts.target);
         if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'Screenshot target must be an element, not coordinates.');
@@ -1553,18 +1610,32 @@ export class Engine {
         if (r.node.sessionId && r.node.ownerBackendNodeId !== undefined) quad = await this.#frameToRoot(tabId, r.node.sessionId, r.node.ownerBackendNodeId, quad);
         const xs = [quad[0], quad[2], quad[4], quad[6]];
         const ys = [quad[1], quad[3], quad[5], quad[7]];
+        let box = { x: Math.min(...xs), y: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) };
+        // An element in a frame is cut to that frame's viewport, so the capture never shows the
+        // page around the frame (the element can be larger than its frame).
+        const inFrame = await this.#frameClip(tabId, r.node);
+        if (inFrame) {
+          const [l, tp, rt, bt, iw, ih] = inFrame;
+          const cl = Math.max(l, 0), ct = Math.max(tp, 0), cr = Math.min(rt, iw), cb = Math.min(bt, ih);
+          if (cr <= cl || cb <= ct) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The element is outside the visible area of its frame.');
+          const fx = (box.right - box.x) / (rt - l || 1), fy = (box.bottom - box.y) / (bt - tp || 1);
+          box = { x: box.x + (cl - l) * fx, y: box.y + (ct - tp) * fy, right: box.x + (cr - l) * fx, bottom: box.y + (cb - tp) * fy };
+        }
         const vp = (await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number } }>(tabId, 'Page.getLayoutMetrics')).cssVisualViewport;
-        clip = { x: Math.min(...xs) + vp.pageX, y: Math.min(...ys) + vp.pageY, width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+        clip = { x: box.x + vp.pageX, y: box.y + vp.pageY, width: box.right - box.x, height: box.bottom - box.y };
         params.captureBeyondViewport = true;
       } else if (opts.fullPage) {
         clip = { x: 0, y: 0, width: Math.ceil(m.cssContentSize.width), height: Math.min(Math.ceil(m.cssContentSize.height), 16384) };
         params.captureBeyondViewport = true;
       }
-      // CSS pixels by default, the units clicks take: on a HiDPI screen (or a zoomed page) a
-      // device-pixel image would need every coordinate divided by devicePixelRatio.
+      // CSS pixels by default, the units clicks take: on a HiDPI screen, a zoomed page or a
+      // pinch-zoomed one, a device-pixel image would need every coordinate divided by the
+      // device pixel ratio times the pinch zoom.
       const dprR = await this.cdp<{ result: { value?: number } }>(tabId, 'Runtime.evaluate', { expression: 'devicePixelRatio', returnByValue: true }).catch(() => null);
       const dpr = typeof dprR?.result.value === 'number' && dprR.result.value > 0 ? dprR.result.value : 1;
-      const cssScale = !opts.hiDpi && Math.abs(dpr - 1) > 0.01;
+      const pinch = m.cssVisualViewport.scale && m.cssVisualViewport.scale > 0 ? m.cssVisualViewport.scale : 1;
+      const factor = dpr * pinch;
+      const cssScale = !opts.hiDpi && Math.abs(factor - 1) > 0.01;
       if (cssScale && !clip) clip = { x: m.cssVisualViewport.pageX, y: m.cssVisualViewport.pageY, width: m.cssVisualViewport.clientWidth, height: m.cssVisualViewport.clientHeight };
       if (clip) params.clip = { ...clip, scale: cssScale ? 1 / dpr : 1 };
       const r = await this.client.request<{ data: string }>('screenshot', { tabId, params, includeOverlay: !!opts.includeOverlay }, 60_000);
@@ -1586,7 +1657,7 @@ export class Engine {
         clip,
         fullPage: !!opts.fullPage,
         // Image pixels per CSS pixel: 1 unless hiDpi.
-        scale: cssScale || dpr === 1 ? 1 : Math.round(dpr * 1000) / 1000,
+        scale: cssScale || Math.abs(factor - 1) <= 0.01 ? 1 : Math.round(factor * 1000) / 1000,
       };
     });
   }
@@ -1614,10 +1685,12 @@ export class Engine {
       if (opts.timeoutMs) params.timeout = opts.timeoutMs;
       type Remote = { type: string; subtype?: string; objectId?: string; value?: unknown; description?: string; unserializableValue?: string };
       type EvalResult = { result: Remote; exceptionDetails?: { text: string; exception?: { description?: string } } };
+      let madeObjects = false;
       const budget = (opts.timeoutMs ?? 30_000) + 5000;
       const until = Date.now() + budget;
       try {
         let r = await this.cdp<EvalResult>(tabId, 'Runtime.evaluate', params, sessionId, budget);
+        madeObjects = !!r.result.objectId || !!r.exceptionDetails;
         if (!r.exceptionDetails && r.result.subtype === 'promise' && r.result.objectId && opts.awaitPromise !== false) {
           r = await this.cdp<EvalResult>(tabId, 'Runtime.awaitPromise', { promiseObjectId: r.result.objectId, returnByValue: false }, sessionId, Math.max(until - Date.now(), 100));
         }
@@ -1638,7 +1711,9 @@ export class Engine {
         if (contextGone(e)) throw await this.#navigatedError(tabId);
         throw e;
       } finally {
-        void this.cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }, sessionId).catch(() => {});
+        // Only when there is something to free: calls to a tab run in order, so a needless one
+        // would wait behind a page that is now busy.
+        if (madeObjects) void this.cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }, sessionId).catch(() => {});
       }
     });
   }

@@ -271,6 +271,11 @@ used. Human actions are simulated as trusted mouse and keyboard events.
   drags there work.
 - A cross-site iframe inside another cross-site iframe is not searched by selectors or followed
   by snapshots.
+- While a Space window is covered and Chrome is not painting it, a frame nested inside a
+  cross-site frame may have no size yet, so its elements count as hidden until the window paints
+  (a screenshot makes it paint).
+- Commands to a tab run one at a time, so a frame that is busy running script delays the tab's
+  next commands until it answers.
 - Spaces end when Chrome closes and are not restored.
 - Certificate errors cannot be bypassed from an extension. On an untrusted certificate (such as a
   local dev server) the agent gets `CERT_ERROR` and hands off; click **Advanced**, then **Proceed**
