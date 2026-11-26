@@ -210,7 +210,7 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
       if (all) return docs.flatMap(inDoc);
       // Visible, and so is every iframe it sits in (as far up as this document can see).
       const shown = (e: Element) => {
-        if (!((e as HTMLElement).checkVisibility?.() ?? true)) return false;
+        if (!((e as HTMLElement).checkVisibility?.({ visibilityProperty: true }) ?? true)) return false;
         let w: Window | null = e.ownerDocument.defaultView;
         for (let i = 0; i < 30 && w && w !== w.parent; i++) {
           let fe: Element | null = null;
@@ -235,7 +235,7 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
 /** Page-side function: the element is visible, and so is every iframe it sits in (as far up as
  *  its document can see). */
 const FRAME_SHOWN_JS = `((e) => {
-  if (!e.checkVisibility()) return false;
+  if (!e.checkVisibility({ visibilityProperty: true })) return false;
   let w = e.ownerDocument.defaultView;
   for (let i = 0; i < 30 && w && w !== w.parent; i++) {
     let fe = null;
@@ -978,7 +978,8 @@ export class Engine {
           const docs = ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`;
           // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
           const matches = cond.selector ? `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)` : '[]';
-          const hasText = cond.text ? `docs.some((d) => (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}))` : 'false';
+          // Text counts only in documents whose iframes are visible.
+          const hasText = cond.text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}); })` : 'false';
           return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; return { n: a.length, vis: a.filter(shown).length, text: ${hasText} }; })()`;
         };
       }
@@ -999,7 +1000,7 @@ export class Engine {
           const ask = (o?: OtherDoc): Promise<{ v?: V; bad?: boolean }> => within(
             this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: o?.guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe!(true)}` : probe!(!!o), returnByValue: true, ...(o?.contextId ? { contextId: o.contextId } : {}) }, o?.sid, Math.max(left, 100))
               .then(async (r) => {
-                if (o && r.result.value?.vis && !(await framesShown(o))) r.result.value.vis = 0;
+                if (o && (r.result.value?.vis || r.result.value?.text) && !(await framesShown(o))) { r.result.value.vis = 0; r.result.value.text = false; }
                 return r;
               })
               .then((r) => (r.exceptionDetails ? { bad: true } : r.result.value ? { v: r.result.value } : o?.guard ? { v: absent } : {}))

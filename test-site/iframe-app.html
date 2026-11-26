@@ -51,6 +51,14 @@
       document.body.append(f);
     }
   }
+  // ?vishidden=1: a visibility:hidden page copy of the cross-site frame's button.
+  if (q.get('vishidden')) {
+    const b = document.createElement('button');
+    b.textContent = 'Run remote query';
+    b.style.visibility = 'hidden';
+    document.body.append(b);
+  }
+  if (q.get('remotehidden')) document.getElementById('remote').style.visibility = 'hidden';
   if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
   if (q.get('shadow')) {
     const host = document.createElement('div');

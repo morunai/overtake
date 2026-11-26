@@ -344,3 +344,15 @@ test('rotated frames are not clicked unchecked; hidden copies do not get in the 
   assert.equal(await inFeature('runs'), 1);
   await A.call('browser_click', { tabId, target: 'text=Run alt query' });
 });
+
+test('visibility:hidden copies are hidden, and text in a hidden frame does not satisfy a wait', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?vishidden=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run remote query', timeoutMs: 15_000 });
+  const before = await inRemote('runs');
+  await A.call('browser_click', { tabId, target: 'text=Run remote query' });
+  assert.equal(await inRemote('runs'), before + 1);
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?remotehidden=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run remote query', state: 'attached', timeoutMs: 15_000 });
+  await assert.rejects(A.call('browser_wait', { tabId, text: 'Run remote query', timeoutMs: 500 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_wait', { tabId, text: 'Run query' });
+});
