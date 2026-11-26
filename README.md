@@ -138,8 +138,21 @@ snapshot of the page after the action, with fresh `@refs`, so the agent does not
 
 To check that an action worked, the input tools take `waitForText` (for example `"Saved"`): it
 waits for that text to appear because of the action, so a "Saved" left over from an earlier save
-does not count. Their results also list the requests the page made (method, URL, status).
-Snapshots mark native drag sources `[draggable]` and give them `@refs`.
+does not count. Their results also list the requests the page made (method, URL, status), and
+include the page URL and title only when they changed, so apps that keep long state in the URL
+do not repeat it after every click. Snapshots mark native drag sources `[draggable]` and give
+them `@refs`.
+
+Apps that put their UI in iframes (cloud consoles, embedded editors) work like any other page.
+Selectors (CSS, `text=`, `xpath=`) search the top document first, then same-origin iframes, then
+cross-site ones. `browser_wait` checks every frame, and snapshots follow nested iframes.
+`browser_type` clears and reads the focused field wherever it is. It returns that field's value,
+capped in length, or `null` when focus is not on a text field.
+
+Screenshots are in CSS pixels, the same units as click coordinates, also on HiDPI screens
+(`hiDpi: true` gives device pixels). A viewport capture of a pinch-zoomed page is left as it is,
+so the zoom is not reset, and its `scale` says how to convert. `browser_evaluate` awaits a returned Promise, so an async
+IIFE returns its value.
 
 The server ships instructions that tell the agent how to behave: one Space per goal, snapshot
 before acting, treat `USER_IN_CONTROL` as a hard stop, and use `space_handoff` when a human is
@@ -257,6 +270,15 @@ used. Human actions are simulated as trusted mouse and keyboard events.
 - `Profiler` and `HeapProfiler` are not available to extensions. Use `browser_trace` instead.
 - Native HTML5 drags into or out of a cross-site iframe are cancelled with an error. Pointer-based
   drags there work.
+- A cross-site iframe inside another cross-site iframe is not searched by selectors or followed
+  by snapshots.
+- While a Space window is covered and Chrome is not painting it, a frame nested inside a
+  cross-site frame may have no size yet, so its elements count as hidden until the window paints
+  (a screenshot makes it paint).
+- Element screenshots inside a rotated or skewed iframe are cut to the iframe's bounding box, so
+  they can include a little of the page around the iframe's corners.
+- Commands to a tab run one at a time, so a frame that is busy running script delays the tab's
+  next commands until it answers.
 - Spaces end when Chrome closes and are not restored.
 - Certificate errors cannot be bypassed from an extension. On an untrusted certificate (such as a
   local dev server) the agent gets `CERT_ERROR` and hands off; click **Advanced**, then **Proceed**

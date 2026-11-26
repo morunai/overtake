@@ -20,13 +20,14 @@ type ToolResult = { content: Content[]; isError?: boolean };
 const INSTRUCTIONS = `Overtake drives the user's real Google Chrome through agent Spaces (dedicated windows), with explicit human/agent control.
 Rules:
 - Work inside a Space you own. Create one per user goal (spaces_create) and keep using its spaceId; it starts with one tab.
-- Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages.
+- Prefer browser_snapshot (accessibility tree with @refs) to choose targets, then act with browser_click/browser_type using @refs. Use screenshots for visual checks and canvas-like pages. To read data from a page (table rows, values), use browser_evaluate or browser_run rather than screenshots.
+- Selectors (CSS, text=, xpath=) and snapshots reach into iframes: the top document is searched first, then iframes.
 - Pages often keep changing after load. To wait for an element, pass waitFor to browser_navigate or use browser_wait with a selector; do not guess with fixed delays.
 - SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
-- For many steps or repeated flows (test suites, filling many forms, checking many pages), write a script file once and run it with browser_run instead of one tool call per step. Re-run the same file after fixing it.
+- For many steps or repeated flows (test suites, filling many forms, checking many pages, or a multi-step task in a heavy web app), write a script file once and run it with browser_run instead of one tool call per step; it returns only what the script returns. Re-run the same file after fixing it.
 - Use browser_select for native <select> dropdowns, not browser_evaluate.
 - Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_drag, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
-- To confirm an action worked, pass waitForText (for example "Saved") to browser_click, browser_type, browser_select, browser_press or browser_drag: it waits for that text to appear because of the action, not text already on the page. Their results also list the requests the page made (method, URL, status).
+- To confirm an action worked, pass waitForText (for example "Saved") to browser_click, browser_type, browser_select, browser_press or browser_drag: it waits for that text to appear because of the action, not text already on the page. Their results also list the requests the page made (method, URL, status). Action results include url and title only when they changed since you last saw them.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
 - A CERT_ERROR (untrusted certificate, Chrome's "Privacy error" page) cannot be bypassed from the extension: hand off so the user clicks "Proceed" once, then navigate again.
@@ -263,22 +264,23 @@ server.registerTool('browser_snapshot', {
 }));
 
 server.registerTool('browser_screenshot', {
-  description: 'Screenshot via CDP Page.captureScreenshot: viewport (default), fullPage, or one element. The Overtake overlay is hidden from the capture unless includeOverlay. Optionally saves to an absolute path.',
+  description: 'Screenshot via CDP Page.captureScreenshot: viewport (default), fullPage, or one element. For visual checks; to read data use browser_evaluate or browser_run. The image is in CSS pixels, the units click coordinates use (pass hiDpi for device pixels; a pinch-zoomed viewport is captured as it is; scale in the result is image pixels per CSS pixel). The Overtake overlay is hidden from the capture unless includeOverlay. Optionally saves to an absolute path.',
   inputSchema: {
     tabId, fullPage: z.boolean().default(false), target: target.optional(), format: z.enum(['png', 'jpeg', 'webp']).default('png'), quality: z.number().int().min(1).max(100).optional(),
     path: z.string().optional().describe('Absolute file path to save the image. With a path, the image is not also returned inline unless inline is true (saves context).'),
     inline: z.boolean().optional().describe('Return the image inline. Default: true without path, false with path.'), includeOverlay: z.boolean().default(false),
+    hiDpi: z.boolean().default(false).describe('Capture in device pixels (sharper on HiDPI screens); divide image coordinates by scale before clicking.'),
   },
-}, wrap(async (a: { tabId: number; fullPage: boolean; target?: string; format: 'png' | 'jpeg' | 'webp'; quality?: number; path?: string; inline?: boolean; includeOverlay: boolean }) => {
+}, wrap(async (a: { tabId: number; fullPage: boolean; target?: string; format: 'png' | 'jpeg' | 'webp'; quality?: number; path?: string; inline?: boolean; includeOverlay: boolean; hiDpi: boolean }) => {
   const r = await engine.screenshot(a.tabId, a);
-  const meta = { mimeType: r.mimeType, bytes: r.bytes, savedTo: r.savedTo, viewport: r.viewport, contentSize: r.contentSize, clip: r.clip, fullPage: r.fullPage };
+  const meta = { mimeType: r.mimeType, bytes: r.bytes, savedTo: r.savedTo, viewport: r.viewport, contentSize: r.contentSize, clip: r.clip, fullPage: r.fullPage, scale: r.scale };
   const content: Content[] = [{ type: 'text', text: JSON.stringify(meta) }];
   if (r.data && (a.inline ?? !a.path)) content.unshift({ type: 'image', data: r.data, mimeType: r.mimeType });
   return { content };
 }));
 
 server.registerTool('browser_evaluate', {
-  description: 'Evaluate JavaScript in the page (console-style: top-level await allowed). Returns the JSON value or the exception. Pass expression, or file (absolute path to a .js file) to run a script you wrote once without re-sending it. Use frameId (from browser_frames) for iframes.',
+  description: 'Evaluate JavaScript in the page (console-style: top-level await allowed; a returned Promise, such as an async IIFE, is awaited). Returns the JSON value or the exception. Good for reading data (rows, values) as compact JSON instead of screenshots. Pass expression, or file (absolute path to a .js file) to run a script you wrote once without re-sending it. Use frameId (from browser_frames) for iframes.',
   inputSchema: {
     tabId, expression: z.string().optional(), file: z.string().optional().describe('Absolute path to a .js, .mjs or .cjs file (max 1 MB) whose contents are evaluated instead of expression.'),
     frameId: z.string().optional(), awaitPromise: z.boolean().default(true), timeoutMs: z.number().int().max(120_000).optional(),
@@ -290,7 +292,7 @@ server.registerTool('browser_evaluate', {
 
 server.registerTool('browser_run', {
   description: [
-    'Run a whole flow from one script in this tab, so you are in the loop only at the start and the end. Write the script to a file once (file), then re-run it after fixes; or pass a short one inline (script).',
+    'Run a whole flow from one script in this tab, so you are in the loop only at the start and the end. The preferred way to do multi-step tasks: one call, and only the result you return comes back. Write the script to a file once (file), then re-run it after fixes; or pass a short one inline (script).',
     'The script is the body of an async function. Each call uses the same real input and checks as the tools:',
     'click(target, {button, clickCount, force, humanlike, label}), type(target|null, text, {clear, submit, slowly}), fill(target, text), select(target, valueOrLabel | [values]), press(keys, {repeat}), hover(target), scroll({target, dx, dy}), drag(from, to), upload(target, files), dialog(accept, promptText),',
     'navigate(url, {waitFor, waitUntil, timeoutMs}), wait(selector | ms | {selector, state, text, urlIncludes, function, networkIdleMs, load, timeoutMs}), sleep(ms), snapshot({scope}) -> text with @refs, url(), evaluate(expressionOrFunction, ...args) -> value in the page,',
@@ -375,7 +377,7 @@ server.registerTool('browser_select', {
 }, wrap(async (a: { tabId: number; target: string; values: string | string[]; force: boolean; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.select(a.tabId, a.target, a.values, a))));
 
 server.registerTool('browser_type', {
-  description: 'Type text. With target, clicks it first. clear replaces existing text; submit presses Enter; slowly sends per-key events instead of a single insertText.',
+  description: 'Type text. With target, clicks it first. clear replaces existing text; submit presses Enter; slowly sends per-key events instead of a single insertText. Returns the focused field\'s value afterwards (also inside iframes; null when focus is not on an editable field; long values are cut).',
   inputSchema: { tabId, text: z.string(), target: target.optional(), clear: z.boolean().default(false), submit: z.boolean().default(false), slowly: z.boolean().default(false), label: z.string().max(60).optional(), ...actionOpts, ...snapshotOpts },
 }, wrap(async (a: { tabId: number; text: string; target?: string; clear: boolean; submit: boolean; slowly: boolean; label?: string } & ActionOpts & SnapshotOpts) => act(a, () => engine.type(a.tabId, a))));
 

@@ -41,10 +41,16 @@ export interface FrameTree {
   ownerBackendNodeId?: number;
 }
 
+/** Key of a child frame document in SnapshotInput.children: its owner <iframe>'s backend node
+ *  id, with the session of the document that holds the owner (ids repeat across processes). */
+export function frameKey(sessionId: string | undefined, backendNodeId: number) {
+  return `${sessionId ?? ''}#${backendNodeId}`;
+}
+
 export interface SnapshotInput {
   main: FrameTree;
-  /** child frame documents keyed by the backendDOMNodeId of their owner <iframe> in the parent */
-  children: Map<number, FrameTree>;
+  /** child frame documents (frameKey of their owner <iframe>), nested frames included */
+  children: Map<string, FrameTree>;
   /** backendNodeIds visible in the viewport (main document); undefined = no filtering */
   visible?: Set<number>;
   nextRef: () => number;
@@ -169,9 +175,8 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
       }
       const label = role === 'Iframe' ? 'iframe' : !role || n.ignored ? 'generic' : role;
       lines.push(`${'  '.repeat(d)}- ${label}${name ? ` "${name.slice(0, 160)}"` : ''}${ref}${value && value !== name ? ` value="${value.slice(0, 120)}"` : ''}${props.length ? ` [${props.join(', ')}]` : ''}`);
-      if (n.backendDOMNodeId !== undefined && input.children.has(n.backendDOMNodeId)) {
-        walkTree(input.children.get(n.backendDOMNodeId)!, d + 1, undefined);
-      }
+      const sub = n.backendDOMNodeId !== undefined ? input.children.get(frameKey(tree.sessionId, n.backendDOMNodeId)) : undefined;
+      if (sub) walkTree(sub, d + 1, undefined);
       // A draggable named from its own text: its text-only subtree would repeat that name.
       if ((onlyText || (drag && !str(n.name))) && name && !hasInteractive(n, byId, input.draggable)) return;
       for (const k of kids) visit(k, d + 1);
