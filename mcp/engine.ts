@@ -7,7 +7,7 @@ import { writeFile, mkdir, stat, copyFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { BrokerClient, requestScope } from './broker-client.ts';
-import { buildSnapshot, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
+import { buildSnapshot, frameKey, type AXNode, type FrameTree, type RefTarget } from './snapshot.ts';
 import { chordSteps, typeSteps } from './keys.ts';
 import { OvertakeError, ErrorCode, type AgentEvent, type InputStep, type SpaceSummary } from '../shared/protocol.ts';
 import { redactCdp, redactNetworkEntry, redactUrl } from './redact.ts';
@@ -66,6 +66,7 @@ interface TabState {
   cursor: { x: number; y: number } | null;
   children: Map<string, { targetId: string; type: string; url: string }>; // OOPIF sessions
   contexts: Map<string, number>; // frameId -> default execution context id
+  shown: { url: string; title: string }; // the url and title the agent last saw in a result
   dialog: { type: string; message: string; defaultPrompt?: string; url: string } | null;
   paused: unknown | null;
   intercepts: InterceptRule[];
@@ -85,6 +86,7 @@ const MAX_EVENTS = 1500;
 
 let seq = 0;
 let refCounter = 0;
+let evalGroup = 0;
 
 /** Refusals that mean "stop now", as opposed to transient page states worth retrying. */
 const HARD_STOP = new Set<string>([ErrorCode.USER_IN_CONTROL, ErrorCode.STOPPED, ErrorCode.NOT_OWNER, ErrorCode.SPACE_CLOSED, ErrorCode.TAB_CLOSED, ErrorCode.SPACE_NOT_FOUND, ErrorCode.TAB_NOT_IN_SPACE, ErrorCode.EXTENSION_NOT_CONNECTED, ErrorCode.AGENT_PAUSED_TIMEOUT]);
@@ -154,37 +156,116 @@ function parseSelector(target: string): { kind: 'css' | 'text' | 'xpath'; sel: s
   return { kind: 'css', sel: target };
 }
 
-/** Page-side finder shared by actions and browser_wait: returns the single (visible-preferred)
- *  match, or { count } when there are none or several. With `all`, returns every match. */
-const FIND_ELEMENT = (function find(sel: string, kind: string, all = false) {
+/** Page-side: this document, then the documents of same-origin iframes (also inside open
+ *  shadow roots and nested frames), which the page can reach. Cross-site frames run in their
+ *  own process and are searched through their own session. */
+const FRAME_DOCS = (function frameDocs() {
+      const docs: Document[] = [document];
+      const walk = (root: Document | ShadowRoot) => {
+        for (const e of root.querySelectorAll('*')) {
+          if (docs.length > 50) return;
+          if (e.shadowRoot) walk(e.shadowRoot);
+          if (e.localName === 'iframe' || e.localName === 'frame') {
+            let d: Document | null = null;
+            try { d = (e as HTMLIFrameElement).contentDocument; } catch { /* cross-origin */ }
+            if (d?.documentElement) { docs.push(d); walk(d); }
+          }
+        }
+      };
+      walk(document);
+      return docs;
+    }).toString();
+
+/** Page-side finder shared by actions and browser_wait, over `docs` (FRAME_DOCS): returns the
+ *  single match, or { count } when there are none or several. Visible matches in the top
+ *  document come first, then visible ones in iframes, then hidden ones anywhere. With `all`,
+ *  returns every match in every document. */
+const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, docs: Document[]) {
       const deepAll = (root: Document | ShadowRoot, css: string): Element[] => {
         const out = [...root.querySelectorAll(css)];
         for (const e of root.querySelectorAll('*')) if (e.shadowRoot) out.push(...deepAll(e.shadowRoot, css));
         return out;
       };
-      let m: Element[] = [];
-      if (kind === 'css') m = deepAll(document, sel);
-      else if (kind === 'xpath') {
-        const r = document.evaluate(sel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-        for (let i = 0; i < r.snapshotLength; i++) if (r.snapshotItem(i) instanceof Element) m.push(r.snapshotItem(i) as Element);
-      } else {
-        const exact = /^".*"$/.test(sel);
-        const want = exact ? sel.slice(1, -1) : sel.replace(/\s+/g, ' ').trim().toLowerCase();
-        const norm = (s: string) => (exact ? s.trim() : s.replace(/\s+/g, ' ').trim().toLowerCase());
-        const all = [...document.querySelectorAll('body *')].filter((e) => e.localName !== 'overtake-overlay' && e.localName !== 'script' && e.localName !== 'style');
-        const hit = all.filter((e) => {
-          const txt = norm((e as HTMLElement).innerText ?? e.textContent ?? '');
-          const aria = norm(e.getAttribute('aria-label') || (e as HTMLInputElement).value || '');
-          return exact ? txt === want || aria === want : txt.includes(want) || aria.includes(want);
-        });
-        m = hit.filter((e) => !hit.some((o) => o !== e && e.contains(o)));
-      }
-      if (all) return m;
-      const vis = m.filter((e) => (e as HTMLElement).checkVisibility?.() ?? true);
-      const pick = vis.length ? vis : m;
+      const inDoc = (doc: Document): Element[] => {
+        let m: Element[] = [];
+        if (kind === 'css') m = deepAll(doc, sel);
+        else if (kind === 'xpath') {
+          const r = doc.evaluate(sel, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          for (let i = 0; i < r.snapshotLength; i++) { const n = r.snapshotItem(i); if (n && n.nodeType === 1) m.push(n as Element); }
+        } else {
+          const exact = /^".*"$/.test(sel);
+          const want = exact ? sel.slice(1, -1) : sel.replace(/\s+/g, ' ').trim().toLowerCase();
+          const norm = (s: string) => (exact ? s.trim() : s.replace(/\s+/g, ' ').trim().toLowerCase());
+          const cands = [...doc.querySelectorAll('body *')].filter((e) => e.localName !== 'overtake-overlay' && e.localName !== 'script' && e.localName !== 'style');
+          const hit = cands.filter((e) => {
+            const txt = norm((e as HTMLElement).innerText ?? e.textContent ?? '');
+            const aria = norm(e.getAttribute('aria-label') || (e as HTMLInputElement).value || '');
+            return exact ? txt === want || aria === want : txt.includes(want) || aria.includes(want);
+          });
+          m = hit.filter((e) => !hit.some((o) => o !== e && e.contains(o)));
+        }
+        return m;
+      };
+      const per = docs.map(inDoc);
+      if (all) return per.flat();
+      const shown = (e: Element) => (e as HTMLElement).checkVisibility?.() ?? true;
+      const topVis = per[0].filter(shown);
+      const frameVis = per.slice(1).flat().filter(shown);
+      const pick = topVis.length ? topVis : frameVis.length ? frameVis : per.flat();
       if (pick.length === 1) return pick[0];
       return { count: pick.length };
     }).toString();
+
+/** Page-side expression: the single match for a selector as a node, or "count:N". */
+function finderExpr(sel: string, kind: string) {
+  return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, (${FRAME_DOCS})()); return r && r.nodeType ? r : 'count:' + r.count; })()`;
+}
+
+/** Page-side: the focused element, followed into open shadow roots and same-origin iframes.
+ *  Returns { remote: true } when focus is inside a frame this document cannot reach
+ *  (cross-site), and then `op` runs on the element: 'clear' selects an editable field's
+ *  contents (true if it did), 'value' reads an editable field's value (null otherwise, capped,
+ *  and only the length for a password). */
+const FOCUSED_OP = (function focused(op: string) {
+      let e: Element | null = document.activeElement;
+      for (let i = 0; e && i < 30; i++) {
+        const sr = (e as HTMLElement).shadowRoot;
+        if (sr?.activeElement) { e = sr.activeElement; continue; }
+        if (e.localName === 'iframe' || e.localName === 'frame') {
+          let d: Document | null = null;
+          try { d = (e as HTMLIFrameElement).contentDocument; } catch { /* cross-origin */ }
+          if (!d) return { remote: true };
+          e = d.activeElement;
+          continue;
+        }
+        break;
+      }
+      if (!e) return { result: op === 'clear' ? false : null };
+      const d = e.ownerDocument;
+      const field = e.localName === 'input' || e.localName === 'textarea';
+      const editable = field || (e as HTMLElement).isContentEditable;
+      if (!editable || e === d.body && !(e as HTMLElement).isContentEditable) return { result: op === 'clear' ? false : null };
+      if (op === 'clear') {
+        if (field) (e as HTMLInputElement).select();
+        else {
+          const r = d.createRange();
+          r.selectNodeContents(e);
+          const s = d.defaultView!.getSelection()!;
+          s.removeAllRanges();
+          s.addRange(r);
+        }
+        return { result: true };
+      }
+      if (field && (e as HTMLInputElement).type === 'password') return { result: `(password, ${(e as HTMLInputElement).value.length} chars)` };
+      const v = field ? (e as HTMLInputElement).value : (e as HTMLElement).innerText;
+      return { result: v.length > 200 ? v.slice(0, 200) + `…(+${v.length - 200} chars)` : v };
+    }).toString();
+
+/** A long URL shortened for a receipt: apps that keep state in the URL make them very long.
+ *  The full one is in location.href (browser_evaluate) or browser_tabs. */
+export function capUrl(url: string, max = 300): string {
+  return url.length > max ? `${url.slice(0, max)}…(+${url.length - max} chars)` : url;
+}
 
 /** Whether a request still counts as in flight for idle checks. Chrome never reports
  *  loadingFinished for some requests that did get a response (fetch with keepalive, as
@@ -282,7 +363,7 @@ export class Engine {
     if (!t) {
       t = {
         tabId, enabled: false, enabling: null, net: new Map(), console: [], events: [], refs: new Map(), cursor: null, children: new Map(),
-        contexts: new Map(), dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
+        contexts: new Map(), shown: { url: '', title: '' }, dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
       };
       this.#tabs.set(tabId, t);
     }
@@ -637,9 +718,11 @@ export class Engine {
         const left = timeoutMs - (Date.now() - started);
         if (left <= 0) throw new OvertakeError(ErrorCode.TIMEOUT, `Navigation used the whole ${timeoutMs} ms; ${opts.waitFor} was not checked.`);
         const w = await this.#waitIn(t, { selector: opts.waitFor, state: 'visible', timeoutMs: left });
+        if (w.url !== undefined) this.#saw(t, { url: w.url, title: w.title ?? '' });
         return { url: w.url, title: w.title, readyState: w.readyState, loaded: isLoaded, sameDocument: !r.loaderId, found: opts.waitFor };
       }
       const info = await this.pageInfo(tabId);
+      this.#saw(t, info);
       return { ...info, loaded: isLoaded, sameDocument: !r.loaderId };
     });
   }
@@ -825,18 +908,39 @@ export class Engine {
     {
       const timeoutMs = cond.timeoutMs ?? 10_000;
       const deadline = Date.now() + timeoutMs;
-      const check = async (): Promise<boolean> => {
-        const parts: string[] = [];
+      // Selector and text are checked in every frame: the page with its same-origin iframes,
+      // and each cross-site iframe through its own session. Each reports
+      // { n: matches, vis: visible matches, text: whether the text is in it }.
+      let probe: string | null = null;
+      if (cond.selector || cond.text) {
+        let matches = '[]';
         if (cond.selector) {
           // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
           const { kind, sel } = parseSelector(cond.selector);
-          const all = `((${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true))`;
-          const state = cond.state || 'visible';
-          parts.push(state === 'hidden'
-            ? `${all}.every((e) => !e.checkVisibility())`
-            : state === 'attached' ? `${all}.length > 0` : `${all}.some((e) => e.checkVisibility())`);
+          matches = `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)`;
         }
-        if (cond.text) parts.push(`(document.body?.innerText || '').includes(${JSON.stringify(cond.text)})`);
+        const hasText = cond.text ? `docs.some((d) => (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}))` : 'false';
+        probe = `(() => { const docs = (${FRAME_DOCS})(); const a = ${matches}; return { n: a.length, vis: a.filter((e) => e.checkVisibility()).length, text: ${hasText} }; })()`;
+      }
+      const state = cond.state || 'visible';
+      const check = async (): Promise<boolean> => {
+        if (probe) {
+          const left = deadline - Date.now();
+          type Probe = { result: { value?: { n: number; vis: number; text: boolean } }; exceptionDetails?: unknown };
+          const none: Probe = { result: { value: { n: 0, vis: 0, text: false } } };
+          const ask = (sid?: string) => within(
+            this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: probe, returnByValue: true }, sid, Math.max(left, 100)).catch(softFail(none)),
+            left, none);
+          const frames = [...t.children.entries()].filter(([, c]) => c.type === 'iframe').map(([sid]) => sid);
+          const [top, ...rest] = await Promise.all([ask(), ...frames.map((sid) => ask(sid))]);
+          if (top.exceptionDetails && cond.selector) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${cond.selector}`);
+          const all = [top, ...rest].map((r) => r.result.value ?? { n: 0, vis: 0, text: false });
+          const n = all.reduce((s, v) => s + v.n, 0);
+          const vis = all.reduce((s, v) => s + v.vis, 0);
+          if (cond.selector && !(state === 'hidden' ? vis === 0 : state === 'attached' ? n > 0 : vis > 0)) return false;
+          if (cond.text && !all.some((v) => v.text)) return false;
+        }
+        const parts: string[] = [];
         if (cond.urlIncludes) parts.push(`location.href.includes(${JSON.stringify(cond.urlIncludes)})`);
         if (cond.function) parts.push(`!!(await (async () => (${cond.function}))())`);
         if (cond.load) parts.push(`document.readyState === 'complete'`);
@@ -879,33 +983,54 @@ export class Engine {
   async snapshot(tabId: number, opts: { scope?: 'viewport' | 'full_page'; maxLines?: number } = {}) {
     return this.action(tabId, async (t) => {
       const { nodes } = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {});
-      const children = new Map<number, FrameTree>();
-      // Same-process child frames.
-      const tree = await this.cdp<{ frameTree: { frame: { id: string }; childFrames?: unknown[] } }>(tabId, 'Page.getFrameTree');
-      const frameIds: string[] = [];
-      const collect = (ft: { frame: { id: string }; childFrames?: unknown[] }, depth: number) => {
-        if (depth > 0) frameIds.push(ft.frame.id);
-        for (const c of (ft.childFrames || []) as typeof ft[]) collect(c, depth + 1);
+      const children = new Map<string, FrameTree>();
+      // Frames in the same process as a document are read through that document's session;
+      // a cross-site frame through its own session, offset by its <iframe> in the page.
+      // Nested frames are followed too (consoles often put iframes inside iframes).
+      const localFrames = new Map<string, Set<string>>();
+      const framesOf = async (sid?: string) => {
+        const key = sid ?? '';
+        let set = localFrames.get(key);
+        if (!set) {
+          set = new Set();
+          const tree = await this.cdp<{ frameTree: { frame: { id: string }; childFrames?: unknown[] } }>(tabId, 'Page.getFrameTree', {}, sid).catch(() => null);
+          const collect = (ft: { frame: { id: string }; childFrames?: unknown[] }, depth: number) => {
+            if (depth > 0) set!.add(ft.frame.id);
+            for (const c of (ft.childFrames || []) as typeof ft[]) collect(c, depth + 1);
+          };
+          if (tree) collect(tree.frameTree, 0);
+          localFrames.set(key, set);
+        }
+        return set;
       };
-      collect(tree.frameTree, 0);
-      for (const n of nodes) {
-        if ((n.role?.value === 'Iframe' || n.role?.value === 'iframe') && n.backendDOMNodeId !== undefined) {
-          const d = await this.cdp<{ node: { frameId?: string; contentDocument?: unknown } }>(tabId, 'DOM.describeNode', { backendNodeId: n.backendDOMNodeId }).catch(() => null);
+      let budget = 60; // frames read per snapshot
+      const expand = async (axNodes: AXNode[], sid: string | undefined, owner: number | undefined, depth: number): Promise<void> => {
+        if (depth > 6) return;
+        for (const n of axNodes) {
+          if (budget <= 0) return;
+          if ((n.role?.value !== 'Iframe' && n.role?.value !== 'iframe') || n.backendDOMNodeId === undefined) continue;
+          const d = await this.cdp<{ node: { frameId?: string } }>(tabId, 'DOM.describeNode', { backendNodeId: n.backendDOMNodeId }, sid).catch(() => null);
           const fid = d?.node.frameId;
           if (!fid) continue;
-          if (frameIds.includes(fid)) {
-            const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', { frameId: fid }).catch(() => null);
-            if (sub) children.set(n.backendDOMNodeId, { nodes: sub.nodes, frameId: fid });
-          } else {
-            // Out-of-process iframe: find its session.
+          budget--;
+          if ((await framesOf(sid)).has(fid)) {
+            const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', { frameId: fid }, sid).catch(() => null);
+            if (!sub) continue;
+            children.set(frameKey(sid, n.backendDOMNodeId), { nodes: sub.nodes, sessionId: sid, frameId: fid, ownerBackendNodeId: owner });
+            await expand(sub.nodes, sid, owner, depth + 1);
+          } else if (!sid) {
+            // Out-of-process iframe: find its session. (One inside another cross-site frame
+            // is not followed: its coordinates would need two offsets.)
             const child = [...t.children.entries()].find(([, v]) => v.targetId === fid);
-            if (child) {
-              const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {}, child[0]).catch(() => null);
-              if (sub) children.set(n.backendDOMNodeId, { nodes: sub.nodes, sessionId: child[0], frameId: fid, ownerBackendNodeId: n.backendDOMNodeId });
-            }
+            if (!child) continue;
+            const sub = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {}, child[0]).catch(() => null);
+            if (!sub) continue;
+            children.set(frameKey(sid, n.backendDOMNodeId), { nodes: sub.nodes, sessionId: child[0], frameId: fid, ownerBackendNodeId: n.backendDOMNodeId });
+            await expand(sub.nodes, child[0], n.backendDOMNodeId, depth + 1);
           }
         }
-      }
+      };
+      await expand(nodes, undefined, undefined, 0);
       const dom = await this.cdp<DomSnap>(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: [] }).catch(() => null);
       let visible: Set<number> | undefined;
       if ((opts.scope || 'viewport') === 'viewport') visible = dom ? await this.#visibleNodes(tabId, dom) : new Set();
@@ -920,6 +1045,7 @@ export class Engine {
       const out = buildSnapshot({ main: { nodes }, children, visible, exclude, draggable, nextRef: () => ++refCounter, maxLines: opts.maxLines });
       t.refs = out.refs;
       const info = await this.pageInfo(tabId);
+      this.#saw(t, info);
       return { url: info.url, title: info.title, snapshot: out.text, refCount: out.refs.size };
     });
   }
@@ -954,8 +1080,11 @@ export class Engine {
       return { node: r, desc: `@${id} ${r.role}${r.name ? ` "${r.name}"` : ''}` };
     }
     const { kind, sel } = parseSelector(target);
-    const finder = `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)})`;
-    const find = () => this.cdp<{ result: { type: string; subtype?: string; objectId?: string; value?: { count: number } }; exceptionDetails?: Json }>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false });
+    const finder = finderExpr(sel, kind);
+    type Found = { result: { type: string; subtype?: string; objectId?: string; value?: string }; exceptionDetails?: Json };
+    const find = (sid?: string) => this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: finder, returnByValue: false }, sid);
+    const countOf = (r: Found) => Number(/^count:(\d+)$/.exec(r.result.value ?? '')?.[1] ?? 0);
+    const tooMany = (count: number) => new OvertakeError(ErrorCode.ELEMENT_AMBIGUOUS, `${target} matched ${count} elements; make it unique (or use a snapshot @ref).`);
     // Finding is read-only: if the document was just replaced, look again in the new one.
     const r = await find().catch(async (e) => {
       if (!contextGone(e)) throw e;
@@ -963,14 +1092,37 @@ export class Engine {
       return find();
     });
     if (r.exceptionDetails) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${target}`);
-    if (r.result.subtype !== 'node' || !r.result.objectId) {
-      const cnt = await this.cdp<{ result: { value: { count: number } } }>(tabId, 'Runtime.callFunctionOn', { objectId: r.result.objectId, functionDeclaration: 'function(){return this}', returnByValue: true }).catch(() => null);
-      const count = cnt?.result.value?.count ?? 0;
-      if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
-      throw new OvertakeError(count ? ErrorCode.ELEMENT_AMBIGUOUS : ErrorCode.ELEMENT_NOT_FOUND, count ? `${target} matched ${count} elements; make it unique (or use a snapshot @ref).` : `${target} matched no element.`);
+    if (r.result.subtype === 'node' && r.result.objectId) {
+      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: r.result.objectId });
+      return { node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: r.result.objectId }, desc: target };
     }
-    const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: r.result.objectId });
-    return { node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: r.result.objectId }, desc: target };
+    if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
+    if (countOf(r)) throw tooMany(countOf(r));
+    // Nothing in the page or its same-origin iframes: look in cross-site iframes, which run in
+    // their own process. Their coordinates are offset by the iframe element in the page.
+    const hits: { node: RefTarget; url: string }[] = [];
+    let more = 0;
+    for (const [sid, c] of t.children) {
+      if (c.type !== 'iframe') continue;
+      const fr = await find(sid).catch(() => null);
+      if (!fr || fr.exceptionDetails) continue;
+      if (fr.result.subtype !== 'node' || !fr.result.objectId) {
+        more += countOf(fr);
+        continue;
+      }
+      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }, sid).catch(() => null);
+      void this.cdp(tabId, 'Runtime.releaseObject', { objectId: fr.result.objectId }, sid).catch(() => {});
+      const owner = await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: c.targetId }).catch(() => null);
+      if (!d || !owner) continue; // e.g. a cross-site frame nested in another one
+      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: sid, ownerBackendNodeId: owner.backendNodeId }, url: c.url });
+    }
+    if (hits.length + more > 1) throw tooMany(hits.length + more);
+    if (hits.length) {
+      // The target's url can be empty before its first navigation is reported: ask the frame.
+      const url = hits[0].url || (await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true }, hits[0].node.sessionId).catch(() => null))?.result.value || '';
+      return { node: hits[0].node, desc: `${target} (in cross-site iframe ${receiptUrl(url)})` };
+    }
+    throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `${target} matched no element.`);
   }
 
   /** Scroll into view, verify the element is the top hit target, return root-viewport coordinates. */
@@ -1069,7 +1221,22 @@ export class Engine {
     const info = t.dialog ? { url: '', title: '' } : await this.pageInfo(t.tabId).catch(() => ({ url: '', title: '' }));
     // A requested navigation can turn into a download or be cancelled: report only commits.
     const navigated = t.lastNavAt > navBefore;
-    return { navigated, url: info.url, title: info.title, ...(t.dialog ? { dialog: t.dialog } : {}) };
+    if (t.dialog) return { navigated, dialog: t.dialog };
+    // The url and title only when they changed since the agent last saw them: on apps that
+    // keep state in the URL, repeating a long one after every click costs many tokens.
+    return { navigated, ...this.#changedPage(t, info) };
+  }
+
+  /** The url (capped) and title, if they differ from what the agent last saw on this tab. */
+  #changedPage(t: TabState, info: { url: string; title: string }): { url?: string; title?: string } {
+    if (!info.url || (info.url === t.shown.url && info.title === t.shown.title)) return {};
+    t.shown = { url: info.url, title: info.title };
+    return { url: capUrl(info.url), title: info.title };
+  }
+
+  /** Note what a full result (navigate, snapshot) showed the agent. */
+  #saw(t: TabState, info: { url: string; title: string }) {
+    if (info.url) t.shown = { url: info.url, title: info.title };
   }
 
   async #tabsBefore(tabId: number): Promise<Set<number>> {
@@ -1203,23 +1370,36 @@ export class Engine {
         steps.push({ method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: 1 } });
         await this.client.request('input.batch', { tabId, steps: steps.splice(0), label: opts.label || `type into ${desc}`.slice(0, 60) });
       }
-      if (opts.clear) {
-        await this.cdp(tabId, 'Runtime.evaluate', {
-          expression: `(() => { const e = document.activeElement; if (!e) return; if (typeof e.select === 'function') e.select(); else { const r = document.createRange(); r.selectNodeContents(e); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } })()`,
-        });
-        steps.push(...chordSteps('Backspace'));
-      }
+      // The focused field may be inside an iframe: FOCUSED_OP follows focus there.
+      if (opts.clear && (await this.#onFocused(t, 'clear'))) steps.push(...chordSteps('Backspace'));
       if (opts.slowly) steps.push(...typeSteps(opts.text).map((s) => ({ ...s, delayMs: 25 })));
       else if (opts.text) steps.push({ method: 'Input.insertText', params: { text: opts.text } });
       if (opts.submit) steps.push(...chordSteps('Enter'));
       const navBefore = Date.now();
       if (steps.length) await this.client.request('input.batch', { tabId, steps });
-      const value = await this.cdp<{ result: { value: unknown } }>(tabId, 'Runtime.evaluate', {
-        expression: `(() => { const e = document.activeElement; return e ? (e.value ?? e.textContent ?? null) : null; })()`, returnByValue: true,
-      }).catch(() => null);
+      // The field's value, to check what was typed. Null when focus is not on an editable
+      // field (the page body, say), capped for long values.
+      const value = await this.#onFocused(t, 'value').catch(() => null);
       const receipt = opts.submit ? await this.#receiptAfter(t, navBefore) : {};
-      return { typedInto: desc, value: value?.result.value, ...receipt };
+      return { typedInto: desc, value, ...receipt };
     });
+  }
+
+  /** Run FOCUSED_OP where focus is: the page (with its same-origin iframes), or the cross-site
+   *  iframe that has focus. */
+  async #onFocused(t: TabState, op: 'clear' | 'value'): Promise<unknown> {
+    type R = { result: { value?: { remote?: boolean; result?: unknown } } };
+    const run = (sid?: string, guard = '') => this.cdp<R>(t.tabId, 'Runtime.evaluate', {
+      expression: `(() => { ${guard} return (${FOCUSED_OP})(${JSON.stringify(op)}); })()`, returnByValue: true,
+    }, sid).catch(() => null);
+    const top = (await run())?.result.value;
+    if (!top?.remote) return top?.result ?? null;
+    for (const [sid, c] of t.children) {
+      if (c.type !== 'iframe') continue;
+      const v = (await run(sid, 'if (!document.hasFocus()) return { result: undefined, away: true };'))?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
+      if (v && !v.away && !v.remote) return v.result ?? null;
+    }
+    return null;
   }
 
   async press(tabId: number, keys: string, repeat = 1) {
@@ -1290,7 +1470,7 @@ export class Engine {
   // -------------------------------------------------------------------------
   // Screenshots
 
-  async screenshot(tabId: number, opts: { fullPage?: boolean; target?: string; format?: 'png' | 'jpeg' | 'webp'; quality?: number; path?: string; includeOverlay?: boolean }) {
+  async screenshot(tabId: number, opts: { fullPage?: boolean; target?: string; format?: 'png' | 'jpeg' | 'webp'; quality?: number; path?: string; includeOverlay?: boolean; hiDpi?: boolean }) {
     return this.action(tabId, async (t) => {
       const format = opts.format || 'png';
       const params: Json = { format, ...(format !== 'png' && opts.quality ? { quality: opts.quality } : {}) };
@@ -1311,7 +1491,13 @@ export class Engine {
         clip = { x: 0, y: 0, width: Math.ceil(m.cssContentSize.width), height: Math.min(Math.ceil(m.cssContentSize.height), 16384) };
         params.captureBeyondViewport = true;
       }
-      if (clip) params.clip = { ...clip, scale: 1 };
+      // CSS pixels by default, the units clicks take: on a HiDPI screen (or a zoomed page) a
+      // device-pixel image would need every coordinate divided by devicePixelRatio.
+      const dprR = await this.cdp<{ result: { value?: number } }>(tabId, 'Runtime.evaluate', { expression: 'devicePixelRatio', returnByValue: true }).catch(() => null);
+      const dpr = typeof dprR?.result.value === 'number' && dprR.result.value > 0 ? dprR.result.value : 1;
+      const cssScale = !opts.hiDpi && Math.abs(dpr - 1) > 0.01;
+      if (cssScale && !clip) clip = { x: m.cssVisualViewport.pageX, y: m.cssVisualViewport.pageY, width: m.cssVisualViewport.clientWidth, height: m.cssVisualViewport.clientHeight };
+      if (clip) params.clip = { ...clip, scale: cssScale ? 1 / dpr : 1 };
       const r = await this.client.request<{ data: string }>('screenshot', { tabId, params, includeOverlay: !!opts.includeOverlay }, 60_000);
       const bytes = Buffer.from(r.data, 'base64');
       let savedTo: string | undefined;
@@ -1330,6 +1516,8 @@ export class Engine {
         contentSize: m.cssContentSize,
         clip,
         fullPage: !!opts.fullPage,
+        // Image pixels per CSS pixel: 1 unless hiDpi.
+        scale: cssScale || dpr === 1 ? 1 : Math.round(dpr * 1000) / 1000,
       };
     });
   }
@@ -1339,7 +1527,11 @@ export class Engine {
 
   async evaluate(tabId: number, expression: string, opts: { frameId?: string; awaitPromise?: boolean; timeoutMs?: number } = {}) {
     return this.action(tabId, async (t) => {
-      const params: Json = { expression, returnByValue: true, awaitPromise: opts.awaitPromise !== false, replMode: true, userGesture: true, generatePreview: false };
+      // Console-style (replMode: top-level await). The result comes back as a handle, not by
+      // value: in replMode, awaitPromise awaits the top-level code, and a Promise it returns
+      // (an async IIFE, say) would otherwise be serialized as {}. Such a Promise is awaited too.
+      const group = `overtake-eval-${++evalGroup}`;
+      const params: Json = { expression, returnByValue: false, objectGroup: group, awaitPromise: opts.awaitPromise !== false, replMode: true, userGesture: true, generatePreview: false };
       let sessionId: string | undefined;
       if (opts.frameId) {
         const child = [...t.children.entries()].find(([, v]) => v.targetId === opts.frameId);
@@ -1351,20 +1543,34 @@ export class Engine {
         }
       }
       if (opts.timeoutMs) params.timeout = opts.timeoutMs;
-      type EvalResult = { result: { type: string; value?: unknown; description?: string; unserializableValue?: string }; exceptionDetails?: { text: string; exception?: { description?: string } } };
-      let r: EvalResult;
+      type Remote = { type: string; subtype?: string; objectId?: string; value?: unknown; description?: string; unserializableValue?: string };
+      type EvalResult = { result: Remote; exceptionDetails?: { text: string; exception?: { description?: string } } };
+      const budget = (opts.timeoutMs ?? 30_000) + 5000;
+      const until = Date.now() + budget;
       try {
-        r = await this.cdp<EvalResult>(tabId, 'Runtime.evaluate', params, sessionId, (opts.timeoutMs ?? 30_000) + 5000);
+        let r = await this.cdp<EvalResult>(tabId, 'Runtime.evaluate', params, sessionId, budget);
+        if (!r.exceptionDetails && r.result.subtype === 'promise' && r.result.objectId && opts.awaitPromise !== false) {
+          r = await this.cdp<EvalResult>(tabId, 'Runtime.awaitPromise', { promiseObjectId: r.result.objectId, returnByValue: false }, sessionId, Math.max(until - Date.now(), 100));
+        }
+        if (r.exceptionDetails) {
+          return { ok: false, exception: r.exceptionDetails.exception?.description || r.exceptionDetails.text };
+        }
+        let v = r.result;
+        if (v.objectId && v.subtype !== 'promise') {
+          // Objects come back by value (JSON), as before.
+          // Objects that are not JSON (cycles, say) fall back to their description.
+          const j = await this.cdp<EvalResult>(tabId, 'Runtime.callFunctionOn', { objectId: v.objectId, functionDeclaration: 'function () { return this; }', returnByValue: true }, sessionId, Math.max(until - Date.now(), 100))
+            .catch((e) => { if (contextGone(e)) throw e; return null; });
+          v = j && !j.exceptionDetails ? { ...j.result, type: v.type } : { type: v.type, description: v.description };
+        }
+        return { ok: true, type: v.type, value: v.value !== undefined ? v.value : v.unserializableValue ?? v.description };
       } catch (e) {
         // Not retried: the script may already have run in part (or caused the navigation).
         if (contextGone(e)) throw await this.#navigatedError(tabId);
         throw e;
+      } finally {
+        void this.cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }, sessionId).catch(() => {});
       }
-      if (r.exceptionDetails) {
-        return { ok: false, exception: r.exceptionDetails.exception?.description || r.exceptionDetails.text };
-      }
-      const v = r.result;
-      return { ok: true, type: v.type, value: v.value !== undefined ? v.value : v.unserializableValue ?? v.description };
     });
   }
 

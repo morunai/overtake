@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Iframe App</title>
+<style>
+  body { font: 15px system-ui; margin: 16px; }
+  iframe { border: 1px solid #ccc; width: 520px; height: 300px; vertical-align: top; }
+</style>
+</head>
+<body>
+<!-- Like a cloud console: the page around the feature is chrome (menus, banners), and the
+     feature itself lives in an iframe. -->
+<div id="banner">We use cookies to run this console. Services: compute, storage, databases, networking, analytics, machine learning, security, monitoring, logging, billing.</div>
+<button id="top">Top button</button>
+<iframe id="feature" title="Feature frame" src="/iframe-app-inner.html"></iframe>
+<iframe id="remote" title="Remote frame" src="http://localhost:8765/iframe-app-inner.html?remote=1"></iframe>
+</body>
+</html>

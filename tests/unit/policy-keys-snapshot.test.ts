@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { checkCdpMethod } from '../../extension/src/background/cdp-policy.ts';
 import { chordSteps, typeSteps } from '../../mcp/keys.ts';
-import { buildSnapshot, type AXNode } from '../../mcp/snapshot.ts';
+import { buildSnapshot, frameKey, type AXNode } from '../../mcp/snapshot.ts';
 
 test('cdp policy: valid methods pass, input methods are flagged for the gate', () => {
   assert.deepEqual(checkCdpMethod('Runtime.evaluate', { expression: '1' }), { input: false });
@@ -79,7 +79,7 @@ test('snapshot: iframe subtree is inlined with its session for refs', () => {
     { nodeId: 'b', ignored: false, role: { type: 'role', value: 'button' }, name: { type: 's', value: 'Inner' }, parentId: 'a', backendDOMNodeId: 7 },
   ];
   let n = 0;
-  const out = buildSnapshot({ main: { nodes: main }, children: new Map([[10, { nodes: child, sessionId: 'S1', ownerBackendNodeId: 10 }]]), nextRef: () => ++n });
+  const out = buildSnapshot({ main: { nodes: main }, children: new Map([[frameKey(undefined, 10), { nodes: child, sessionId: 'S1', ownerBackendNodeId: 10 }]]), nextRef: () => ++n });
   assert.match(out.text, /- iframe "child" @1\n  - button "Inner" @2/);
   assert.equal(out.refs.get(2)?.sessionId, 'S1');
   assert.equal(out.refs.get(2)?.ownerBackendNodeId, 10);

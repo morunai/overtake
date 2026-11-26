@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Feature</title>
+<style>body { font: 14px system-ui; margin: 8px; } table { border-collapse: collapse; margin-top: 8px; } td, th { border: 1px solid #ccc; padding: 2px 6px; }</style>
+</head>
+<body>
+<label>Select up to 50 log groups <input id="search" aria-label="Search log groups"></label>
+<div id="editor" contenteditable="true" aria-label="Query editor" style="border:1px solid #999;min-height:20px;margin:6px 0">fields @message</div>
+<button id="run">Run query</button>
+<button id="pw-show" hidden>x</button>
+<input id="pw" type="password" aria-label="Secret" value="">
+<div role="tabpanel" aria-label="Logs" id="panel"></div>
+<iframe id="nested" title="Nested frame" src="/frame.html" style="width:300px;height:40px;border:0"></iframe>
+<script>
+  const remote = location.search.includes('remote=1');
+  if (remote) {
+    document.getElementById('run').textContent = 'Run remote query';
+    document.getElementById('search').setAttribute('aria-label', 'Remote search');
+  }
+  window.runs = 0;
+  document.getElementById('run').onclick = () => {
+    runs++;
+    setTimeout(() => {
+      const q = document.getElementById('search').value;
+      document.getElementById('panel').innerHTML = '<table><thead><tr><th>@timestamp</th><th>@message</th></tr></thead><tbody>'
+        + [1, 2, 3].map((i) => `<tr><td>2026-11-26 10:0${i}</td><td>row ${i} for ${q || 'all'}</td></tr>`).join('') + '</tbody></table>';
+      document.getElementById('panel').setAttribute('aria-label', 'Logs (3)');
+    }, 150);
+  };
+</script>
+</body>
+</html>
