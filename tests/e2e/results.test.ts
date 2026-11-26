@@ -88,6 +88,11 @@ test('textGone sees shadow-root text; nested label text reports its checkbox; an
   await A.call('browser_wait', { tabId, text: 'Shadow loading' });
   await A.call('browser_click', { tabId, target: '#sdone' });
   await A.call('browser_wait', { tabId, textGone: 'Shadow loading' });
+  // Collapsed whitespace and nested shadow roots.
+  await A.call('browser_wait', { tabId, text: 'Running query' });
+  await assert.rejects(A.call('browser_wait', { tabId, textGone: 'Running query', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_click', { tabId, target: '#ndone' });
+  await A.call('browser_wait', { tabId, textGone: 'Running query' });
   const r = await A.call('browser_click', { tabId, target: '#nestedText' });
   assert.deepEqual(r.state, { checked: true });
   const fr = await A.call('browser_frames', { tabId });

@@ -19,6 +19,8 @@
   <button id="hash">Change view</button>
   <label><input type="checkbox" id="nested"><span id="nestedText">Nested label</span></label>
   <shadow-status id="sstatus"></shadow-status>
+  <nested-status id="nstatus"></nested-status>
+  <button id="ndone" onclick="document.getElementById('nstatus').remove()">Finish nested</button>
   <button id="sdone">Finish shadow</button>
 </main>
 <div role="switch" id="clone" aria-checked="false" tabindex="0">Replaced switch</div>
@@ -29,6 +31,13 @@
 <script>
   customElements.define('shadow-status', class extends HTMLElement {
     constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<div style="display:contents"><span>Shadow </span><span>loading</span></div>'; }
+  });
+  // Whitespace that renders collapsed, and a nested shadow root.
+  customElements.define('nested-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>Running     </span><inner-status></inner-status>'; }
+  });
+  customElements.define('inner-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>query</span>'; }
   });
   document.getElementById('sdone').onclick = () => { document.getElementById('sstatus').shadowRoot.innerHTML = '<span>Shadow ready</span>'; };
   // Replaced on click by a checked copy, as some frameworks re-render.

@@ -1002,33 +1002,29 @@ export class Engine {
           // those out) under visible hosts.
           const docText = `(d) => {
             let out = d.body?.innerText || '';
-            // Each text node that is rendered (has boxes) and not visibility:hidden, joined as
-            // it flows; display: contents wrappers have no boxes of their own but their text does.
-            const textIn = (sr) => {
-              let t = '';
-              const w = d.createTreeWalker(sr, NodeFilter.SHOW_TEXT);
-              const r = d.createRange();
-              for (let n = w.nextNode(); n; n = w.nextNode()) {
+            // Shadow content in composed order (nested shadow roots, slotted nodes in their
+            // slots): each text node that is rendered (has boxes) and not visibility:hidden.
+            // display: contents wrappers have no boxes of their own, but their text does.
+            const r = d.createRange();
+            const add = (n, depth) => {
+              if (depth > 60) return;
+              if (n.nodeType === 3) {
                 const p = n.parentElement;
-                if (!p || d.defaultView.getComputedStyle(p).visibility === 'hidden') continue;
+                if (!p || d.defaultView.getComputedStyle(p).visibility === 'hidden') return;
                 r.selectNodeContents(n);
-                if (r.getClientRects().length) t += n.data;
+                if (r.getClientRects().length) out += n.data;
+                return;
               }
-              return t;
+              if (n.nodeType !== 1 && n.nodeType !== 11) return;
+              if (n.localName === 'slot') { const a = n.assignedNodes({ flatten: true }); for (const k of (a.length ? a : n.childNodes)) add(k, depth + 1); return; }
+              const kids = n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes;
+              for (const k of kids) add(k, depth + 1);
             };
-            const walk = (root, depth) => {
-              if (depth > 20) return;
-              for (const el of root.querySelectorAll('*')) {
-                const sr = el.shadowRoot;
-                if (!sr) continue;
-                out += '\\n' + textIn(sr);
-                walk(sr, depth + 1);
-              }
-            };
-            walk(d, 0);
+            for (const el of d.querySelectorAll('*')) if (el.shadowRoot) { out += '\\n'; add(el, 0); }
             return out;
           }`;
-          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && textOf(d).includes(${JSON.stringify(text)}); })` : 'false';
+          // Whitespace compared as rendered: runs collapse to one space, on both sides.
+          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && textOf(d).replace(/\\s+/g, ' ').includes(${JSON.stringify(text.replace(/\s+/g, ' '))}); })` : 'false';
           return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; const textOf = ${docText}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone)} }; })()`;
         };
       }
