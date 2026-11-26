@@ -103,7 +103,7 @@ export class Harness {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [join(ROOT, 'mcp', 'server.ts')],
-      env: { ...(process.env as Record<string, string>), OVERTAKE_HOME: home, OVERTAKE_AGENT_NAME: name },
+      env: { ...(process.env as Record<string, string>), OVERTAKE_HOME: home, OVERTAKE_AGENT_NAME: name, OVERTAKE_TIMING: '1' },
       stderr: 'inherit',
     });
     const client = new Client({ name: `e2e-${name}`, version: '1.0.0' });

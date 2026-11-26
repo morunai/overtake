@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Console</title>
+<style>body { font: 14px system-ui; margin: 16px; } nav a { margin-right: 6px; } #panel { border: 1px solid #ccc; padding: 8px; margin-top: 8px; }</style>
+</head>
+<body>
+<!-- A console-like page: a long menu of "#" links, state kept in a long URL hash, and a panel
+     with a checkbox, a disclosure button and a query that shows "Running..." while it runs. -->
+<nav id="menu" aria-label="Services"></nav>
+<a id="docs" href="/docs/start?x=1">Docs</a>
+<main id="panel" aria-label="Query panel">
+  <label><input type="checkbox" id="prd"> /member-prd/ecs</label>
+  <button id="more" aria-expanded="false" onclick="this.setAttribute('aria-expanded', this.getAttribute('aria-expanded') === 'true' ? 'false' : 'true')">More options</button>
+  <div role="switch" id="live" aria-checked="false" tabindex="0" onclick="this.setAttribute('aria-checked', this.getAttribute('aria-checked') === 'true' ? 'false' : 'true')">Live tail</div>
+  <button id="run">Run query</button>
+  <span id="status"></span>
+  <button id="hash">Change view</button>
+  <label><input type="checkbox" id="nested"><span id="nestedText">Nested label</span></label>
+  <shadow-status id="sstatus"></shadow-status>
+  <nested-status id="nstatus"></nested-status>
+  <div id="texts"><root-text></root-text><p>Mixed <x-word></x-word> now</p><block-text></block-text></div>
+  <button id="tdone" onclick="document.getElementById('texts').remove()">Clear texts</button>
+  <p id="upper" style="text-transform:uppercase">Ready to save</p>
+  <p id="hbr"><span>Run<br hidden>ning</span></p>
+  <slot-hide id="slothide">Hidden slotted</slot-hide>
+  <p id="brline"><x-word></x-word> Loading<br>query</p>
+  <button id="capbtn" style="text-transform:capitalize"><x-word></x-word> save changes</button>
+  <svg width="200" height="30"><desc>Loading chart...</desc><text x="0" y="20">No data available</text></svg>
+  <button id="ndone" onclick="document.getElementById('nstatus').remove()">Finish nested</button>
+  <button id="sdone">Finish shadow</button>
+</main>
+<div role="switch" id="clone" aria-checked="false" tabindex="0">Replaced switch</div>
+<iframe srcdoc="<button>First anon</button>" style="width:200px;height:40px"></iframe>
+<iframe src="/frame.html?access_token=sekrit-value" style="width:200px;height:40px"></iframe>
+<iframe srcdoc="<iframe srcdoc='&lt;button&gt;Inner anon&lt;/button&gt;' style='width:180px;height:40px'></iframe>" style="width:200px;height:60px"></iframe>
+<iframe srcdoc="<button>Second anon</button>" style="width:200px;height:40px"></iframe>
+<script>
+  customElements.define('shadow-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<div style="display:contents"><span>Shadow </span><span>loading</span></div>'; }
+  });
+  // Whitespace that renders collapsed, and a nested shadow root.
+  customElements.define('nested-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>Running     </span><inner-status></inner-status>'; }
+  });
+  customElements.define('inner-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>query</span>'; }
+  });
+  // Text directly in a shadow root, shadow text between light text, blocks and line breaks.
+  customElements.define('root-text', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = 'Root loading'; }
+  });
+  customElements.define('x-word', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>loading</span>'; }
+  });
+  customElements.define('block-text', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<div>Block</div><div>waiting</div><span>Break<br>pending</span>'; }
+  });
+  customElements.define('slot-hide', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<slot style="visibility:hidden"></slot>'; }
+  });
+  document.getElementById('sdone').onclick = () => { document.getElementById('sstatus').shadowRoot.innerHTML = '<span>Shadow ready</span>'; };
+  // Replaced on click by a checked copy, as some frameworks re-render.
+  document.getElementById('clone').onclick = (e) => { const c = e.currentTarget.cloneNode(true); c.setAttribute('aria-checked', 'true'); e.currentTarget.replaceWith(c); };
+  const menu = document.getElementById('menu');
+  for (let i = 0; i < 60; i++) { const a = document.createElement('a'); a.href = '#'; a.textContent = 'Service ' + i; menu.append(a); }
+  history.replaceState(null, '', location.pathname + '#state=' + 'q'.repeat(400));
+  document.getElementById('run').onclick = () => {
+    const s = document.getElementById('status');
+    s.textContent = 'Running...';
+    setTimeout(() => { s.textContent = 'Query complete.'; }, 700);
+  };
+  document.getElementById('hash').onclick = () => { location.hash = 'state=' + 'v'.repeat(400); };
+</script>
+</body>
+</html>

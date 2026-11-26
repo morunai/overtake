@@ -69,7 +69,7 @@ export class OvertakeEnv {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [join(SNAP, 'mcp', 'server.ts')],
-      env: { ...(process.env as Record<string, string>), OVERTAKE_HOME: this.home, OVERTAKE_AGENT_NAME: name },
+      env: { ...(process.env as Record<string, string>), OVERTAKE_HOME: this.home, OVERTAKE_AGENT_NAME: name, OVERTAKE_TIMING: '1' },
       stderr: 'ignore',
     });
     const client = new Client({ name: `rr-${name}`, version: '1.0.0' });

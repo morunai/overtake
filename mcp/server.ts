@@ -26,7 +26,8 @@ Rules:
 - SPACE_CLOSED or TAB_CLOSED means the Space or tab is gone (the message says who closed it). Do not retry on it; tell the user or create a new Space.
 - For many steps or repeated flows (test suites, filling many forms, checking many pages, or a multi-step task in a heavy web app), write a script file once and run it with browser_run instead of one tool call per step; it returns only what the script returns. Re-run the same file after fixing it.
 - Use browser_select for native <select> dropdowns, not browser_evaluate.
-- Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_drag, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call.
+- Pass snapshot: true to browser_click, browser_type, browser_select, browser_press, browser_drag, browser_navigate or browser_wait when you need to see the page after the action, instead of a separate browser_snapshot call. On big pages, pass root to browser_snapshot (the panel or iframe you work in) to keep it small; refs keep their numbers across snapshots.
+- To wait for something to finish when you do not know the final wording, use browser_wait with textGone (e.g. "Running...").
 - To confirm an action worked, pass waitForText (for example "Saved") to browser_click, browser_type, browser_select, browser_press or browser_drag: it waits for that text to appear because of the action, not text already on the page. Their results also list the requests the page made (method, URL, status). Action results include url and title only when they changed since you last saw them.
 - A USER_IN_CONTROL error is a hard stop: the human took over. Do not retry or route around it. Tell the user, and resume only after they give control back (space_wait_for_control can wait for that).
 - When the user must act (login without provided credentials, CAPTCHA, 2FA, permission prompts), call space_handoff with a short reason, end your turn, and resume later with space_resume.
@@ -92,8 +93,10 @@ const snapshotOpts = {
 };
 type SnapshotOpts = { snapshot: boolean; snapshotScope: 'viewport' | 'full_page' };
 
-function snapshotText(r: { url: string; title: string; snapshot: string }) {
-  return `url: ${r.url}\ntitle: ${r.title}\n\n${r.snapshot}`;
+function snapshotText(r: { url?: string; title?: string; snapshot: string }) {
+  // After an action, url and title appear only when they changed.
+  const head = [r.url !== undefined ? `url: ${r.url}` : '', r.title !== undefined ? `title: ${r.title}` : ''].filter(Boolean).join('\n');
+  return head ? `${head}\n\n${r.snapshot}` : r.snapshot;
 }
 
 /** The action's JSON receipt, plus a snapshot of the page afterwards when asked for. The
@@ -113,7 +116,7 @@ async function afterAction(tabId: number, r: unknown, o: SnapshotOpts, since?: n
     // passes no `since`: its condition already says the page is ready.
     if (since !== undefined) await engine.settle(tabId, since);
     if ((await engine.pageInfo(tabId)).readyState === 'loading') return skipped('the page is still loading; use browser_wait, then browser_snapshot.');
-    const s = await engine.snapshot(tabId, { scope: o.snapshotScope });
+    const s = await engine.snapshot(tabId, { scope: o.snapshotScope, afterAction: true });
     return { content: [...receipt.content, { type: 'text', text: snapshotText(s) }] };
   } catch (e) {
     const w = toWireError(e);
@@ -242,9 +245,10 @@ server.registerTool('browser_navigate', {
 }));
 
 server.registerTool('browser_wait', {
-  description: 'Wait until all given conditions hold: selector state, page text, URL substring, JS predicate, network idle, or load complete. Use delayMs for a plain pause (do not use page timers for delays). Fails immediately with USER_IN_CONTROL if the human takes over.',
+  description: 'Wait until all given conditions hold: selector state, page text appearing (text) or disappearing (textGone), URL substring, JS predicate, network idle, or load complete. Use delayMs for a plain pause (do not use page timers for delays). Fails immediately with USER_IN_CONTROL if the human takes over.',
   inputSchema: {
-    tabId, delayMs: z.number().int().min(0).max(120_000).optional().describe('Plain pause in ms, measured outside the page.'), selector: z.string().optional(), state: z.enum(['visible', 'attached', 'hidden']).optional(), text: z.string().optional(), urlIncludes: z.string().optional(),
+    tabId, delayMs: z.number().int().min(0).max(120_000).optional().describe('Plain pause in ms, measured outside the page.'), selector: z.string().optional(), state: z.enum(['visible', 'attached', 'hidden']).optional(), text: z.string().optional(),
+    textGone: z.string().optional().describe('Text that must no longer show anywhere on the page (including iframes), e.g. "Loading..." or "Running...", for when you do not know what will replace it.'), urlIncludes: z.string().optional(),
     function: z.string().optional().describe('JS expression evaluated in the page, truthy = done (may be async).'), networkIdleMs: z.number().int().optional(), load: z.boolean().optional(),
     timeoutMs: z.number().int().max(120_000).default(10_000), ...snapshotOpts,
   },
@@ -257,9 +261,12 @@ server.registerTool('browser_wait', {
 // Observation
 
 server.registerTool('browser_snapshot', {
-  description: 'Accessibility snapshot of the page (includes iframe content) with @refs for interactive elements. Default scope is the viewport; use full_page for everything. Refs become stale after navigation.',
-  inputSchema: { tabId, scope: z.enum(['viewport', 'full_page']).default('viewport'), maxLines: z.number().int().min(50).max(5000).optional() },
-}, wrap(async (a: { tabId: number; scope: 'viewport' | 'full_page'; maxLines?: number }) => {
+  description: 'Accessibility snapshot of the page (includes iframe content) with @refs for interactive elements. Default scope is the viewport; use full_page for everything, or root for one part (an element or an iframe, by @ref or selector), which keeps big pages small. An element keeps its @ref across snapshots until the page navigates.',
+  inputSchema: {
+    tabId, scope: z.enum(['viewport', 'full_page']).default('viewport'), maxLines: z.number().int().min(50).max(5000).optional(),
+    root: z.string().optional().describe('Only this element\'s subtree, by @ref or selector, e.g. the main panel or an iframe ("iframe#editor"). The whole subtree, not just the viewport.'),
+  },
+}, wrap(async (a: { tabId: number; scope: 'viewport' | 'full_page'; maxLines?: number; root?: string }) => {
   return text(snapshotText(await engine.snapshot(a.tabId, a)));
 }));
 
@@ -295,7 +302,7 @@ server.registerTool('browser_run', {
     'Run a whole flow from one script in this tab, so you are in the loop only at the start and the end. The preferred way to do multi-step tasks: one call, and only the result you return comes back. Write the script to a file once (file), then re-run it after fixes; or pass a short one inline (script).',
     'The script is the body of an async function. Each call uses the same real input and checks as the tools:',
     'click(target, {button, clickCount, force, humanlike, label}), type(target|null, text, {clear, submit, slowly}), fill(target, text), select(target, valueOrLabel | [values]), press(keys, {repeat}), hover(target), scroll({target, dx, dy}), drag(from, to), upload(target, files), dialog(accept, promptText),',
-    'navigate(url, {waitFor, waitUntil, timeoutMs}), wait(selector | ms | {selector, state, text, urlIncludes, function, networkIdleMs, load, timeoutMs}), sleep(ms), snapshot({scope}) -> text with @refs, url(), evaluate(expressionOrFunction, ...args) -> value in the page,',
+    'navigate(url, {waitFor, waitUntil, timeoutMs}), wait(selector | ms | {selector, state, text, textGone, urlIncludes, function, networkIdleMs, load, timeoutMs}), sleep(ms), snapshot({scope, root}) -> text with @refs, url(), evaluate(expressionOrFunction, ...args) -> value in the page,',
     'assert(condition, message), log(...values), console.log, args (your input). Targets are the same as the tools: @refs, CSS, "text=...", "xpath=...".',
     'Errors are thrown into the script (e.code, e.message) and may be caught. Uncaught ones fail the run with the step, the script line and a snapshot of the page.',
     'USER_IN_CONTROL, STOPPED and SPACE_CLOSED end the script at once, cannot be caught, and come back as a tool error. The return value of the script is returned as result.',
@@ -353,7 +360,7 @@ server.registerTool('browser_events', {
   inputSchema: { tabId, methodPrefix: z.string().optional(), sinceSeq: z.number().int().optional(), limit: z.number().int().max(500).default(50) },
 }, wrap(async (a: { tabId: number; methodPrefix?: string; sinceSeq?: number; limit: number }) => ({ latestSeq: engine.latestSeq(), events: engine.events(a.tabId, a) })));
 
-server.registerTool('browser_frames', { description: 'Frame tree of a tab, including out-of-process iframes and their CDP session ids.', inputSchema: { tabId } },
+server.registerTool('browser_frames', { description: 'Frame tree of a tab, including out-of-process iframes and their CDP session ids. owner is an @ref for each frame\'s <iframe> element (use it as a snapshot root or a target), ownerElement a readable selector for it in its own document; name is Chrome\'s frame name, which can come from the element\'s id.', inputSchema: { tabId } },
   wrap(async ({ tabId }: { tabId: number }) => engine.frames(tabId)));
 
 // ---------------------------------------------------------------------------

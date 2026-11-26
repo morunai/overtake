@@ -402,3 +402,14 @@ test('clear replaces text in a field of an iframe inside a closed shadow root', 
     await A.call('spaces_close', { spaceId: fresh.spaceId });
   }
 });
+
+test('browser_frames keeps refs a snapshot made for iframes', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&only=alt` });
+  await A.call('browser_wait', { tabId, selector: '#inner' });
+  const snap = await A.call('browser_snapshot', { tabId, scope: 'full_page' });
+  const ref = /iframe "Nested frame" (@\d+)/.exec(snap)![1];
+  await A.call('browser_click', { tabId, target: ref });
+  const fr = await A.call('browser_frames', { tabId });
+  assert.ok(fr.frames.some((f: { owner?: string }) => f.owner === ref), 'the same ref');
+  await A.call('browser_click', { tabId, target: ref });
+});
