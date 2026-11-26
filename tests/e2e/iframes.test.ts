@@ -18,10 +18,13 @@ const inRemote = async (expr: string) => (await A.call('browser_evaluate', { tab
 // A second origin on the same site (127.0.0.1, another port): its frames share the page's
 // process, but the page's script cannot reach into them.
 const ALT_PORT = 8767;
+const ALT2_PORT = 8768;
 let alt: Server;
+let alt2: Server;
 
 before(async () => {
   alt = (await startTestServer(ALT_PORT)) as Server;
+  alt2 = (await startTestServer(ALT2_PORT)) as Server;
   await h.start();
   A = await h.agent('iframes');
   ({ tabId } = await A.call('spaces_create', { name: 'iframes' }));
@@ -30,6 +33,7 @@ before(async () => {
 after(async () => {
   await h.stop();
   alt?.close();
+  alt2?.close();
 });
 
 test('waits find selectors and text inside same-origin and cross-site iframes', async () => {
@@ -304,4 +308,24 @@ test('clicks are checked against the page itself across origin boundaries; scree
   await A.call('browser_wait', { tabId, selector: 'text=Run shadow query', timeoutMs: 15_000 });
   await A.call('browser_click', { tabId, target: 'text=Run shadow query' });
   await A.call('browser_wait', { tabId, text: 'row 1 for all' });
+});
+
+test('every frame level is checked, scaled frames map per axis, and top-page matches resolve fast', async () => {
+  // Three same-site origins nested; the middle document covers the innermost frame.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&altnest=${ALT2_PORT}&covernest=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run deep query', timeoutMs: 15_000 });
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run deep query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /covered by div\.nestcover/.test(e.message));
+  // Without the cover, the same click goes through.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&altnest=${ALT2_PORT}` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run deep query', timeoutMs: 15_000 });
+  await A.call('browser_click', { tabId, target: 'text=Run deep query' });
+  // A frame squashed vertically only.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?squash=1` });
+  await A.call('browser_wait', { tabId, selector: '#run' });
+  await A.call('browser_click', { tabId, target: 'text=Run query' });
+  assert.equal(await inFeature('runs'), 1);
+  // Many matches inside a frame do not slow down a match in the top document.
+  await A.call('browser_evaluate', { tabId, expression: `(() => { const d = document.getElementById('feature').contentDocument; for (let i = 0; i < 3000; i++) { const b = d.createElement('button'); b.textContent = 'Top button'; d.body.append(b); } return 1; })()` });
+  const r = await A.call('browser_click', { tabId, target: 'text=Top button' });
+  assert.ok(r.timingMs.resolve < 150, JSON.stringify(r.timingMs));
 });

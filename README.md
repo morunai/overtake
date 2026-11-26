@@ -274,6 +274,8 @@ used. Human actions are simulated as trusted mouse and keyboard events.
 - While a Space window is covered and Chrome is not painting it, a frame nested inside a
   cross-site frame may have no size yet, so its elements count as hidden until the window paints
   (a screenshot makes it paint).
+- Element screenshots inside a rotated or skewed iframe are cut to the iframe's bounding box, so
+  they can include a little of the page around the iframe's corners.
 - Commands to a tab run one at a time, so a frame that is busy running script delays the tab's
   next commands until it answers.
 - Spaces end when Chrome closes and are not restored.

@@ -34,6 +34,8 @@
   // ?deepremote=1: the feature frame embeds a cross-site frame. ?althidden=1: the alt frame is
   // visibility:hidden. ?shadow=1: a cross-site frame inside an open shadow root.
   if (q.get('deepremote')) document.getElementById('feature').src = '/iframe-app-inner.html?nestremote=1';
+  if (q.get('altnest')) document.getElementById('alt').src += `&nestport=${q.get('altnest')}${q.get('covernest') ? '&covernest=1' : ''}`;
+  if (q.get('squash')) document.getElementById('feature').style.cssText += ';transform:scale(1, 0.5);transform-origin:0 0';
   if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
   if (q.get('shadow')) {
     const host = document.createElement('div');

@@ -207,8 +207,7 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
         }
         return m;
       };
-      const per = docs.map(inDoc);
-      if (all) return per.flat();
+      if (all) return docs.flatMap(inDoc);
       // Visible, and so is every iframe it sits in (as far up as this document can see).
       const shown = (e: Element) => {
         if (!((e as HTMLElement).checkVisibility?.() ?? true)) return false;
@@ -222,9 +221,13 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
         }
         return true;
       };
-      const topVis = per[0].filter(shown);
-      const frameVis = per.slice(1).flat().filter(shown);
-      const pick = topVis.length ? topVis : frameVis.length ? frameVis : per.flat();
+      // The top document first: frames are searched only when it has no visible match.
+      const top = inDoc(docs[0]);
+      const topVis = top.filter(shown);
+      if (topVis.length) return topVis.length === 1 ? topVis[0] : { count: topVis.length };
+      const inFrames = docs.slice(1).flatMap(inDoc);
+      const frameVis = inFrames.filter(shown);
+      const pick = frameVis.length ? frameVis : [...top, ...inFrames];
       if (pick.length === 1) return pick[0];
       return { count: pick.length };
     }).toString();
@@ -1263,7 +1266,7 @@ export class Engine {
       if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
       objectId = res.object.objectId;
     }
-    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean; inFrame?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
+    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean; inFrame?: boolean; cx?: number; cy?: number } } }>(tabId, 'Runtime.callFunctionOn', {
       objectId,
       returnByValue: true,
       functionDeclaration: `function(){
@@ -1288,15 +1291,15 @@ export class Engine {
           if (!fe) break;
           if (!fe.checkVisibility({ visibilityProperty: true })) return { ok: false, reason: 'the iframe it is in is hidden' };
           const fr = fe.getBoundingClientRect();
-          const k = fe.clientWidth ? fr.width / (fe.offsetWidth || fr.width) : 1;
-          x = fr.left + (fe.clientLeft + x) * k;
-          y = fr.top + (fe.clientTop + y) * k;
+          const kx = fr.width / (fe.offsetWidth || fr.width || 1), ky = fr.height / (fe.offsetHeight || fr.height || 1);
+          x = fr.left + (fe.clientLeft + x) * kx;
+          y = fr.top + (fe.clientTop + y) * ky;
           const froot = fe.getRootNode();
           const hit = (froot.elementsFromPoint ? froot : fe.ownerDocument).elementsFromPoint(x, y).filter((e) => e.localName !== 'overtake-overlay')[0];
           if (hit !== fe) return { ok: false, top: desc(hit), disabled: !!this.disabled };
           el = fe;
         }
-        return { ok, top: desc(top), disabled: !!this.disabled, inFrame };
+        return { ok, top: desc(top), disabled: !!this.disabled, inFrame, cx, cy };
       }`,
     }, sid);
     const v = check.result.value;
@@ -1316,6 +1319,38 @@ export class Engine {
     // around it). Hit-test the page itself at the final point: the node there must be the
     // element (or inside it), or for a cross-site frame its <iframe>. Otherwise the input would
     // land on whatever covers or replaces the frame (a hidden frame is not hit at all).
+    if (!force && (sid || v.inFrame) && v.cx !== undefined && v.cy !== undefined) {
+      // Every enclosing <iframe>, found through CDP across origins: in its own document it must
+      // be visible and on top at the point (mapped up level by level).
+      const fid = node.frameId ?? (sid ? t.children.get(sid)?.targetId : undefined);
+      if (fid) {
+        let px = v.cx, py = v.cy;
+        for (const o of await this.#frameOwners(t, fid, sid)) {
+          const ob = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: o.id }, o.sid).catch(() => null);
+          if (!ob) break;
+          const lv = await this.cdp<{ result: { value?: { ok: boolean; hidden?: boolean; top?: string; x: number; y: number } } }>(tabId, 'Runtime.callFunctionOn', {
+            objectId: ob.object.objectId, returnByValue: true, arguments: [{ value: px }, { value: py }],
+            functionDeclaration: `function (px, py) {
+              if (!this.checkVisibility({ visibilityProperty: true })) return { ok: false, hidden: true, x: 0, y: 0 };
+              const r = this.getBoundingClientRect();
+              const kx = r.width / (this.offsetWidth || r.width || 1), ky = r.height / (this.offsetHeight || r.height || 1);
+              const x = r.left + (this.clientLeft + px) * kx, y = r.top + (this.clientTop + py) * ky;
+              const root = this.getRootNode();
+              const hit = (root.elementsFromPoint ? root : this.ownerDocument).elementsFromPoint(x, y).filter((e) => e.localName !== 'overtake-overlay')[0];
+              const top = hit ? hit.localName + (hit.id ? '#' + hit.id : '') + (typeof hit.className === 'string' && hit.className ? '.' + hit.className.trim().split(/\\s+/).slice(0, 2).join('.') : '') : 'nothing';
+              return { ok: hit === this, top, x, y };
+            }`,
+          }, o.sid).catch(() => null);
+          void this.cdp(tabId, 'Runtime.releaseObject', { objectId: ob.object.objectId }, o.sid).catch(() => {});
+          const lvv = lv?.result.value;
+          if (!lvv) break;
+          if (lvv.hidden) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'Cannot act on the element: the iframe it is in is hidden.');
+          if (!lvv.ok) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${lvv.top} at its center. Close the covering element or pass force:true.`);
+          px = lvv.x;
+          py = lvv.y;
+        }
+      }
+    }
     if (!force && (sid || v.inFrame)) {
       // Top down from the page: the element on top at the point (the Overtake overlay aside),
       // into open shadow roots and frames the page can script, until a frame it cannot.
@@ -1334,9 +1369,9 @@ export class Engine {
             try { d = el.contentDocument; } catch {}
             if (!d) return el;
             const r = el.getBoundingClientRect();
-            const k = r.width / (el.offsetWidth || r.width || 1);
-            x = (x - r.left) / k - el.clientLeft;
-            y = (y - r.top) / k - el.clientTop;
+            const kx = r.width / (el.offsetWidth || r.width || 1), ky = r.height / (el.offsetHeight || r.height || 1);
+            x = (x - r.left) / kx - el.clientLeft;
+            y = (y - r.top) / ky - el.clientTop;
             doc = d;
           }
           return el;
@@ -1466,8 +1501,8 @@ export class Engine {
           try { fe = w.frameElement; } catch {}
           if (!fe) break;
           const fr = fe.getBoundingClientRect();
-          const k = fr.width / (fe.offsetWidth || fr.width || 1);
-          const up = (q) => [fr.left + (fe.clientLeft + q[0]) * k, fr.top + (fe.clientTop + q[1]) * k, fr.left + (fe.clientLeft + q[2]) * k, fr.top + (fe.clientTop + q[3]) * k];
+          const kx = fr.width / (fe.offsetWidth || fr.width || 1), ky = fr.height / (fe.offsetHeight || fr.height || 1);
+          const up = (q) => [fr.left + (fe.clientLeft + q[0]) * kx, fr.top + (fe.clientTop + q[1]) * ky, fr.left + (fe.clientLeft + q[2]) * kx, fr.top + (fe.clientTop + q[3]) * ky];
           R = up(R);
           C = up(C);
           w = fe.ownerDocument.defaultView;

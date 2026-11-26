@@ -42,6 +42,21 @@
     f.style.cssText = 'width:480px;height:200px;border:0';
     document.body.prepend(f);
   }
+  // ?nestport=PORT: a frame of yet another origin, which ?covernest=1 covers with an element
+  // of this document.
+  if (params.get('nestport')) {
+    const f = document.createElement('iframe');
+    f.id = 'nestport';
+    f.src = `http://127.0.0.1:${params.get('nestport')}/iframe-app-inner.html?deep=1`;
+    f.style.cssText = 'width:480px;height:200px;border:0';
+    document.body.prepend(f);
+    if (params.get('covernest')) {
+      const c = document.createElement('div');
+      c.className = 'nestcover';
+      c.style.cssText = 'position:absolute;left:0;top:0;width:480px;height:200px;background:rgba(0,0,255,.2)';
+      document.body.append(c);
+    }
+  }
   if (params.get('wide')) {
     const w = document.createElement('div');
     w.id = 'wide';
