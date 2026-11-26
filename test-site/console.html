@@ -17,8 +17,17 @@
   <button id="run">Run query</button>
   <span id="status"></span>
   <button id="hash">Change view</button>
+  <label><input type="checkbox" id="nested"><span id="nestedText">Nested label</span></label>
+  <shadow-status id="sstatus"></shadow-status>
+  <button id="sdone">Finish shadow</button>
 </main>
+<iframe srcdoc="<button>First anon</button>" style="width:200px;height:40px"></iframe>
+<iframe srcdoc="<button>Second anon</button>" style="width:200px;height:40px"></iframe>
 <script>
+  customElements.define('shadow-status', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>Shadow loading</span>'; }
+  });
+  document.getElementById('sdone').onclick = () => { document.getElementById('sstatus').shadowRoot.innerHTML = '<span>Shadow ready</span>'; };
   const menu = document.getElementById('menu');
   for (let i = 0; i < 60; i++) { const a = document.createElement('a'); a.href = '#'; a.textContent = 'Service ' + i; menu.append(a); }
   history.replaceState(null, '', location.pathname + '#state=' + 'q'.repeat(400));

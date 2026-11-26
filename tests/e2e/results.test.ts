@@ -77,3 +77,20 @@ test('frames list the selector of their iframe element, usable as a snapshot roo
   assert.match(s, /button "Run query" @\d+/);
   assert.doesNotMatch(s, /Top button|Run remote query/);
 });
+
+test('textGone sees shadow-root text; nested label text reports its checkbox; anonymous frames get distinct owners', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/console.html` });
+  await assert.rejects(A.call('browser_wait', { tabId, textGone: 'Shadow loading', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_wait', { tabId, text: 'Shadow loading' });
+  await A.call('browser_click', { tabId, target: '#sdone' });
+  await A.call('browser_wait', { tabId, textGone: 'Shadow loading' });
+  const r = await A.call('browser_click', { tabId, target: '#nestedText' });
+  assert.deepEqual(r.state, { checked: true });
+  const fr = await A.call('browser_frames', { tabId });
+  const owners = fr.frames.filter((f: { depth: number }) => f.depth > 0).map((f: { owner?: string }) => f.owner);
+  assert.equal(new Set(owners).size, owners.length, JSON.stringify(owners));
+  for (const [i, o] of owners.entries()) {
+    const s = await A.call('browser_snapshot', { tabId, root: o });
+    assert.match(s, i === 0 ? /First anon/ : /Second anon/, `${o}: ${s}`);
+  }
+});

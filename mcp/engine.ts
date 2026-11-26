@@ -150,11 +150,6 @@ export const DEVICES: Record<string, { width: number; height: number; deviceScal
   'Desktop 1440': { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
 };
 
-/** CSS.escape for an id in a selector (the server has no CSS global). */
-function CSS_ESCAPE(id: string) {
-  return /^[A-Za-z_][\w-]*$/.test(id) ? id : id.replace(/[^\w-]/g, (c) => '\\' + c).replace(/^(\d)/, '\\3$1 ');
-}
-
 /** Split an element target into its kind: css (default), text= or xpath=. */
 function parseSelector(target: string): { kind: 'css' | 'text' | 'xpath'; sel: string } {
   if (target.startsWith('text=')) return { kind: 'text', sel: target.slice(5) };
@@ -1003,8 +998,24 @@ export class Engine {
           // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
           const matches = cond.selector ? `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)` : '[]';
           // Text counts only in documents whose iframes are visible.
-          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && (d.body?.innerText || '').includes(${JSON.stringify(text)}); })` : 'false';
-          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone)} }; })()`;
+          // A document's visible text, with the text of its open shadow roots (innerText leaves
+          // those out) under visible hosts.
+          const docText = `(d) => {
+            let out = d.body?.innerText || '';
+            const walk = (root, depth) => {
+              if (depth > 20) return;
+              for (const el of root.querySelectorAll('*')) {
+                const sr = el.shadowRoot;
+                if (!sr || !el.checkVisibility({ visibilityProperty: true })) continue;
+                out += '\\n' + [...sr.childNodes].map((n) => n.nodeType === 3 ? n.data : n.nodeType === 1 && n.checkVisibility({ visibilityProperty: true }) ? (n.innerText ?? '') : '').join('\\n');
+                walk(sr, depth + 1);
+              }
+            };
+            walk(d, 0);
+            return out;
+          }`;
+          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && textOf(d).includes(${JSON.stringify(text)}); })` : 'false';
+          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; const textOf = ${docText}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone)} }; })()`;
         };
       }
       const state = cond.state || 'visible';
@@ -1763,7 +1774,8 @@ export class Engine {
       functionDeclaration: `function () {
         let e = this.nodeType === 1 ? this : this.parentElement;
         if (!e) return null;
-        if (e.localName === 'label' && e.control) e = e.control;
+        const lab = e.closest('label');
+        if (lab && lab.control && !e.matches('input, select, textarea, [role=checkbox], [role=switch], [role=radio]')) e = lab.control;
         else if (!e.matches('input, [role], [aria-checked], [aria-pressed], [aria-expanded], [aria-selected]')) e = e.closest('input, [role=checkbox], [role=switch], [role=radio], [role=tab], [role=option], [aria-checked], [aria-pressed], [aria-expanded], [aria-selected]') || e;
         const out = {};
         if (e.localName === 'input' && (e.type === 'checkbox' || e.type === 'radio')) out.checked = e.indeterminate ? 'mixed' : e.checked;
@@ -2407,13 +2419,31 @@ export class Engine {
         if (f.depth === 0) continue;
         const o = await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: f.frameId }).catch(() => null);
         if (!o) continue;
-        const d = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tabId, 'DOM.describeNode', { backendNodeId: o.backendNodeId }).catch(() => null);
-        if (!d) continue;
-        const a = new Map<string, string>();
-        const at = d.node.attributes || [];
-        for (let i = 0; i + 1 < at.length; i += 2) a.set(at[i], at[i + 1]);
-        const q = (v: string) => JSON.stringify(v);
-        f.owner = a.get('id') ? `${d.node.localName}#${CSS_ESCAPE(a.get('id')!)}` : a.get('name') ? `${d.node.localName}[name=${q(a.get('name')!)}]` : a.get('title') ? `${d.node.localName}[title=${q(a.get('title')!)}]` : d.node.localName;
+        // A selector that matches only this element in its document: its id, name or title when
+        // unique there, else a path of :nth-of-type steps from the nearest unique id.
+        const res = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: o.backendNodeId }).catch(() => null);
+        if (!res) continue;
+        const sel = await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.callFunctionOn', {
+          objectId: res.object.objectId, returnByValue: true,
+          functionDeclaration: `function () {
+            const root = this.getRootNode();
+            const one = (s) => { try { return root.querySelectorAll(s).length === 1 && root.querySelector(s) === this; } catch { return false; } };
+            const tag = this.localName;
+            const q = (v) => JSON.stringify(v);
+            if (this.id && one('#' + CSS.escape(this.id))) return tag + '#' + CSS.escape(this.id);
+            for (const a of ['name', 'title', 'src']) { const v = this.getAttribute(a); if (v && one(tag + '[' + a + '=' + q(v) + ']')) return tag + '[' + a + '=' + q(v) + ']'; }
+            const steps = [];
+            for (let e = this; e && e.nodeType === 1; e = e.parentElement) {
+              if (e !== this && e.id && one('#' + CSS.escape(e.id))) { steps.unshift('#' + CSS.escape(e.id)); break; }
+              let k = 1;
+              for (let p = e.previousElementSibling; p; p = p.previousElementSibling) if (p.localName === e.localName) k++;
+              steps.unshift(e.localName + ':nth-of-type(' + k + ')');
+            }
+            return steps.join(' > ');
+          }`,
+        }).catch(() => null);
+        void this.cdp(tabId, 'Runtime.releaseObject', { objectId: res.object.objectId }).catch(() => {});
+        if (sel?.result.value) f.owner = sel.result.value;
       }
       return { frames: out };
     });
