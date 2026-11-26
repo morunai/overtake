@@ -1045,9 +1045,14 @@ export class Engine {
               if (tag === 'br') { out += '\\n'; return; }
               const block = !disp.startsWith('inline') && disp !== 'contents';
               if (!path.has(n) && tag !== 'slot') {
-                // No shadow content inside: the browser renders it (SVG and other non-HTML
-                // elements have no innerText: their text content).
-                const x = typeof n.innerText === 'string' ? n.innerText : (n.textContent || '');
+                // No shadow content inside: the browser renders it. SVG and other non-HTML
+                // elements have no innerText: their rendered text nodes (not <title>, <desc>).
+                let x = '';
+                if (typeof n.innerText === 'string') x = n.innerText;
+                else {
+                  const w = d.createTreeWalker(n, NodeFilter.SHOW_TEXT);
+                  for (let k = w.nextNode(); k; k = w.nextNode()) x += shownText(k);
+                }
                 out += block ? '\\n' + x + '\\n' : x;
                 return;
               }

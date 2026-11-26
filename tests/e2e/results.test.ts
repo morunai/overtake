@@ -110,6 +110,9 @@ test('textGone sees shadow-root text; nested label text reports its checkbox; an
     await A.call('browser_wait', { tabId, text: p, timeoutMs: 2000 });
     await assert.rejects(A.call('browser_wait', { tabId, textGone: p, timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT', p);
   }
+  // SVG metadata is not shown.
+  await assert.rejects(A.call('browser_wait', { tabId, text: 'Loading chart...', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_wait', { tabId, textGone: 'Loading chart...', timeoutMs: 2000 });
   await A.call('browser_click', { tabId, target: '#tdone' });
   for (const p of phrases) await A.call('browser_wait', { tabId, textGone: p, timeoutMs: 2000 });
   const r = await A.call('browser_click', { tabId, target: '#nestedText' });
