@@ -99,6 +99,12 @@ test('textGone sees shadow-root text; nested label text reports its checkbox; an
     await A.call('browser_wait', { tabId, text: p, timeoutMs: 2000 });
     await assert.rejects(A.call('browser_wait', { tabId, textGone: p, timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT', p);
   }
+  // As rendered: text-transform and a hidden <br>; text in a hidden slot is not shown.
+  await A.call('browser_wait', { tabId, text: 'READY TO SAVE', timeoutMs: 2000 });
+  await A.call('browser_wait', { tabId, text: 'Running', timeoutMs: 2000 });
+  await assert.rejects(A.call('browser_wait', { tabId, textGone: 'Running', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_wait', { tabId, textGone: 'Hidden slotted', timeoutMs: 2000 });
+  await assert.rejects(A.call('browser_wait', { tabId, text: 'Hidden slotted', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
   await A.call('browser_click', { tabId, target: '#tdone' });
   for (const p of phrases) await A.call('browser_wait', { tabId, textGone: p, timeoutMs: 2000 });
   const r = await A.call('browser_click', { tabId, target: '#nestedText' });
@@ -116,4 +122,10 @@ test('textGone sees shadow-root text; nested label text reports its checkbox; an
   // A control the page replaces on click: no stale state.
   const c = await A.call('browser_click', { tabId, target: '#clone' });
   assert.equal(c.state, undefined);
+});
+
+test('a page too big to read in full does not prove text gone', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/console.html` });
+  await A.call('browser_evaluate', { tabId, expression: `(() => { const host = document.createElement('div'); host.attachShadow({ mode: 'open' }).innerHTML = '<slot></slot>'; for (let i = 0; i < 25000; i++) { const s = document.createElement('span'); s.textContent = 'x'; host.append(s); } const p = document.createElement('p'); p.textContent = 'Big status'; host.append(p); document.body.append(host); return 1; })()` });
+  await assert.rejects(A.call('browser_wait', { tabId, textGone: 'Big status', timeoutMs: 500 }), (e: Error) => code(e) === 'TIMEOUT');
 });

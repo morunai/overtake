@@ -1001,46 +1001,64 @@ export class Engine {
           // A document's visible text, with the text of its open shadow roots (innerText leaves
           // those out) under visible hosts.
           const docText = `(d) => {
-            // Without shadow roots, innerText is the rendered text. With them (innerText leaves
-            // shadow content out), walk the composed tree in order: nested shadow roots, slots
-            // with their assigned nodes; a line break around blocks and at <br>; text that is
-            // rendered (has boxes) and not visibility:hidden.
-            const all = d.querySelectorAll('*');
-            let hosts = false;
-            for (const el of all) if (el.shadowRoot) { hosts = true; break; }
-            if (!hosts) return d.body?.innerText || '';
+            // The document's rendered text, { t, partial }. innerText gives it, except that it
+            // leaves shadow content out. So with shadow roots, walk the composed tree only along
+            // the elements that lead to a shadow root or a slot, and let innerText render every
+            // other subtree (text-transform, hidden parts, <br> and whitespace as Chrome shows
+            // them). Text nodes met on the walk are taken when rendered and visible (a slotted
+            // one by its slot). A walk cut short is partial: it cannot prove text gone.
+            const hostsIn = (root, out, depth) => {
+              if (depth > 30) return;
+              for (const el of root.querySelectorAll('*')) if (el.shadowRoot) { out.push(el); hostsIn(el.shadowRoot, out, depth + 1); }
+            };
+            const hosts = [];
+            hostsIn(d, hosts, 0);
+            if (!hosts.length) return { t: d.body?.innerText || '', partial: false };
             const win = d.defaultView;
+            // Elements on the way to a host or a slot: walked; all others: innerText.
+            const path = new Set();
+            const mark = (n) => { for (let e = n; e && !path.has(e); e = e.parentNode || e.host) path.add(e); };
+            for (const h of hosts) { mark(h); for (const sl of h.shadowRoot.querySelectorAll('slot')) mark(sl); }
             const r = d.createRange();
             let out = '';
-            let budget = 50000;
+            let budget = 20000;
+            let partial = false;
+            const shownText = (n) => {
+              const slot = n.assignedSlot;
+              const p = slot || n.parentElement || (n.parentNode && n.parentNode.host);
+              if (!p || win.getComputedStyle(p).visibility === 'hidden') return '';
+              r.selectNodeContents(n);
+              if (!r.getClientRects().length) return '';
+              const tt = win.getComputedStyle(p).textTransform;
+              return tt === 'uppercase' ? n.data.toUpperCase() : tt === 'lowercase' ? n.data.toLowerCase() : n.data;
+            };
             const add = (n, depth) => {
-              if (depth > 200 || --budget < 0) return;
-              if (n.nodeType === 3) {
-                const p = n.parentElement || (n.parentNode && n.parentNode.host);
-                if (!p || win.getComputedStyle(p).visibility === 'hidden') return;
-                r.selectNodeContents(n);
-                if (r.getClientRects().length) out += n.data;
-                return;
-              }
+              if (depth > 200 || --budget < 0) { partial = true; return; }
+              if (n.nodeType === 3) { out += shownText(n); return; }
               if (n.nodeType === 11) { for (const k of n.childNodes) add(k, depth + 1); return; }
               if (n.nodeType !== 1) return;
               const tag = n.localName;
               if (tag === 'script' || tag === 'style' || tag === 'template' || tag === 'noscript') return;
-              if (tag === 'br') { out += '\\n'; return; }
-              if (tag === 'slot') { const a = n.assignedNodes({ flatten: true }); for (const k of (a.length ? a : n.childNodes)) add(k, depth + 1); return; }
               const disp = win.getComputedStyle(n).display;
               if (disp === 'none') return;
               const block = !disp.startsWith('inline') && disp !== 'contents';
+              if (!path.has(n) && tag !== 'slot') {
+                // No shadow content inside: the browser renders it.
+                out += block ? '\\n' + (n.innerText ?? '') + '\\n' : (n.innerText ?? '');
+                return;
+              }
               if (block) out += '\\n';
-              for (const k of (n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)) add(k, depth + 1);
+              if (tag === 'slot') { const a = n.assignedNodes({ flatten: true }); for (const k of (a.length ? a : n.childNodes)) add(k, depth + 1); }
+              else for (const k of (n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)) add(k, depth + 1);
               if (block) out += '\\n';
             };
             if (d.body) add(d.body, 0);
-            return out;
+            return { t: out, partial };
           }`;
           // Whitespace compared as rendered: runs collapse to one space, on both sides.
-          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && textOf(d).replace(/\\s+/g, ' ').includes(${JSON.stringify(text.replace(/\s+/g, ' '))}); })` : 'false';
-          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; const textOf = ${docText}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone)} }; })()`;
+          // gone: a document whose text could only be read in part still counts as showing it.
+          const has = (text?: string, gone = false) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} if (!(d === document || !fe || shown(fe))) return false; const x = textOf(d); return ${gone ? 'x.partial || ' : ''}x.t.replace(/\\s+/g, ' ').includes(${JSON.stringify(text.replace(/\s+/g, ' '))}); })` : 'false';
+          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; const textOf = ${docText}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone, true)} }; })()`;
         };
       }
       const state = cond.state || 'visible';
