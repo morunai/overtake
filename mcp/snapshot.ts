@@ -53,7 +53,13 @@ export interface SnapshotInput {
   children: Map<string, FrameTree>;
   /** backendNodeIds visible in the viewport (main document); undefined = no filtering */
   visible?: Set<number>;
-  nextRef: () => number;
+  /** The ref number for a node, by a key stable across snapshots (session and backend node id),
+   *  so an element keeps its ref while the page stays. */
+  nextRef: (key: string) => number;
+  /** The page's URL: links to it are printed short (path, or just the #fragment). */
+  pageUrl?: string;
+  /** Only this node's subtree (with any frames in it). */
+  root?: { backendNodeId: number; sessionId?: string };
   maxLines?: number;
   /** backendNodeIds whose subtrees are hidden from the agent (the Overtake overlay). */
   exclude?: Set<number>;
@@ -63,9 +69,25 @@ export interface SnapshotInput {
 
 export interface SnapshotOutput {
   text: string;
+  /** False when `root` was given but is not in the tree. */
+  rootFound: boolean;
   refs: Map<number, RefTarget>;
   truncated: boolean;
   omittedBelow: boolean;
+}
+
+/** A link target as printed: relative to the page when it can be (same origin: path; same page:
+ *  the #fragment), nothing for a bare "#" link to the page itself. */
+export function shortHref(href: string, pageUrl?: string): string {
+  if (!pageUrl) return href.slice(0, 120);
+  try {
+    const u = new URL(href), p = new URL(pageUrl);
+    if (u.origin !== p.origin) return href.slice(0, 120);
+    if (u.pathname === p.pathname && u.search === p.search) return u.hash.length > 1 ? u.hash.slice(0, 120) : '';
+    return (u.pathname + u.search + u.hash).slice(0, 120);
+  } catch {
+    return href.slice(0, 120);
+  }
 }
 
 function str(v?: AXValue): string {
@@ -98,9 +120,9 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
   let truncated = false;
   let omittedBelow = false;
 
-  const walkTree = (tree: FrameTree, depth: number, filter: Set<number> | undefined) => {
+  const walkTree = (tree: FrameTree, depth: number, filter: Set<number> | undefined, start?: AXNode) => {
     const byId = new Map(tree.nodes.map((n) => [n.nodeId, n]));
-    const root = tree.nodes.find((n) => !n.parentId) || tree.nodes[0];
+    const root = start || tree.nodes.find((n) => !n.parentId) || tree.nodes[0];
     if (!root) return;
 
     // Visible if this node or any descendant has a visible backend node.
@@ -163,13 +185,16 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
         else if (['checked', 'pressed', 'expanded', 'selected'].includes(p.name) && val !== undefined && val !== 'false' && val !== false) props.push(`${p.name}${val === true || val === 'true' ? '' : '=' + val}`);
         else if (p.name === 'disabled' && val) props.push('disabled');
         else if (p.name === 'focused' && val) props.push('focused');
-        else if (p.name === 'url' && role === 'link' && typeof val === 'string') props.push(`href=${val.slice(0, 120)}`);
+        else if (p.name === 'url' && role === 'link' && typeof val === 'string') {
+          const h = shortHref(val, input.pageUrl);
+          if (h) props.push(`href=${h}`);
+        }
       }
       const value = str(n.value);
       let ref = '';
       if (drag) props.push('draggable');
       if (n.backendDOMNodeId !== undefined && (drag || INTERACTIVE.has(role) || (name && ['heading', 'img', 'image'].includes(role)))) {
-        const id = input.nextRef();
+        const id = input.nextRef(`${tree.sessionId ?? ''}:${n.backendDOMNodeId}`);
         refs.set(id, { backendNodeId: n.backendDOMNodeId, sessionId: tree.sessionId, frameId: tree.frameId, ownerBackendNodeId: tree.ownerBackendNodeId, role, name });
         ref = ` @${id}`;
       }
@@ -184,8 +209,20 @@ export function buildSnapshot(input: SnapshotInput): SnapshotOutput {
     visit(root, depth);
   };
 
-  walkTree(input.main, 0, input.visible);
+  let rootFound = true;
+  if (input.root) {
+    // The tree holding the node: same session (or the page's), and that backend node id.
+    const r = input.root;
+    const trees = [input.main, ...input.children.values()].filter((t) => (t.sessionId ?? undefined) === (r.sessionId ?? undefined));
+    let hit: { tree: FrameTree; node: AXNode } | undefined;
+    for (const t of trees) {
+      const node = t.nodes.find((n) => n.backendDOMNodeId === r.backendNodeId);
+      if (node) { hit = { tree: t, node }; break; }
+    }
+    if (hit) walkTree(hit.tree, 0, undefined, hit.node);
+    else rootFound = false;
+  } else walkTree(input.main, 0, input.visible);
   if (truncated) lines.push(`[snapshot truncated at ${maxLines} lines; use scope "full_page" with a root ref, or browser_evaluate]`);
   if (omittedBelow && input.visible) lines.push('[more content outside the viewport: scroll, or use scope "full_page"]');
-  return { text: lines.join('\n'), refs, truncated, omittedBelow };
+  return { text: lines.join('\n'), refs, truncated, omittedBelow, rootFound };
 }

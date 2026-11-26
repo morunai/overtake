@@ -125,7 +125,8 @@ test('an action with snapshot: true returns the page after it, with working refs
   assert.equal(r.content.length, 2);
   assert.ok(JSON.parse(r.content[0].text).clicked, 'the receipt comes first');
   const snap: string = r.content[1].text;
-  assert.match(snap, /^url: /);
+  // Nothing navigated: no url/title header (the agent already has them).
+  assert.doesNotMatch(snap, /^url: /);
   assert.match(snap, new RegExp(`clicks: ${n + 1}`), 'the snapshot shows the state after the click');
   // Its refs replace the old ones and work.
   const ref = /button "Click me" (@\d+)/.exec(snap)![1];

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Console</title>
+<style>body { font: 14px system-ui; margin: 16px; } nav a { margin-right: 6px; } #panel { border: 1px solid #ccc; padding: 8px; margin-top: 8px; }</style>
+</head>
+<body>
+<!-- A console-like page: a long menu of "#" links, state kept in a long URL hash, and a panel
+     with a checkbox, a disclosure button and a query that shows "Running..." while it runs. -->
+<nav id="menu" aria-label="Services"></nav>
+<a id="docs" href="/docs/start?x=1">Docs</a>
+<main id="panel" aria-label="Query panel">
+  <label><input type="checkbox" id="prd"> /member-prd/ecs</label>
+  <button id="more" aria-expanded="false" onclick="this.setAttribute('aria-expanded', this.getAttribute('aria-expanded') === 'true' ? 'false' : 'true')">More options</button>
+  <div role="switch" id="live" aria-checked="false" tabindex="0" onclick="this.setAttribute('aria-checked', this.getAttribute('aria-checked') === 'true' ? 'false' : 'true')">Live tail</div>
+  <button id="run">Run query</button>
+  <span id="status"></span>
+  <button id="hash">Change view</button>
+</main>
+<script>
+  const menu = document.getElementById('menu');
+  for (let i = 0; i < 60; i++) { const a = document.createElement('a'); a.href = '#'; a.textContent = 'Service ' + i; menu.append(a); }
+  history.replaceState(null, '', location.pathname + '#state=' + 'q'.repeat(400));
+  document.getElementById('run').onclick = () => {
+    const s = document.getElementById('status');
+    s.textContent = 'Running...';
+    setTimeout(() => { s.textContent = 'Query complete.'; }, 700);
+  };
+  document.getElementById('hash').onclick = () => { location.hash = 'state=' + 'v'.repeat(400); };
+</script>
+</body>
+</html>

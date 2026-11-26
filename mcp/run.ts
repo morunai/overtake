@@ -175,7 +175,7 @@ export async function runScript(engine: Engine, client: BrokerClient, o: RunOpti
     sleep: (ms: number) => engine.wait(tabId, { delayMs: Math.max(0, Number(ms) || 0) }),
     snapshot: async (opts: Opts) => {
       if (lastActionAt !== undefined) await engine.settle(tabId, lastActionAt);
-      const s = await engine.snapshot(tabId, { scope: opts?.scope === 'full_page' ? 'full_page' : 'viewport' });
+      const s = await engine.snapshot(tabId, { scope: opts?.scope === 'full_page' ? 'full_page' : 'viewport', root: typeof opts?.root === 'string' ? opts.root : undefined });
       return `url: ${s.url}\ntitle: ${s.title}\n\n${s.snapshot}`;
     },
     url: async () => (await engine.pageInfo(tabId)).url,

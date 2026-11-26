@@ -133,8 +133,14 @@ It prints the `claude mcp add` command for that instance.
 
 `browser_click`, `browser_type`, `browser_select`, `browser_press`, `browser_drag`,
 `browser_navigate`, `browser_wait` and `browser_run` take `snapshot: true` to also return a
-snapshot of the page after the action, with fresh `@refs`, so the agent does not need a separate
-`browser_snapshot` call.
+snapshot of the page after the action, so the agent does not need a separate `browser_snapshot`
+call. An element keeps its `@ref` across snapshots until the page navigates. `browser_snapshot`
+takes `root` (an element or an iframe, by `@ref` or selector) to show only that part of a big
+page. Links to the page itself print short (a path, or just the `#fragment`), and a snapshot
+after an action repeats the URL and title only when they changed.
+
+`browser_wait` takes `textGone` to wait until text such as "Running..." is no longer shown.
+A click on a checkbox, switch, toggle button or disclosure reports the control's new `state`.
 
 To check that an action worked, the input tools take `waitForText` (for example `"Saved"`): it
 waits for that text to appear because of the action, so a "Saved" left over from an earlier save

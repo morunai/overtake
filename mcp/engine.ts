@@ -63,6 +63,7 @@ interface TabState {
   console: ConsoleEntry[];
   events: { seq: number; at: number; method: string; sessionId?: string; params: unknown }[];
   refs: Map<number, RefTarget>;
+  refIds: Map<string, number>; // stable ref numbers for this document (session:backendNodeId)
   cursor: { x: number; y: number } | null;
   children: Map<string, { targetId: string; type: string; url: string; parentFrameId?: string }>; // OOPIF sessions
   contexts: Map<string, number>; // frameId -> default execution context id (main session)
@@ -148,6 +149,11 @@ export const DEVICES: Record<string, { width: number; height: number; deviceScal
   iPad: { width: 820, height: 1180, deviceScaleFactor: 2, mobile: true, userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1' },
   'Desktop 1440': { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false },
 };
+
+/** CSS.escape for an id in a selector (the server has no CSS global). */
+function CSS_ESCAPE(id: string) {
+  return /^[A-Za-z_][\w-]*$/.test(id) ? id : id.replace(/[^\w-]/g, (c) => '\\' + c).replace(/^(\d)/, '\\3$1 ');
+}
 
 /** Split an element target into its kind: css (default), text= or xpath=. */
 function parseSelector(target: string): { kind: 'css' | 'text' | 'xpath'; sel: string } {
@@ -419,7 +425,7 @@ export class Engine {
     let t = this.#tabs.get(tabId);
     if (!t) {
       t = {
-        tabId, enabled: false, enabling: null, net: new Map(), console: [], events: [], refs: new Map(), cursor: null, children: new Map(),
+        tabId, enabled: false, enabling: null, net: new Map(), console: [], events: [], refs: new Map(), refIds: new Map(), cursor: null, children: new Map(),
         contexts: new Map(), childContexts: new Map(), shown: { url: '', title: '' }, dialog: null, paused: null, intercepts: [], loadWaiters: new Set(), lastNavAt: 0, navRequestedAt: 0, lastLoadAt: 0, downloadAt: 0, mainFrameId: null, chooserWaiters: new Set(), tracing: null,
       };
       this.#tabs.set(tabId, t);
@@ -613,6 +619,7 @@ export class Engine {
         const frame = p.frame as Json;
         if (!frame.parentId && !sessionId) {
           t.refs.clear();
+          t.refIds.clear();
           t.lastNavAt = Date.now();
           t.mainFrameId = frame.id as string;
         }
@@ -956,7 +963,7 @@ export class Engine {
     }
   }
 
-  async wait(tabId: number, cond: { delayMs?: number; selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
+  async wait(tabId: number, cond: { delayMs?: number; selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; textGone?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
     if (cond.delayMs) {
       // A plain pause (no page timers, so background throttling cannot stretch it).
       // Control is re-checked afterwards, so a take-over during the pause is reported.
@@ -968,7 +975,7 @@ export class Engine {
         if (s.control === 'AGENT_PAUSED' && s.owner === this.client.agentKey) return { waited: cond.delayMs, note: 'The human paused the agent; your next command will wait for Resume.' };
         throw this.#lostControl(s);
       }
-      if (!cond.selector && !cond.text && !cond.urlIncludes && !cond.function && !cond.networkIdleMs && !cond.load) return { waited: cond.delayMs };
+      if (!cond.selector && !cond.text && !cond.textGone && !cond.urlIncludes && !cond.function && !cond.networkIdleMs && !cond.load) return { waited: cond.delayMs };
     }
     return this.action(tabId, (t) => this.#waitIn(t, cond));
   }
@@ -979,33 +986,34 @@ export class Engine {
   }
 
   /** The polling part of wait, for callers already inside the tab's action. */
-  async #waitIn(t: TabState, cond: { selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
+  async #waitIn(t: TabState, cond: { selector?: string; state?: 'visible' | 'attached' | 'hidden'; text?: string; textGone?: string; urlIncludes?: string; function?: string; networkIdleMs?: number; load?: boolean; timeoutMs?: number }) {
     const tabId = t.tabId;
     {
       const timeoutMs = cond.timeoutMs ?? 10_000;
       const deadline = Date.now() + timeoutMs;
       // Selector and text are checked in every frame: the page with its same-origin iframes,
       // and each cross-site iframe through its own session. Each reports
-      // { n: matches, vis: visible matches, text: whether the text is in it }.
+      // { n: matches, vis: visible matches, text: whether the text is in it, gone: whether the
+      // textGone text is (still) in it }.
       let probe: ((ownDocOnly: boolean) => string) | null = null;
-      if (cond.selector || cond.text) {
+      if (cond.selector || cond.text || cond.textGone) {
         const { kind, sel } = cond.selector ? parseSelector(cond.selector) : { kind: '', sel: '' };
         probe = (ownDocOnly) => {
           const docs = ownDocOnly ? '[document]' : `(${FRAME_DOCS})()`;
           // Same selector forms as the action tools (css incl. open shadow roots, text=, xpath=).
           const matches = cond.selector ? `(${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, true, docs)` : '[]';
           // Text counts only in documents whose iframes are visible.
-          const hasText = cond.text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && (d.body?.innerText || '').includes(${JSON.stringify(cond.text)}); })` : 'false';
-          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; return { n: a.length, vis: a.filter(shown).length, text: ${hasText} }; })()`;
+          const has = (text?: string) => text ? `docs.some((d) => { let fe = null; try { fe = d.defaultView.frameElement; } catch {} return (d === document || !fe || shown(fe)) && (d.body?.innerText || '').includes(${JSON.stringify(text)}); })` : 'false';
+          return `(() => { const docs = ${docs}; const a = ${matches}; const shown = ${FRAME_SHOWN_JS}; return { n: a.length, vis: a.filter(shown).length, text: ${has(cond.text)}, gone: ${has(cond.textGone)} }; })()`;
         };
       }
       const state = cond.state || 'visible';
       const check = async (): Promise<boolean> => {
         if (probe) {
           const left = deadline - Date.now();
-          type V = { n: number; vis: number; text: boolean };
+          type V = { n: number; vis: number; text: boolean; gone: boolean };
           type Probe = { result: { value?: V | null }; exceptionDetails?: unknown };
-          const absent: V = { n: 0, vis: 0, text: false };
+          const absent: V = { n: 0, vis: 0, text: false, gone: false };
           // Selector and text are checked in every document: the page with the frames it
           // reaches, then each document it cannot reach, on its own. A probe that fails or times
           // out is unknown: it cannot prove absence (state "hidden"), but a match found elsewhere
@@ -1016,7 +1024,7 @@ export class Engine {
           const ask = (o?: OtherDoc): Promise<{ v?: V; bad?: boolean }> => within(
             this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: o?.guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe!(true)}` : probe!(!!o), returnByValue: true, ...(o?.contextId ? { contextId: o.contextId } : {}) }, o?.sid, Math.max(left, 100))
               .then(async (r) => {
-                if (o && (r.result.value?.vis || r.result.value?.text) && !(await framesShown(o))) { r.result.value.vis = 0; r.result.value.text = false; }
+                if (o && (r.result.value?.vis || r.result.value?.text || r.result.value?.gone) && !(await framesShown(o))) { r.result.value.vis = 0; r.result.value.text = false; r.result.value.gone = false; }
                 return r;
               })
               .then((r) => (r.exceptionDetails ? { bad: true } : r.result.value ? { v: r.result.value } : o?.guard ? { v: absent } : {}))
@@ -1042,8 +1050,11 @@ export class Engine {
             }
             let textOk: boolean | undefined = true;
             if (cond.text) textOk = known.some((v) => v.text) ? true : pending ? undefined : false;
-            if (selOk === false || textOk === false) return false;
-            return selOk && textOk ? true : undefined;
+            // Gone: no document still shows it, and every document answered.
+            let goneOk: boolean | undefined = true;
+            if (cond.textGone) goneOk = known.some((v) => v.gone) ? false : pending ? undefined : !unknown;
+            if (selOk === false || textOk === false || goneOk === false) return false;
+            return selOk && textOk && goneOk ? true : undefined;
           };
           const ok = await new Promise<boolean>((resolve, reject) => {
             let settled = false;
@@ -1100,8 +1111,16 @@ export class Engine {
   // -------------------------------------------------------------------------
   // Snapshot
 
-  async snapshot(tabId: number, opts: { scope?: 'viewport' | 'full_page'; maxLines?: number } = {}) {
+  async snapshot(tabId: number, opts: { scope?: 'viewport' | 'full_page'; maxLines?: number; root?: string; afterAction?: boolean } = {}) {
     return this.action(tabId, async (t) => {
+      // A subtree only: an element by ref or selector (an iframe gives its frame's content).
+      let root: { backendNodeId: number; sessionId?: string } | undefined;
+      if (opts.root) {
+        const r = await this.#resolve(t, opts.root);
+        if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'root must be an element (@ref or selector), not coordinates.');
+        root = { backendNodeId: r.node.backendNodeId, sessionId: r.node.sessionId };
+        if (r.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.node.objectId }).catch(() => {});
+      }
       const { nodes } = await this.cdp<{ nodes: AXNode[] }>(tabId, 'Accessibility.getFullAXTree', {});
       const children = new Map<string, FrameTree>();
       // Frames in the same process as a document are read through that document's session;
@@ -1162,11 +1181,21 @@ export class Engine {
         if (d) exclude.add(d.node.backendNodeId);
         void this.cdp(tabId, 'Runtime.releaseObject', { objectId: host.result.objectId }).catch(() => {});
       }
-      const out = buildSnapshot({ main: { nodes }, children, visible, exclude, draggable, nextRef: () => ++refCounter, maxLines: opts.maxLines });
-      t.refs = out.refs;
       const info = await this.pageInfo(tabId);
-      this.#saw(t, info);
-      return { url: info.url, title: info.title, snapshot: out.text, refCount: out.refs.size };
+      // Refs keep their numbers while the document stays, so one from an earlier snapshot of the
+      // same element still reads the same.
+      const nextRef = (key: string) => {
+        let id = t.refIds.get(key);
+        if (id === undefined) t.refIds.set(key, (id = ++refCounter));
+        return id;
+      };
+      const out = buildSnapshot({ main: { nodes }, children, visible: root ? undefined : visible, exclude, draggable, nextRef, maxLines: opts.maxLines, pageUrl: info.url, root });
+      if (!out.rootFound) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, `${opts.root} is not in the accessibility tree (hidden, or not rendered).`);
+      // Merge: refs from earlier snapshots of this document stay usable.
+      for (const [id, r] of out.refs) t.refs.set(id, r);
+      // After an action, the url and title only when they changed (they head every snapshot).
+      const page = opts.afterAction ? this.#changedPage(t, info) : (this.#saw(t, info), { url: capUrl(info.url), title: info.title });
+      return { url: page.url, title: page.title, snapshot: out.text, refCount: out.refs.size };
     });
   }
 
@@ -1712,10 +1741,41 @@ export class Engine {
       if (r.node?.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.node.objectId }).catch(() => {});
       const receipt = await this.#receiptAfter(t, navBefore);
       lap('receipt');
+      // A checkbox, switch, toggle button or disclosure: its state after the click, so the
+      // agent does not need another call to see whether it took.
+      const state = r.node && !receipt.navigated ? await this.#controlState(tabId, r.node) : null;
       const popups = await this.#popups(tabId, before).catch(() => []);
       lap('popups');
-      return { clicked: r.desc, at: pt, ...receipt, ...(popups.length ? { popups } : {}), timingMs: tm };
+      // Click timings only when asked for (benchmarks): in every receipt they cost tokens, and
+      // their "popups" step was read as a popup count.
+      return { clicked: r.desc, at: pt, ...receipt, ...(popups.length ? { popups } : {}), ...(state ? { state } : {}), ...(process.env.OVERTAKE_TIMING ? { timingMs: tm } : {}) };
     });
+  }
+
+  /** The checked / pressed / expanded / selected state of a control (or of the control a label
+   *  is for), or null when it has none. */
+  async #controlState(tabId: number, node: RefTarget & { objectId?: string }): Promise<Record<string, boolean | string> | null> {
+    const sid = node.sessionId;
+    const res = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId }, sid).catch(() => null);
+    if (!res) return null;
+    const r = await this.cdp<{ result: { value?: Record<string, boolean | string> | null } }>(tabId, 'Runtime.callFunctionOn', {
+      objectId: res.object.objectId, returnByValue: true,
+      functionDeclaration: `function () {
+        let e = this.nodeType === 1 ? this : this.parentElement;
+        if (!e) return null;
+        if (e.localName === 'label' && e.control) e = e.control;
+        else if (!e.matches('input, [role], [aria-checked], [aria-pressed], [aria-expanded], [aria-selected]')) e = e.closest('input, [role=checkbox], [role=switch], [role=radio], [role=tab], [role=option], [aria-checked], [aria-pressed], [aria-expanded], [aria-selected]') || e;
+        const out = {};
+        if (e.localName === 'input' && (e.type === 'checkbox' || e.type === 'radio')) out.checked = e.indeterminate ? 'mixed' : e.checked;
+        for (const [a, k] of [['aria-checked', 'checked'], ['aria-pressed', 'pressed'], ['aria-expanded', 'expanded'], ['aria-selected', 'selected']]) {
+          const v = e.getAttribute(a);
+          if (v !== null && !(k in out)) out[k] = v === 'true' ? true : v === 'false' ? false : v;
+        }
+        return Object.keys(out).length ? out : null;
+      }`,
+    }, sid).catch(() => null);
+    void this.cdp(tabId, 'Runtime.releaseObject', { objectId: res.object.objectId }, sid).catch(() => {});
+    return r?.result.value ?? null;
   }
 
   /** Choose option(s) in a native <select>, matched by value, then by visible label. The element
@@ -2341,6 +2401,20 @@ export class Engine {
       walk(tree.frameTree, 0);
       // OOPIFs appear in the main frame tree only as placeholders on some versions; list sessions too.
       for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: v.url, depth: 1, outOfProcess: true, sessionId: sid });
+      // The <iframe> element of each frame, as a selector for the page around it ("name" is
+      // Chrome's frame name, which can come from the element's id).
+      for (const f of out as (typeof out[number] & { owner?: string })[]) {
+        if (f.depth === 0) continue;
+        const o = await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: f.frameId }).catch(() => null);
+        if (!o) continue;
+        const d = await this.cdp<{ node: { localName: string; attributes?: string[] } }>(tabId, 'DOM.describeNode', { backendNodeId: o.backendNodeId }).catch(() => null);
+        if (!d) continue;
+        const a = new Map<string, string>();
+        const at = d.node.attributes || [];
+        for (let i = 0; i + 1 < at.length; i += 2) a.set(at[i], at[i + 1]);
+        const q = (v: string) => JSON.stringify(v);
+        f.owner = a.get('id') ? `${d.node.localName}#${CSS_ESCAPE(a.get('id')!)}` : a.get('name') ? `${d.node.localName}[name=${q(a.get('name')!)}]` : a.get('title') ? `${d.node.localName}[title=${q(a.get('title')!)}]` : d.node.localName;
+      }
       return { frames: out };
     });
   }
