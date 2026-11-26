@@ -2,7 +2,9 @@
 // snapshots reach into same-origin and cross-site iframes; results stay small.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import type { Server } from 'node:http';
 import { Harness, SITE, pngSize, type Agent } from './harness.ts';
+import { startTestServer } from '../../test-site/server.mjs';
 
 const h = new Harness();
 let A: Agent;
@@ -13,7 +15,13 @@ const inFeature = async (expr: string) => (await A.call('browser_evaluate', { ta
 const remoteFrame = async () => (await A.call('browser_frames', { tabId })).frames.find((f: { outOfProcess: boolean; sessionId?: string }) => f.outOfProcess && f.sessionId);
 const inRemote = async (expr: string) => (await A.call('browser_evaluate', { tabId, frameId: (await remoteFrame()).frameId, expression: expr })).value;
 
+// A second origin on the same site (127.0.0.1, another port): its frames share the page's
+// process, but the page's script cannot reach into them.
+const ALT_PORT = 8767;
+let alt: Server;
+
 before(async () => {
+  alt = (await startTestServer(ALT_PORT)) as Server;
   await h.start();
   A = await h.agent('iframes');
   ({ tabId } = await A.call('spaces_create', { name: 'iframes' }));
@@ -21,6 +29,7 @@ before(async () => {
 });
 after(async () => {
   await h.stop();
+  alt?.close();
 });
 
 test('waits find selectors and text inside same-origin and cross-site iframes', async () => {
@@ -151,4 +160,32 @@ test('screenshots are in CSS pixels by default on a HiDPI page; hiDpi gives devi
   } finally {
     await A.call('browser_cdp', { tabId, method: 'Emulation.clearDeviceMetricsOverride', params: {} });
   }
+});
+
+test('frames of another origin on the same site, and a scaled cross-site frame', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&scaled=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query' });
+  await A.call('browser_wait', { tabId, text: 'Run alt query' });
+  const altFrame = (await A.call('browser_frames', { tabId })).frames.find((f: { url: string }) => f.url.includes(`:${ALT_PORT}/`));
+  const inAlt = async (expr: string) => (await A.call('browser_evaluate', { tabId, frameId: altFrame.frameId, expression: expr })).value;
+  await A.call('browser_click', { tabId, target: 'text=Run alt query' });
+  assert.equal(await inAlt('runs'), 1);
+  let r = await A.call('browser_type', { tabId, target: 'text=Alt search', text: 'abc' });
+  assert.equal(r.value, 'abc');
+  r = await A.call('browser_type', { tabId, text: 'XYZ', clear: true });
+  assert.equal(r.value, 'XYZ');
+  assert.equal(await inAlt(`document.getElementById('search').value`), 'XYZ');
+  // A visible element is not "hidden", even while the page is too busy to answer.
+  await assert.rejects(A.call('browser_wait', { tabId, selector: 'text=Run alt query', state: 'hidden', timeoutMs: 300 }), (e: Error) => code(e) === 'TIMEOUT');
+  await A.call('browser_evaluate', { tabId, expression: 'setTimeout(() => { const end = Date.now() + 1200; while (Date.now() < end) {} }, 0); 1' });
+  await assert.rejects(A.call('browser_wait', { tabId, selector: '#top', state: 'hidden', timeoutMs: 400 }), (e: Error) => code(e) === 'TIMEOUT');
+  // The cross-site frame is drawn at half size: clicks and element screenshots map through that.
+  await A.call('browser_wait', { tabId, selector: 'text=Run remote query', timeoutMs: 15_000 });
+  const before = await inRemote('runs');
+  await A.call('browser_click', { tabId, target: 'text=Run remote query' });
+  assert.equal(await inRemote('runs'), before + 1);
+  const shot = await A.callRaw('browser_screenshot', { tabId, target: 'text=Run remote query' });
+  const clip = JSON.parse(shot.content.find((c) => c.type === 'text').text).clip;
+  const box = (await A.call('browser_evaluate', { tabId, expression: `(() => { const r = document.getElementById('remote').getBoundingClientRect(); return [r.x, r.y, r.right, r.bottom]; })()` })).value;
+  assert.ok(clip.x >= box[0] && clip.y >= box[1] && clip.x + clip.width <= box[2] + 1 && clip.y + clip.height <= box[3] + 1, `${JSON.stringify(clip)} in ${box}`);
 });

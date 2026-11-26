@@ -216,6 +216,15 @@ const FIND_ELEMENT = (function find(sel: string, kind: string, all: boolean, doc
       return { count: pick.length };
     }).toString();
 
+/** Page-side expression, run in a frame's own context: whether the top document reaches this
+ *  frame's document (FRAME_DOCS covers it), that is, every frame up to the top is same-origin. */
+const REACHABLE_FROM_TOP = `(() => { let w = window; for (let i = 0; i < 30 && w !== top; i++) { if (!w.frameElement) return false; w = w.parent; } return w === top; })()`;
+
+/** Whether a CDP error means the frame or its context is gone (as opposed to slow or failing). */
+function frameGone(e: unknown) {
+  return /Cannot find context|No frame|Session with given id not found|not found|detached|closed/i.test(String((e as Error)?.message ?? e));
+}
+
 /** Page-side expression: the single match for a selector as a node, or "count:N". */
 function finderExpr(sel: string, kind: string) {
   return `(() => { const r = (${FIND_ELEMENT})(${JSON.stringify(sel)}, ${JSON.stringify(kind)}, false, (${FRAME_DOCS})()); return r && r.nodeType ? r : 'count:' + r.count; })()`;
@@ -519,9 +528,13 @@ export class Engine {
       case 'Runtime.executionContextCreated': {
         const c = p.context as Json;
         const aux = c.auxData as Json | undefined;
-        if (aux?.isDefault && typeof aux.frameId === 'string') t.contexts.set(aux.frameId, c.id as number);
+        // Main session only: context ids are per session (cross-site frames have their own).
+        if (!sessionId && aux?.isDefault && typeof aux.frameId === 'string') t.contexts.set(aux.frameId, c.id as number);
         break;
       }
+      case 'Runtime.executionContextDestroyed':
+        if (!sessionId) for (const [f, id] of t.contexts) if (id === p.executionContextId) t.contexts.delete(f);
+        break;
       case 'Runtime.executionContextsCleared':
         if (!sessionId) t.contexts.clear();
         break;
@@ -926,15 +939,29 @@ export class Engine {
       const check = async (): Promise<boolean> => {
         if (probe) {
           const left = deadline - Date.now();
-          type Probe = { result: { value?: { n: number; vis: number; text: boolean } }; exceptionDetails?: unknown };
-          const none: Probe = { result: { value: { n: 0, vis: 0, text: false } } };
-          const ask = (sid?: string) => within(
-            this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: probe, returnByValue: true }, sid, Math.max(left, 100)).catch(softFail(none)),
-            left, none);
+          type V = { n: number; vis: number; text: boolean };
+          type Probe = { result: { value?: V }; exceptionDetails?: unknown };
+          const absent: V = { n: 0, vis: 0, text: false };
+          // A probe that fails or times out is unknown, not "no match": otherwise a slow page
+          // would satisfy state "hidden". Only a frame that is gone counts as having nothing.
+          const ask = (sid?: string, contextId?: number, guard = false): Promise<Probe | V | null> => within(
+            this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe}` : probe, returnByValue: true, ...(contextId ? { contextId } : {}) }, sid, Math.max(left, 100))
+              .then((r) => (guard && !r.exceptionDetails && r.result.value == null ? absent : r))
+              .catch((e) => { softFail(null)(e); return sid || contextId ? (frameGone(e) ? absent : null) : null; }),
+            left, null);
           const frames = [...t.children.entries()].filter(([, c]) => c.type === 'iframe').map(([sid]) => sid);
-          const [top, ...rest] = await Promise.all([ask(), ...frames.map((sid) => ask(sid))]);
-          if (top.exceptionDetails && cond.selector) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${cond.selector}`);
-          const all = [top, ...rest].map((r) => r.result.value ?? { n: 0, vis: 0, text: false });
+          // Same-process frames the top document cannot reach (same site, other origin).
+          const ctxs = [...t.contexts.entries()].filter(([f]) => f !== t.mainFrameId).map(([, id]) => id);
+          const [top, ...rest] = await Promise.all([ask(), ...frames.map((sid) => ask(sid)), ...ctxs.map((id) => ask(undefined, id, true))]);
+          if (top && 'result' in top && top.exceptionDetails && cond.selector) throw new OvertakeError(ErrorCode.BAD_REQUEST, `Invalid selector ${cond.selector}`);
+          const all: V[] = [];
+          for (const r of [top, ...rest]) {
+            if (!r) return false;
+            if ('result' in r) {
+              if (!r.result.value) return false;
+              all.push(r.result.value);
+            } else all.push(r);
+          }
           const n = all.reduce((s, v) => s + v.n, 0);
           const vis = all.reduce((s, v) => s + v.vis, 0);
           if (cond.selector && !(state === 'hidden' ? vis === 0 : state === 'attached' ? n > 0 : vis > 0)) return false;
@@ -1098,10 +1125,24 @@ export class Engine {
     }
     if (r.result.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: r.result.objectId }).catch(() => {});
     if (countOf(r)) throw tooMany(countOf(r));
-    // Nothing in the page or its same-origin iframes: look in cross-site iframes, which run in
-    // their own process. Their coordinates are offset by the iframe element in the page.
-    const hits: { node: RefTarget; url: string }[] = [];
+    // Nothing in the page or its same-origin iframes. Look in frames the page cannot reach:
+    // same-process ones of another origin on the same site (through their own execution
+    // context; their nodes and coordinates work like the page's), then cross-site iframes, which
+    // run in their own process and are offset by their iframe element in the page.
+    const hits: { node: RefTarget & { objectId?: string }; url: string }[] = [];
     let more = 0;
+    for (const [fid, contextId] of t.contexts) {
+      if (fid === t.mainFrameId) continue;
+      const fr = await this.cdp<Found>(tabId, 'Runtime.evaluate', { expression: `(${REACHABLE_FROM_TOP}) ? 'count:0' : ${finder}`, returnByValue: false, contextId }).catch(() => null);
+      if (!fr || fr.exceptionDetails) continue;
+      if (fr.result.subtype !== 'node' || !fr.result.objectId) {
+        more += countOf(fr);
+        continue;
+      }
+      const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }).catch(() => null);
+      if (!d) continue;
+      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: fr.result.objectId }, url: '' });
+    }
     for (const [sid, c] of t.children) {
       if (c.type !== 'iframe') continue;
       const fr = await find(sid).catch(() => null);
@@ -1116,7 +1157,11 @@ export class Engine {
       if (!d || !owner) continue; // e.g. a cross-site frame nested in another one
       hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: sid, ownerBackendNodeId: owner.backendNodeId }, url: c.url });
     }
-    if (hits.length + more > 1) throw tooMany(hits.length + more);
+    if (hits.length + more > 1) {
+      for (const h of hits) if (h.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: h.node.objectId }).catch(() => {});
+      throw tooMany(hits.length + more);
+    }
+    if (hits.length && !hits[0].node.sessionId) return { node: hits[0].node, desc: target };
     if (hits.length) {
       // The target's url can be empty before its first navigation is reported: ask the frame.
       const url = hits[0].url || (await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.evaluate', { expression: 'location.href', returnByValue: true }, hits[0].node.sessionId).catch(() => null))?.result.value || '';
@@ -1164,12 +1209,25 @@ export class Engine {
     const quad = q.quads[0];
     let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
     let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-    if (sid && node.ownerBackendNodeId !== undefined) {
-      const box = await this.cdp<{ model: { content: number[] } }>(tabId, 'DOM.getBoxModel', { backendNodeId: node.ownerBackendNodeId });
-      x += box.model.content[0];
-      y += box.model.content[1];
-    }
+    if (sid && node.ownerBackendNodeId !== undefined) [x, y] = await this.#frameToRoot(tabId, sid, node.ownerBackendNodeId, [x, y]);
     return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+  }
+
+  /** Map points (x0, y0, x1, y1, ...) in a cross-site frame's viewport to the page's viewport,
+   *  through its <iframe>'s content box as drawn (so a scaled or rotated iframe maps right). */
+  async #frameToRoot(tabId: number, sid: string, owner: number, pts: number[]): Promise<number[]> {
+    const box = await this.cdp<{ model: { content: number[] } }>(tabId, 'DOM.getBoxModel', { backendNodeId: owner });
+    const c = box.model.content; // corners: top-left, top-right, bottom-right, bottom-left
+    const size = await this.cdp<{ result: { value?: [number, number] } }>(tabId, 'Runtime.evaluate', { expression: '[innerWidth, innerHeight]', returnByValue: true }, sid).catch(() => null);
+    const w = size?.result.value?.[0] || Math.hypot(c[2] - c[0], c[3] - c[1]);
+    const h = size?.result.value?.[1] || Math.hypot(c[6] - c[0], c[7] - c[1]);
+    const out: number[] = [];
+    for (let i = 0; i + 1 < pts.length; i += 2) {
+      const u = pts[i] / w;
+      const v = pts[i + 1] / h;
+      out.push(c[0] + u * (c[2] - c[0]) + v * (c[6] - c[0]), c[1] + u * (c[3] - c[1]) + v * (c[7] - c[1]));
+    }
+    return out;
   }
 
   #jump(t: TabState, to: { x: number; y: number }): InputStep[] {
@@ -1394,6 +1452,16 @@ export class Engine {
     }, sid).catch(() => null);
     const top = (await run())?.result.value;
     if (!top?.remote) return top?.result ?? null;
+    // Focus is in a frame the page cannot reach: a same-process one of another origin (its own
+    // context), or a cross-site one (its own session).
+    for (const [fid, contextId] of t.contexts) {
+      if (fid === t.mainFrameId) continue;
+      const r = await this.cdp<R>(t.tabId, 'Runtime.evaluate', {
+        expression: `(() => { if (!document.hasFocus() || (${REACHABLE_FROM_TOP})) return { away: true }; return (${FOCUSED_OP})(${JSON.stringify(op)}); })()`, returnByValue: true, contextId,
+      }).catch(() => null);
+      const v = r?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
+      if (v && !v.away && !v.remote) return v.result ?? null;
+    }
     for (const [sid, c] of t.children) {
       if (c.type !== 'iframe') continue;
       const v = (await run(sid, 'if (!document.hasFocus()) return { result: undefined, away: true };'))?.result.value as { remote?: boolean; result?: unknown; away?: boolean } | undefined;
@@ -1481,7 +1549,8 @@ export class Engine {
         if (!r.node) throw new OvertakeError(ErrorCode.BAD_REQUEST, 'Screenshot target must be an element, not coordinates.');
         await this.cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: r.node.backendNodeId }, r.node.sessionId).catch(() => {});
         const q = await this.cdp<{ quads: number[][] }>(tabId, 'DOM.getContentQuads', { backendNodeId: r.node.backendNodeId }, r.node.sessionId);
-        const quad = q.quads[0];
+        let quad = q.quads[0];
+        if (r.node.sessionId && r.node.ownerBackendNodeId !== undefined) quad = await this.#frameToRoot(tabId, r.node.sessionId, r.node.ownerBackendNodeId, quad);
         const xs = [quad[0], quad[2], quad[4], quad[6]];
         const ys = [quad[1], quad[3], quad[5], quad[7]];
         const vp = (await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number } }>(tabId, 'Page.getLayoutMetrics')).cssVisualViewport;

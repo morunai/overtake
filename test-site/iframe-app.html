@@ -15,5 +15,18 @@
 <button id="top">Top button</button>
 <iframe id="feature" title="Feature frame" src="/iframe-app-inner.html"></iframe>
 <iframe id="remote" title="Remote frame" src="http://localhost:8765/iframe-app-inner.html?remote=1"></iframe>
+<script>
+  // ?alt=PORT: a frame of the same site on another port (another origin, same process), which
+  // the page's own script cannot reach. ?scaled=1: the cross-site frame drawn at half size.
+  const q = new URLSearchParams(location.search);
+  if (q.get('alt')) {
+    const f = document.createElement('iframe');
+    f.id = 'alt';
+    f.title = 'Alt frame';
+    f.src = `http://127.0.0.1:${q.get('alt')}/iframe-app-inner.html?alt=1`;
+    document.body.append(f);
+  }
+  if (q.get('scaled')) document.getElementById('remote').style.transform = 'scale(0.5)';
+</script>
 </body>
 </html>

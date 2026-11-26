@@ -19,6 +19,10 @@
     document.getElementById('run').textContent = 'Run remote query';
     document.getElementById('search').setAttribute('aria-label', 'Remote search');
   }
+  if (location.search.includes('alt=1')) {
+    document.getElementById('run').textContent = 'Run alt query';
+    document.getElementById('search').setAttribute('aria-label', 'Alt search');
+  }
   window.runs = 0;
   document.getElementById('run').onclick = () => {
     runs++;
