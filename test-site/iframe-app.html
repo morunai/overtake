@@ -59,6 +59,7 @@
     document.body.append(b);
   }
   if (q.get('remotehidden')) document.getElementById('remote').style.visibility = 'hidden';
+  if (q.get('closed')) document.getElementById('feature').src = '/iframe-app-inner.html?closed=1';
   if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
   if (q.get('shadow')) {
     const host = document.createElement('div');

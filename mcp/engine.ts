@@ -1420,11 +1420,15 @@ export class Engine {
         let ok = !!hit && hit.node.backendNodeId === (sid ? node.ownerBackendNodeId : node.backendNodeId);
         if (!ok && hit && !sid) {
           // The element itself, or something inside it (or its label), is fine.
-          const w = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId }).catch(() => null);
+          // In the page's own context, like the hit (objects cannot cross contexts).
+          const topCtx = t.mainFrameId ? t.contexts.get(t.mainFrameId) : undefined;
+          const w = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId, ...(topCtx ? { executionContextId: topCtx } : {}) }).catch(() => null);
           if (w) {
             const r = await this.cdp<{ result: { value?: boolean } }>(tabId, 'Runtime.callFunctionOn', {
               objectId: hitObj, returnByValue: true, arguments: [{ objectId: w.object.objectId }],
-              functionDeclaration: 'function (t) { for (let n = this, i = 0; n && i < 500; i++) { if (n === t) return true; n = n.parentNode || n.host; } return this.localName === "label" && this.control === t; }',
+              // Also a host around the element: the walk down cannot enter a closed shadow root,
+              // and the check above already found the element on top inside it.
+              functionDeclaration: 'function (t) { for (let n = this, i = 0; n && i < 500; i++) { if (n === t) return true; n = n.parentNode || n.host; } for (let n = t, i = 0; n && i < 500; i++) { if (n === this) return true; n = n.parentNode || n.host; } return this.localName === "label" && this.control === t; }',
             }).catch(() => null);
             void this.cdp(tabId, 'Runtime.releaseObject', { objectId: w.object.objectId }).catch(() => {});
             ok = !!r?.result.value;

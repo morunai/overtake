@@ -356,3 +356,13 @@ test('visibility:hidden copies are hidden, and text in a hidden frame does not s
   await assert.rejects(A.call('browser_wait', { tabId, text: 'Run remote query', timeoutMs: 500 }), (e: Error) => code(e) === 'TIMEOUT');
   await A.call('browser_wait', { tabId, text: 'Run query' });
 });
+
+test('a button in a closed shadow root inside a frame is clicked by its ref', async () => {
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?closed=1` });
+  await A.call('browser_wait', { tabId, selector: '#host' });
+  const snap = await A.call('browser_snapshot', { tabId });
+  const ref = /button "Closed button" (@\d+)/.exec(snap)?.[1];
+  assert.ok(ref, snap);
+  await A.call('browser_click', { tabId, target: ref });
+  assert.equal(await inFeature('closedClicks'), 1);
+});

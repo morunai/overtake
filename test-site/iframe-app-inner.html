@@ -64,6 +64,16 @@
     w.textContent = 'Wide';
     document.body.prepend(w);
   }
+  // ?closed=1: a button inside a closed shadow root.
+  if (params.get('closed')) {
+    const host = document.createElement('div');
+    host.id = 'host';
+    const b = document.createElement('button');
+    b.textContent = 'Closed button';
+    b.onclick = () => { window.closedClicks = (window.closedClicks || 0) + 1; };
+    host.attachShadow({ mode: 'closed' }).append(b);
+    document.body.prepend(host);
+  }
   window.runs = 0;
   document.getElementById('run').onclick = () => {
     runs++;
