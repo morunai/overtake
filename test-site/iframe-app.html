@@ -31,6 +31,19 @@
   if (q.get('remotealt')) document.getElementById('remote').src += `&nestalt=${q.get('remotealt')}`;
   // ?wide=1: the feature frame holds an element larger than the frame.
   if (q.get('wide')) document.getElementById('feature').src = '/iframe-app-inner.html?wide=1';
+  // ?deepremote=1: the feature frame embeds a cross-site frame. ?althidden=1: the alt frame is
+  // visibility:hidden. ?shadow=1: a cross-site frame inside an open shadow root.
+  if (q.get('deepremote')) document.getElementById('feature').src = '/iframe-app-inner.html?nestremote=1';
+  if (q.get('althidden')) document.getElementById('alt').style.visibility = 'hidden';
+  if (q.get('shadow')) {
+    const host = document.createElement('div');
+    host.id = 'host';
+    const f = document.createElement('iframe');
+    f.src = 'http://localhost:8765/iframe-app-inner.html?remote=1&shadowq=1';
+    f.style.cssText = 'width:520px;height:300px;border:0';
+    host.attachShadow({ mode: 'open' }).append(f);
+    document.body.prepend(host);
+  }
   // ?traps=1: a hidden iframe over a page button, page elements drawn over both frames, and a
   // large element in a frame nested in a small frame.
   if (q.get('traps')) {
@@ -45,8 +58,9 @@
     ghost.srcdoc = '<button id="ghost" style="width:180px;height:50px">Ghost</button>';
     ghost.style.cssText = 'position:absolute;left:20px;top:420px;width:200px;height:60px;border:0;visibility:hidden';
     document.body.append(under, ghost);
-    for (const id of ['feature', 'remote']) {
+    for (const id of ['feature', 'remote', 'alt']) {
       const f = document.getElementById(id);
+      if (!f) continue;
       const c = document.createElement('div');
       c.className = 'cover';
       c.style.cssText = `position:absolute;left:${f.offsetLeft}px;top:${f.offsetTop}px;width:${f.offsetWidth}px;height:${f.offsetHeight}px;background:rgba(255,0,0,.2)`;
@@ -55,7 +69,8 @@
     const outer = document.createElement('iframe');
     outer.id = 'outer';
     outer.style.cssText = 'position:absolute;left:300px;top:420px;width:200px;height:150px;border:0';
-    outer.srcdoc = '<body style="margin:0"><iframe id="inner" style="width:500px;height:500px;border:0" srcdoc="&lt;div id=big style=&quot;width:480px;height:480px;background:#fca5a5&quot;&gt;Big&lt;/div&gt;"></iframe></body>';
+    outer.srcdoc = '<body style="margin:0"><iframe id="inner" style="width:500px;height:500px;border:0" srcdoc="&lt;div id=big style=&quot;width:480px;height:480px;background:#fca5a5&quot;&gt;Big&lt;/div&gt;"></iframe>'
+      + (q.get('alt') ? `<iframe id="innerAlt" style="width:950px;height:450px;border:0" src="http://127.0.0.1:${q.get('alt')}/iframe-app-inner.html?wide=1"></iframe>` : '') + '</body>';
     document.body.append(outer);
   }
   // ?only=alt: just the frame of another origin.

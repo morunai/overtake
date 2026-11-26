@@ -276,3 +276,32 @@ test('hidden or covered iframes are not clicked through, and nested-frame screen
     await A.call('browser_cdp', { tabId, method: 'Emulation.setPageScaleFactor', params: { pageScaleFactor: 1 } });
   }
 });
+
+test('clicks are checked against the page itself across origin boundaries; screenshots too', async () => {
+  // A same-site frame of another origin, covered by the page: the cover must not get the click.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&traps=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query' });
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run alt query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /covered by div\.cover/.test(e.message));
+  // A large element in a cross-origin frame nested in a small same-origin frame: cut to the
+  // small frame.
+  await A.call('browser_wait', { tabId, selector: '#wide', state: 'attached' });
+  const shot = await A.callRaw('browser_screenshot', { tabId, target: '#wide' });
+  const clip = JSON.parse(shot.content.find((c) => c.type === 'text').text).clip;
+  const box = (await A.call('browser_evaluate', { tabId, expression: `(() => { const r = document.getElementById('outer').getBoundingClientRect(); return [r.x + scrollX, r.y + scrollY, r.right + scrollX, r.bottom + scrollY]; })()` })).value;
+  assert.ok(clip.x >= box[0] - 1 && clip.y >= box[1] - 1 && clip.x + clip.width <= box[2] + 1 && clip.y + clip.height <= box[3] + 1, `${JSON.stringify(clip)} in ${box}`);
+  // The same frame hidden: its elements are hidden and not clicked.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?alt=${ALT_PORT}&althidden=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query', state: 'attached' });
+  await A.call('browser_wait', { tabId, selector: 'text=Run alt query', state: 'hidden' });
+  await assert.rejects(A.call('browser_wait', { tabId, selector: 'text=Run alt query', timeoutMs: 400 }), (e: Error) => code(e) === 'TIMEOUT');
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run alt query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE');
+  // A cross-site frame inside a same-origin frame that the page covers.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?deepremote=1&traps=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run deep query', state: 'attached', timeoutMs: 15_000 });
+  await assert.rejects(A.call('browser_click', { tabId, target: 'text=Run deep query' }), (e: Error) => code(e) === 'ELEMENT_NOT_ACTIONABLE' && /covered by div\.cover/.test(e.message));
+  // A cross-site frame inside a shadow root, not covered: clicked.
+  await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html?shadow=1` });
+  await A.call('browser_wait', { tabId, selector: 'text=Run shadow query', timeoutMs: 15_000 });
+  await A.call('browser_click', { tabId, target: 'text=Run shadow query' });
+  await A.call('browser_wait', { tabId, text: 'row 1 for all' });
+});

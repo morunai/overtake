@@ -64,7 +64,7 @@ interface TabState {
   events: { seq: number; at: number; method: string; sessionId?: string; params: unknown }[];
   refs: Map<number, RefTarget>;
   cursor: { x: number; y: number } | null;
-  children: Map<string, { targetId: string; type: string; url: string }>; // OOPIF sessions
+  children: Map<string, { targetId: string; type: string; url: string; parentFrameId?: string }>; // OOPIF sessions
   contexts: Map<string, number>; // frameId -> default execution context id (main session)
   childContexts: Map<string, Map<string, number>>; // per cross-site frame session: frameId -> context id
   shown: { url: string; title: string }; // the url and title the agent last saw in a result
@@ -259,7 +259,7 @@ function finderExpr(sel: string, kind: string, ownDocOnly = false) {
 }
 
 /** A document the top document's script cannot reach, to search on its own. */
-type OtherDoc = { sid?: string; contextId?: number; guard: boolean; targetId?: string; url?: string };
+type OtherDoc = { sid?: string; contextId?: number; guard: boolean; targetId?: string; url?: string; frameId?: string };
 
 /** Page-side: the focused element, followed into open shadow roots and same-origin iframes.
  *  Returns { remote: true } when focus is inside a frame this document cannot reach
@@ -310,6 +310,7 @@ export function capUrl(url: string, max = 300): string {
 /** Whether a request still counts as in flight for idle checks. Chrome never reports
  *  loadingFinished for some requests that did get a response (fetch with keepalive, as
  *  analytics and event beacons use), so a response more than a moment old counts as done. */
+type FT = { frame: { id: string }; childFrames?: FT[] };
 type DomSnap = { strings: string[]; documents: { nodes: { backendNodeId: number[]; attributes?: number[][] }; layout: { nodeIndex: number[]; bounds: number[][] } }[] };
 
 /** Elements with draggable="true" in the snapshot's documents (the main page and same-process
@@ -582,7 +583,7 @@ export class Engine {
         break;
       case 'Target.attachedToTarget': {
         const info = p.targetInfo as Json;
-        t.children.set(p.sessionId as string, { targetId: info.targetId as string, type: info.type as string, url: info.url as string });
+        t.children.set(p.sessionId as string, { targetId: info.targetId as string, type: info.type as string, url: info.url as string, parentFrameId: info.parentFrameId as string | undefined });
         // Bring OOPIF sessions to parity with the main session.
         const sid = p.sessionId as string;
         for (const m of ['Runtime.enable', 'Network.enable', 'Page.enable']) void this.cdp(tabId, m, {}, sid).catch(() => {});
@@ -989,8 +990,15 @@ export class Engine {
           // reaches, then each document it cannot reach, on its own. A probe that fails or times
           // out is unknown: it cannot prove absence (state "hidden"), but a match found elsewhere
           // still counts. Only a frame that is gone counts as having nothing.
+          // A document the page cannot see into: its matches count as visible only if every
+          // <iframe> around it is visible too.
+          const framesShown = async (o: OtherDoc) => this.#ownersShown(t, await this.#frameOwners(t, o.frameId, o.sid));
           const ask = (o?: OtherDoc): Promise<{ v?: V; bad?: boolean }> => within(
             this.cdp<Probe>(tabId, 'Runtime.evaluate', { expression: o?.guard ? `(${REACHABLE_FROM_TOP}) ? null : ${probe!(true)}` : probe!(!!o), returnByValue: true, ...(o?.contextId ? { contextId: o.contextId } : {}) }, o?.sid, Math.max(left, 100))
+              .then(async (r) => {
+                if (o && r.result.value?.vis && !(await framesShown(o))) r.result.value.vis = 0;
+                return r;
+              })
               .then((r) => (r.exceptionDetails ? { bad: true } : r.result.value ? { v: r.result.value } : o?.guard ? { v: absent } : {}))
               .catch((e) => { softFail(null)(e); return o && frameGone(e) ? { v: absent } : {}; }),
             left, {});
@@ -1207,14 +1215,14 @@ export class Engine {
       }
       const d = await this.cdp<{ node: { backendNodeId: number; nodeName: string } }>(tabId, 'DOM.describeNode', { objectId: fr.result.objectId }, o.sid).catch(() => null);
       if (!o.sid) {
-        if (d) hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: fr.result.objectId }, url: '' });
+        if (d) hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', objectId: fr.result.objectId, frameId: o.frameId }, url: '' });
         continue;
       }
       void this.cdp(tabId, 'Runtime.releaseObject', { objectId: fr.result.objectId }, o.sid).catch(() => {});
       if (!owners.has(o.sid)) owners.set(o.sid, (await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: o.targetId }).catch(() => null))?.backendNodeId ?? null);
       const owner = owners.get(o.sid);
       if (!d || !owner) continue; // e.g. a cross-site frame nested in another one
-      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: o.sid, ownerBackendNodeId: owner }, url: o.url || '' });
+      hits.push({ node: { backendNodeId: d.node.backendNodeId, role: d.node.nodeName.toLowerCase(), name: '', sessionId: o.sid, ownerBackendNodeId: owner, frameId: o.frameId }, url: o.url || '' });
     }
     if (hits.length + more > 1) {
       for (const h of hits) if (h.node.objectId) void this.cdp(tabId, 'Runtime.releaseObject', { objectId: h.node.objectId }).catch(() => {});
@@ -1234,12 +1242,12 @@ export class Engine {
    *  each cross-site frame's session (its default context when none is known yet). */
   #otherDocs(t: TabState): OtherDoc[] {
     const out: OtherDoc[] = [];
-    for (const [fid, contextId] of t.contexts) if (fid !== t.mainFrameId) out.push({ contextId, guard: true });
+    for (const [fid, contextId] of t.contexts) if (fid !== t.mainFrameId) out.push({ contextId, guard: true, frameId: fid });
     for (const [sid, c] of t.children) {
       if (c.type !== 'iframe') continue;
       const ctxs = t.childContexts.get(sid);
-      if (ctxs?.size) for (const contextId of ctxs.values()) out.push({ sid, contextId, guard: false, targetId: c.targetId, url: c.url });
-      else out.push({ sid, guard: false, targetId: c.targetId, url: c.url });
+      if (ctxs?.size) for (const [fid, contextId] of ctxs) out.push({ sid, contextId, guard: false, targetId: c.targetId, url: c.url, frameId: fid });
+      else out.push({ sid, guard: false, targetId: c.targetId, url: c.url, frameId: c.targetId });
     }
     return out;
   }
@@ -1255,7 +1263,7 @@ export class Engine {
       if (!res) throw new OvertakeError(ErrorCode.ELEMENT_NOT_FOUND, 'The element is no longer in the document. Take a new snapshot.');
       objectId = res.object.objectId;
     }
-    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
+    const check = await this.cdp<{ result: { value: { ok: boolean; reason?: string; top?: string; disabled?: boolean; detached?: boolean; inFrame?: boolean } } }>(tabId, 'Runtime.callFunctionOn', {
       objectId,
       returnByValue: true,
       functionDeclaration: `function(){
@@ -1268,6 +1276,7 @@ export class Engine {
         const top = stack[0];
         const desc = (e) => e ? e.localName + (e.id ? '#' + e.id : '') + (typeof e.className === 'string' && e.className ? '.' + e.className.trim().split(/\\s+/).slice(0, 2).join('.') : '') : 'nothing';
         const ok = !!top && (top === this || this.contains(top) || (top.localName === 'label' && top.control === this));
+        const inFrame = this.ownerDocument.defaultView !== this.ownerDocument.defaultView.top;
         if (!ok) return { ok, top: desc(top), disabled: !!this.disabled };
         // Inside an iframe: that iframe must be visible and on top at this point in its own
         // document, and so on up (as far as this document can see), or the click lands on
@@ -1287,7 +1296,7 @@ export class Engine {
           if (hit !== fe) return { ok: false, top: desc(hit), disabled: !!this.disabled };
           el = fe;
         }
-        return { ok, top: desc(top), disabled: !!this.disabled };
+        return { ok, top: desc(top), disabled: !!this.disabled, inFrame };
       }`,
     }, sid);
     const v = check.result.value;
@@ -1302,30 +1311,137 @@ export class Engine {
     const quad = q.quads[0];
     let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
     let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-    if (sid && node.ownerBackendNodeId !== undefined) {
-      [x, y] = await this.#frameToRoot(tabId, sid, node.ownerBackendNodeId, [x, y]);
-      // The cross-site iframe itself must be visible and on top at that point in the page.
-      if (!force) {
-        const owner = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.ownerBackendNodeId }).catch(() => null);
-        if (owner) {
-          const o = await this.cdp<{ result: { value?: { ok?: boolean; reason?: string; top?: string } } }>(tabId, 'Runtime.callFunctionOn', {
-            objectId: owner.object.objectId, returnByValue: true, arguments: [{ value: x }, { value: y }],
-            functionDeclaration: `function (x, y) {
-              const vis = this.checkVisibility({ visibilityProperty: true }) && (${FRAME_SHOWN_JS})(this);
-              if (!vis) return { reason: 'the iframe it is in is hidden' };
-              if (this.ownerDocument !== document) return { ok: true };
-              const hit = document.elementsFromPoint(x, y).filter((e) => e.localName !== 'overtake-overlay')[0];
-              return { ok: hit === this, top: hit ? hit.localName + (hit.id ? '#' + hit.id : '') : 'nothing' };
-            }`,
-          }).catch(() => null);
-          void this.cdp(tabId, 'Runtime.releaseObject', { objectId: owner.object.objectId }).catch(() => {});
-          const ov = o?.result.value;
-          if (ov?.reason) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `Cannot act on the element: ${ov.reason}.`);
-          if (ov && ov.ok === false) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${ov.top} at its center. Close the covering element or pass force:true.`);
+    if (sid && node.ownerBackendNodeId !== undefined) [x, y] = await this.#frameToRoot(tabId, sid, node.ownerBackendNodeId, [x, y]);
+    // In a frame, the check above sees only the frame's own document (and same-origin ones
+    // around it). Hit-test the page itself at the final point: the node there must be the
+    // element (or inside it), or for a cross-site frame its <iframe>. Otherwise the input would
+    // land on whatever covers or replaces the frame (a hidden frame is not hit at all).
+    if (!force && (sid || v.inFrame)) {
+      // Top down from the page: the element on top at the point (the Overtake overlay aside),
+      // into open shadow roots and frames the page can script, until a frame it cannot.
+      const found = await this.cdp<{ result: { objectId?: string; subtype?: string } }>(tabId, 'Runtime.evaluate', {
+        expression: `((x, y) => {
+          let doc = document, el = null;
+          for (let i = 0; i < 30; i++) {
+            el = doc.elementsFromPoint(x, y).filter((e) => e.localName !== 'overtake-overlay')[0] || null;
+            for (let j = 0; el && el.shadowRoot && j < 30; j++) {
+              const inner = el.shadowRoot.elementsFromPoint(x, y).filter((e) => e.localName !== 'overtake-overlay')[0];
+              if (!inner || inner === el) break;
+              el = inner;
+            }
+            if (!el || (el.localName !== 'iframe' && el.localName !== 'frame')) return el;
+            let d = null;
+            try { d = el.contentDocument; } catch {}
+            if (!d) return el;
+            const r = el.getBoundingClientRect();
+            const k = r.width / (el.offsetWidth || r.width || 1);
+            x = (x - r.left) / k - el.clientLeft;
+            y = (y - r.top) / k - el.clientTop;
+            doc = d;
+          }
+          return el;
+        })(${x}, ${y})`,
+        returnByValue: false,
+      }).catch(() => null);
+      const hitObj = found?.result.subtype === 'node' ? found.result.objectId : undefined;
+      if (hitObj) {
+        const hit = await this.cdp<{ node: { backendNodeId: number } }>(tabId, 'DOM.describeNode', { objectId: hitObj }).catch(() => null);
+        let ok = !!hit && hit.node.backendNodeId === (sid ? node.ownerBackendNodeId : node.backendNodeId);
+        if (!ok && hit && !sid) {
+          // The element itself, or something inside it (or its label), is fine.
+          const w = await this.cdp<{ object: { objectId: string } }>(tabId, 'DOM.resolveNode', { backendNodeId: node.backendNodeId }).catch(() => null);
+          if (w) {
+            const r = await this.cdp<{ result: { value?: boolean } }>(tabId, 'Runtime.callFunctionOn', {
+              objectId: hitObj, returnByValue: true, arguments: [{ objectId: w.object.objectId }],
+              functionDeclaration: 'function (t) { for (let n = this, i = 0; n && i < 500; i++) { if (n === t) return true; n = n.parentNode || n.host; } return this.localName === "label" && this.control === t; }',
+            }).catch(() => null);
+            void this.cdp(tabId, 'Runtime.releaseObject', { objectId: w.object.objectId }).catch(() => {});
+            ok = !!r?.result.value;
+          }
         }
+        if (!ok && hit) {
+          // Stopped at a frame the page cannot script: it must be one around the element.
+          const fid = node.frameId ?? (sid ? t.children.get(sid)?.targetId : undefined);
+          const owners = fid ? await this.#frameOwners(t, fid, sid) : [];
+          ok = owners.some((o) => !o.sid && o.id === hit.node.backendNodeId);
+        }
+        let topDesc = 'another element';
+        if (!ok) {
+          const d = await this.cdp<{ result: { value?: string } }>(tabId, 'Runtime.callFunctionOn', {
+            objectId: hitObj, returnByValue: true,
+            functionDeclaration: "function () { const e = this; return e.localName + (e.id ? '#' + e.id : '') + (typeof e.className === 'string' && e.className ? '.' + e.className.trim().split(/\\s+/).slice(0, 2).join('.') : ''); }",
+          }).catch(() => null);
+          topDesc = d?.result.value || topDesc;
+        }
+        void this.cdp(tabId, 'Runtime.releaseObject', { objectId: hitObj }).catch(() => {});
+        if (!ok) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, `The element is covered by ${topDesc} at its center (its frame may be hidden or covered). Close the covering element or pass force:true.`);
       }
     }
     return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+  }
+
+  /** The <iframe> elements around frame `frameId` (a frame of session `sid`), innermost first,
+   *  each with the session that holds it. Followed across origins through CDP, which code in the
+   *  page cannot do; stops at a cross-site frame inside another cross-site frame. */
+  async #frameOwners(t: TabState, frameId: string | undefined, sid: string | undefined): Promise<{ id: number; sid?: string }[]> {
+    const out: { id: number; sid?: string }[] = [];
+    const parents = new Map<string, Map<string, string>>();
+    let f = frameId, s = sid;
+    for (let i = 0; i < 12 && f; i++) {
+      if (!s && f === t.mainFrameId) break;
+      const child = s ? t.children.get(s) : undefined;
+      if (s && child && f === child.targetId) {
+        // The root of a cross-site frame: its <iframe> is in the page's process.
+        if (child.parentFrameId === undefined) break;
+        const o = await this.cdp<{ backendNodeId: number }>(t.tabId, 'DOM.getFrameOwner', { frameId: f }).catch(() => null);
+        if (!o) break;
+        out.push({ id: o.backendNodeId });
+        s = undefined;
+        f = child.parentFrameId;
+        continue;
+      }
+      const o = await this.cdp<{ backendNodeId: number }>(t.tabId, 'DOM.getFrameOwner', { frameId: f }, s).catch(() => null);
+      if (!o) break;
+      out.push({ id: o.backendNodeId, sid: s });
+      const key = s ?? '';
+      let pm = parents.get(key);
+      if (!pm) {
+        pm = new Map();
+        const tree = await this.cdp<{ frameTree: FT }>(t.tabId, 'Page.getFrameTree', {}, s).catch(() => null);
+        const walk = (ft: FT) => { for (const c of ft.childFrames || []) { pm!.set(c.frame.id, ft.frame.id); walk(c); } };
+        if (tree) walk(tree.frameTree);
+        parents.set(key, pm);
+      }
+      f = pm.get(f);
+    }
+    return out;
+  }
+
+  /** An enclosing <iframe>'s content box in the page's viewport (its bounding box). */
+  async #ownerBox(t: TabState, o: { id: number; sid?: string }): Promise<{ x: number; y: number; right: number; bottom: number } | null> {
+    const box = await this.cdp<{ model: { content: number[] } }>(t.tabId, 'DOM.getBoxModel', { backendNodeId: o.id }, o.sid).catch(() => null);
+    if (!box) return null;
+    let q = box.model.content;
+    if (o.sid) {
+      const c = t.children.get(o.sid);
+      const owner = c && (await this.cdp<{ backendNodeId: number }>(t.tabId, 'DOM.getFrameOwner', { frameId: c.targetId }).catch(() => null));
+      if (!owner) return null;
+      q = await this.#frameToRoot(t.tabId, o.sid, owner.backendNodeId, q);
+    }
+    const xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+    return { x: Math.min(...xs), y: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) };
+  }
+
+  /** Whether every enclosing <iframe> is visible (not display:none, not visibility:hidden). */
+  async #ownersShown(t: TabState, owners: { id: number; sid?: string }[]): Promise<boolean> {
+    for (const o of owners) {
+      const r = await this.cdp<{ object: { objectId: string } }>(t.tabId, 'DOM.resolveNode', { backendNodeId: o.id }, o.sid).catch(() => null);
+      if (!r) return false;
+      const v = await this.cdp<{ result: { value?: boolean } }>(t.tabId, 'Runtime.callFunctionOn', { objectId: r.object.objectId, returnByValue: true, functionDeclaration: 'function () { return this.checkVisibility({ visibilityProperty: true }); }' }, o.sid).catch(() => null);
+      void this.cdp(t.tabId, 'Runtime.releaseObject', { objectId: r.object.objectId }, o.sid).catch(() => {});
+      if (v?.result.value === false) return false;
+    }
+    return true;
   }
 
   /** For an element inside a frame: the part of it that shows through its frame and every
@@ -1709,6 +1825,17 @@ export class Engine {
           const [u0, v0, u1, v1] = inFrame;
           const bw = box.right - box.x, bh = box.bottom - box.y;
           box = { x: box.x + u0 * bw, y: box.y + v0 * bh, right: box.x + u1 * bw, bottom: box.y + v1 * bh };
+        }
+        // Frames the element's document cannot see (another origin): cut to each enclosing
+        // <iframe> found through CDP.
+        const fid = r.node.frameId ?? (r.node.sessionId ? t.children.get(r.node.sessionId)?.targetId : undefined);
+        if (fid) {
+          for (const o of await this.#frameOwners(t, fid, r.node.sessionId)) {
+            const ob = await this.#ownerBox(t, o);
+            if (!ob) continue;
+            box = { x: Math.max(box.x, ob.x), y: Math.max(box.y, ob.y), right: Math.min(box.right, ob.right), bottom: Math.min(box.bottom, ob.bottom) };
+          }
+          if (box.right <= box.x || box.bottom <= box.y) throw new OvertakeError(ErrorCode.ELEMENT_NOT_ACTIONABLE, 'The element is outside the visible area of its frame.');
         }
         const vp = (await this.cdp<{ cssVisualViewport: { pageX: number; pageY: number } }>(tabId, 'Page.getLayoutMetrics')).cssVisualViewport;
         clip = { x: box.x + vp.pageX, y: box.y + vp.pageY, width: box.right - box.x, height: box.bottom - box.y };

@@ -32,6 +32,16 @@
     f.style.cssText = 'width:480px;height:200px;border:0';
     document.body.prepend(f);
   }
+  if (params.get('deep')) document.getElementById('run').textContent = 'Run deep query';
+  if (params.get('shadowq')) document.getElementById('run').textContent = 'Run shadow query';
+  if (params.get('nestremote')) {
+    const f = document.createElement('iframe');
+    f.id = 'nestedremote';
+    f.title = 'Nested remote frame';
+    f.src = 'http://localhost:8765/iframe-app-inner.html?remote=1&deep=1';
+    f.style.cssText = 'width:480px;height:200px;border:0';
+    document.body.prepend(f);
+  }
   if (params.get('wide')) {
     const w = document.createElement('div');
     w.id = 'wide';
