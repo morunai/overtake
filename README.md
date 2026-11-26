@@ -136,7 +136,7 @@ It prints the `claude mcp add` command for that instance.
 snapshot of the page after the action, so the agent does not need a separate `browser_snapshot`
 call. An element keeps its `@ref` across snapshots until the page navigates. `browser_snapshot`
 takes `root` (an element or an iframe, by `@ref` or selector) to show only that part of a big
-page. Links to the page itself print short (a path, or just the `#fragment`), and a snapshot
+page; `browser_frames` gives each frame's `<iframe>` as an `@ref` (`owner`) for that. Links to the page itself print short (a path, or just the `#fragment`), and a snapshot
 after an action repeats the URL and title only when they changed.
 
 `browser_wait` takes `textGone` to wait until text such as "Running..." is no longer shown.

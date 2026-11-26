@@ -70,12 +70,16 @@ test('frames list the selector of their iframe element, usable as a snapshot roo
   await A.call('browser_navigate', { tabId, url: `${SITE}/iframe-app.html` });
   await A.call('browser_wait', { tabId, selector: '#run' });
   const fr = await A.call('browser_frames', { tabId });
-  const owners = fr.frames.map((f: { owner?: string }) => f.owner).filter(Boolean);
-  assert.ok(owners.includes('iframe#feature'), JSON.stringify(fr.frames));
-  assert.ok(owners.includes('iframe#remote'), JSON.stringify(fr.frames));
-  const s = await A.call('browser_snapshot', { tabId, root: 'iframe#feature' });
-  assert.match(s, /button "Run query" @\d+/);
-  assert.doesNotMatch(s, /Top button|Run remote query/);
+  const elements = fr.frames.map((f: { ownerElement?: string }) => f.ownerElement).filter(Boolean);
+  assert.ok(elements.includes('iframe#feature'), JSON.stringify(fr.frames));
+  assert.ok(elements.includes('iframe#remote'), JSON.stringify(fr.frames));
+  const feature = fr.frames.find((f: { ownerElement?: string }) => f.ownerElement === 'iframe#feature');
+  assert.match(feature.owner, /^@\d+$/);
+  for (const root of ['iframe#feature', feature.owner]) {
+    const s = await A.call('browser_snapshot', { tabId, root });
+    assert.match(s, /button "Run query" @\d+/);
+    assert.doesNotMatch(s, /Top button|Run remote query/);
+  }
 });
 
 test('textGone sees shadow-root text; nested label text reports its checkbox; anonymous frames get distinct owners', async () => {
@@ -87,10 +91,16 @@ test('textGone sees shadow-root text; nested label text reports its checkbox; an
   const r = await A.call('browser_click', { tabId, target: '#nestedText' });
   assert.deepEqual(r.state, { checked: true });
   const fr = await A.call('browser_frames', { tabId });
-  const owners = fr.frames.filter((f: { depth: number }) => f.depth > 0).map((f: { owner?: string }) => f.owner);
+  assert.doesNotMatch(JSON.stringify(fr), /sekrit/, 'no tokens from src');
+  const anon = fr.frames.filter((f: { depth: number }) => f.depth > 0);
+  const owners = anon.map((f: { owner?: string }) => f.owner);
   assert.equal(new Set(owners).size, owners.length, JSON.stringify(owners));
-  for (const [i, o] of owners.entries()) {
-    const s = await A.call('browser_snapshot', { tabId, root: o });
-    assert.match(s, i === 0 ? /First anon/ : /Second anon/, `${o}: ${s}`);
-  }
+  const texts = [];
+  for (const o of owners) texts.push(await A.call('browser_snapshot', { tabId, root: o }));
+  assert.ok(texts.some((t) => /First anon/.test(t) && !/Second anon/.test(t)), texts.join('\n---\n'));
+  assert.ok(texts.some((t) => /Second anon/.test(t) && !/First anon/.test(t)));
+  assert.ok(texts.some((t) => /Inner anon/.test(t) && !/iframe[^\n]*\n\s+- iframe/.test(t)), 'the inner frame alone, not the outer one');
+  // A control the page replaces on click: no stale state.
+  const c = await A.call('browser_click', { tabId, target: '#clone' });
+  assert.equal(c.state, undefined);
 });

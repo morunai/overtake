@@ -360,7 +360,7 @@ server.registerTool('browser_events', {
   inputSchema: { tabId, methodPrefix: z.string().optional(), sinceSeq: z.number().int().optional(), limit: z.number().int().max(500).default(50) },
 }, wrap(async (a: { tabId: number; methodPrefix?: string; sinceSeq?: number; limit: number }) => ({ latestSeq: engine.latestSeq(), events: engine.events(a.tabId, a) })));
 
-server.registerTool('browser_frames', { description: 'Frame tree of a tab, including out-of-process iframes and their CDP session ids. owner is a selector for each frame\'s <iframe> element in its parent page (use it as a snapshot root or a target); name is Chrome\'s frame name, which can come from the element\'s id.', inputSchema: { tabId } },
+server.registerTool('browser_frames', { description: 'Frame tree of a tab, including out-of-process iframes and their CDP session ids. owner is an @ref for each frame\'s <iframe> element (use it as a snapshot root or a target), ownerElement a readable selector for it in its own document; name is Chrome\'s frame name, which can come from the element\'s id.', inputSchema: { tabId } },
   wrap(async ({ tabId }: { tabId: number }) => engine.frames(tabId)));
 
 // ---------------------------------------------------------------------------

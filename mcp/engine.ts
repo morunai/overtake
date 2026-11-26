@@ -1002,12 +1002,26 @@ export class Engine {
           // those out) under visible hosts.
           const docText = `(d) => {
             let out = d.body?.innerText || '';
+            // Each text node that is rendered (has boxes) and not visibility:hidden, joined as
+            // it flows; display: contents wrappers have no boxes of their own but their text does.
+            const textIn = (sr) => {
+              let t = '';
+              const w = d.createTreeWalker(sr, NodeFilter.SHOW_TEXT);
+              const r = d.createRange();
+              for (let n = w.nextNode(); n; n = w.nextNode()) {
+                const p = n.parentElement;
+                if (!p || d.defaultView.getComputedStyle(p).visibility === 'hidden') continue;
+                r.selectNodeContents(n);
+                if (r.getClientRects().length) t += n.data;
+              }
+              return t;
+            };
             const walk = (root, depth) => {
               if (depth > 20) return;
               for (const el of root.querySelectorAll('*')) {
                 const sr = el.shadowRoot;
-                if (!sr || !el.checkVisibility({ visibilityProperty: true })) continue;
-                out += '\\n' + [...sr.childNodes].map((n) => n.nodeType === 3 ? n.data : n.nodeType === 1 && n.checkVisibility({ visibilityProperty: true }) ? (n.innerText ?? '') : '').join('\\n');
+                if (!sr) continue;
+                out += '\\n' + textIn(sr);
                 walk(sr, depth + 1);
               }
             };
@@ -1772,6 +1786,7 @@ export class Engine {
     const r = await this.cdp<{ result: { value?: Record<string, boolean | string> | null } }>(tabId, 'Runtime.callFunctionOn', {
       objectId: res.object.objectId, returnByValue: true,
       functionDeclaration: `function () {
+        if (!this.isConnected) return null; // replaced by the page: its state would be stale
         let e = this.nodeType === 1 ? this : this.parentElement;
         if (!e) return null;
         const lab = e.closest('label');
@@ -2407,15 +2422,16 @@ export class Engine {
       const out: { frameId: string; url: string; name?: string; depth: number; outOfProcess: boolean; sessionId?: string }[] = [];
       const walk = (ft: { frame: { id: string; url: string; name?: string }; childFrames?: unknown[] }, depth: number) => {
         const child = [...t.children.entries()].find(([, v]) => v.targetId === ft.frame.id);
-        out.push({ frameId: ft.frame.id, url: ft.frame.url, name: ft.frame.name, depth, outOfProcess: !!child, sessionId: child?.[0] });
+        // Masked like browser_network: a frame URL can carry tokens.
+        out.push({ frameId: ft.frame.id, url: redactUrl(ft.frame.url), name: ft.frame.name, depth, outOfProcess: !!child, sessionId: child?.[0] });
         for (const c of (ft.childFrames || []) as typeof ft[]) walk(c, depth + 1);
       };
       walk(tree.frameTree, 0);
       // OOPIFs appear in the main frame tree only as placeholders on some versions; list sessions too.
-      for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: v.url, depth: 1, outOfProcess: true, sessionId: sid });
+      for (const [sid, v] of t.children) if (v.type === 'iframe' && !out.some((f) => f.frameId === v.targetId)) out.push({ frameId: v.targetId, url: redactUrl(v.url), depth: 1, outOfProcess: true, sessionId: sid });
       // The <iframe> element of each frame, as a selector for the page around it ("name" is
       // Chrome's frame name, which can come from the element's id).
-      for (const f of out as (typeof out[number] & { owner?: string })[]) {
+      for (const f of out as (typeof out[number] & { owner?: string; ownerElement?: string })[]) {
         if (f.depth === 0) continue;
         const o = await this.cdp<{ backendNodeId: number }>(tabId, 'DOM.getFrameOwner', { frameId: f.frameId }).catch(() => null);
         if (!o) continue;
@@ -2431,7 +2447,7 @@ export class Engine {
             const tag = this.localName;
             const q = (v) => JSON.stringify(v);
             if (this.id && one('#' + CSS.escape(this.id))) return tag + '#' + CSS.escape(this.id);
-            for (const a of ['name', 'title', 'src']) { const v = this.getAttribute(a); if (v && one(tag + '[' + a + '=' + q(v) + ']')) return tag + '[' + a + '=' + q(v) + ']'; }
+            for (const a of ['name', 'title']) { const v = this.getAttribute(a); if (v && one(tag + '[' + a + '=' + q(v) + ']')) return tag + '[' + a + '=' + q(v) + ']'; }
             const steps = [];
             for (let e = this; e && e.nodeType === 1; e = e.parentElement) {
               if (e !== this && e.id && one('#' + CSS.escape(e.id))) { steps.unshift('#' + CSS.escape(e.id)); break; }
@@ -2443,7 +2459,15 @@ export class Engine {
           }`,
         }).catch(() => null);
         void this.cdp(tabId, 'Runtime.releaseObject', { objectId: res.object.objectId }).catch(() => {});
-        if (sel?.result.value) f.owner = sel.result.value;
+        // A ref, which names this element exactly (a selector could also match in another
+        // document); the selector as a readable description. Never from src, which can carry
+        // tokens.
+        const key = `:${o.backendNodeId}`;
+        let id = t.refIds.get(key);
+        if (id === undefined) t.refIds.set(key, (id = ++refCounter));
+        t.refs.set(id, { backendNodeId: o.backendNodeId, role: 'iframe', name: sel?.result.value || '' });
+        f.owner = `@${id}`;
+        if (sel?.result.value) f.ownerElement = sel.result.value;
       }
       return { frames: out };
     });

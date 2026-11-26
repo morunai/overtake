@@ -21,13 +21,18 @@
   <shadow-status id="sstatus"></shadow-status>
   <button id="sdone">Finish shadow</button>
 </main>
+<div role="switch" id="clone" aria-checked="false" tabindex="0">Replaced switch</div>
 <iframe srcdoc="<button>First anon</button>" style="width:200px;height:40px"></iframe>
+<iframe src="/frame.html?access_token=sekrit-value" style="width:200px;height:40px"></iframe>
+<iframe srcdoc="<iframe srcdoc='&lt;button&gt;Inner anon&lt;/button&gt;' style='width:180px;height:40px'></iframe>" style="width:200px;height:60px"></iframe>
 <iframe srcdoc="<button>Second anon</button>" style="width:200px;height:40px"></iframe>
 <script>
   customElements.define('shadow-status', class extends HTMLElement {
-    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<span>Shadow loading</span>'; }
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<div style="display:contents"><span>Shadow </span><span>loading</span></div>'; }
   });
   document.getElementById('sdone').onclick = () => { document.getElementById('sstatus').shadowRoot.innerHTML = '<span>Shadow ready</span>'; };
+  // Replaced on click by a checked copy, as some frameworks re-render.
+  document.getElementById('clone').onclick = (e) => { const c = e.currentTarget.cloneNode(true); c.setAttribute('aria-checked', 'true'); e.currentTarget.replaceWith(c); };
   const menu = document.getElementById('menu');
   for (let i = 0; i < 60; i++) { const a = document.createElement('a'); a.href = '#'; a.textContent = 'Service ' + i; menu.append(a); }
   history.replaceState(null, '', location.pathname + '#state=' + 'q'.repeat(400));
